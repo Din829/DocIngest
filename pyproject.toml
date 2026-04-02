@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "docingest"
+version = "0.1.0"
+description = "Universal document preprocessing engine for RAG and Agentic Search"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+dependencies = [
+    "docling>=2.70",          # Document parsing (PDF/PPT/Excel/HTML/images)
+    "litellm>=1.80",          # Multi-provider LLM API (Vision, chunking assist)
+    "typer>=0.12",            # CLI framework
+    "pyyaml>=6.0",            # YAML config loading
+    "diskcache>=5.6",         # AI call result caching
+    "rich>=13.0",             # Terminal output formatting
+]
+
+[project.optional-dependencies]
+ocr = [
+    "docling[easyocr]",       # EasyOCR support (multi-language)
+]
+tesseract = [
+    "docling[tesserocr]",     # Tesseract OCR support
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+docingest = "docingest.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/docingest"]

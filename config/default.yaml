@@ -1,0 +1,167 @@
+# DocIngest Default Configuration
+# Override per-project by placing a docingest.yaml in your project root
+# Priority: default.yaml < project docingest.yaml < CLI args
+
+# =============================================================================
+# AI Models (multi-provider with fallback)
+# =============================================================================
+models:
+  vision:
+    primary:
+      provider: "google"
+      model: "gemini-3-flash"
+      api_key_env: "GEMINI_API_KEY"
+    fallback:
+      provider: "openai"
+      model: "gpt-5.4-mini"
+      api_key_env: "OPENAI_API_KEY"
+
+  chunking_assist:
+    primary:
+      provider: "google"
+      model: "gemini-3-flash"
+      api_key_env: "GEMINI_API_KEY"
+    fallback:
+      provider: "openai"
+      model: "gpt-5.4-mini"
+      api_key_env: "OPENAI_API_KEY"
+
+  contextual_summary:  # Only used when enrichment.contextual_summary = true
+    primary:
+      provider: "openai"
+      model: "gpt-5.4-mini"
+      api_key_env: "OPENAI_API_KEY"
+
+# =============================================================================
+# Phase 1: Document Parsing
+# =============================================================================
+parsing:
+  engine: "docling"           # docling | docling_with_fallback
+
+  # OCR settings (auto-triggered for scanned documents)
+  ocr:
+    engine: "auto"            # auto | easyocr | tesseract | rapidocr
+    languages: ["eng", "jpn", "chi_sim"]
+    force: false              # true: force OCR even on text-layer PDFs
+
+  # Language detection
+  language_detection: "auto"  # auto | fixed value ("ja", "en", "zh", etc.)
+  # auto: detect via character distribution (no AI, fast)
+
+  # Vision (per-page AI description for charts/images)
+  vision:
+    enabled: true
+    page_strategy: "auto"     # auto | all_pages | images_only | never
+    # auto: per-page decision (text→Docling, charts→Vision, scan→Vision)
+    # all_pages: send every page to Vision (expensive, for high-value docs)
+    # images_only: only describe standalone images, no full-page Vision
+    # never: no Vision at all
+    image_area_threshold: 0.3 # image area > 30% of page → full-page Vision
+    min_image_size_kb: 20     # < 20KB → icon/decoration, skip
+    min_dimensions: [200, 200] # < 200x200px → skip
+    parallel_calls: 8         # concurrent Vision API calls (page-level parallelism)
+
+  # PDF-specific
+  pdf:
+    table_extraction: true
+    image_extraction: true
+    max_pages: null           # null = no limit
+
+  # PPT-specific
+  pptx:
+    include_notes: true       # include speaker notes
+
+  # Excel-specific
+  xlsx:
+    row_to_text: true         # convert rows to natural language sentences
+    max_rows: 10000
+    include_formulas: false
+
+# =============================================================================
+# Phase 2: Output Structure
+# =============================================================================
+output:
+  dir: "./knowledge"
+  sources_dir: "sources"
+  assets_dir: "assets"
+  index_file: "index.json"
+
+  markdown:
+    include_metadata_header: true  # YAML frontmatter in each file
+    image_refs: "relative"         # relative | absolute | inline_base64
+    max_file_size_mb: 10           # split very large documents
+
+# =============================================================================
+# Phase 3: Chunking
+# =============================================================================
+chunking:
+  enabled: true
+  strategy: "auto"            # auto | heading | recursive | slide | sheet | whole | agentic
+
+  max_tokens: 512
+  min_tokens: 100
+  overlap_tokens: 50
+
+  heading:
+    levels: [1, 2, 3]
+    fallback: "recursive"
+
+  auto:
+    min_headings: 3
+    max_heading_gap_levels: 2
+    prefer_heading_threshold: 2   # structure score >= 2 → heading strategy
+
+    # Format-specific strategy mapping (override per format)
+    format_strategies:
+      pptx: "slide"
+      xlsx: "sheet"
+      csv: "sheet"
+      image: "whole"
+      default: "scoring"          # all others → structure scoring
+
+    # Extensions treated as "image" format
+    image_formats: ["png", "jpg", "jpeg", "tiff", "bmp", "webp", "gif"]
+
+  # Protection rules (applied across all strategies)
+  protection:
+    tables: true              # don't split Markdown tables
+    code_blocks: true         # don't split ``` blocks
+    lists: true               # keep lists together when possible
+    quotes: true              # keep > blocks together
+    allowed_overflow: 2.0     # protected blocks may exceed max_tokens × 2.0
+
+  ai_assist:
+    enabled: true
+    trigger: "oversized"      # oversized | anomaly | always | never
+    oversized_multiplier: 2   # chunk > max_tokens * 2 triggers AI
+
+  enrichment:
+    path_injection: true      # prepend file path + heading path (free, always do)
+    contextual_summary: false # LLM summary per chunk (expensive, opt-in)
+
+  output_file: "chunks.jsonl"
+
+# =============================================================================
+# Performance
+# =============================================================================
+performance:
+  parallel_files: 4           # file-level parallelism
+  # Vision parallelism is set in parsing.vision.parallel_calls
+
+# =============================================================================
+# Error Handling
+# =============================================================================
+error_handling:
+  on_parse_failure: "skip"    # skip | retry | fail
+  on_vision_failure: "skip"   # chart description fails → skip (text preserved)
+  on_chunk_failure: "fallback" # chunk fails → fallback to recursive
+  max_retries: 2
+  report_file: "errors.json"
+
+# =============================================================================
+# Cache
+# =============================================================================
+cache:
+  enabled: true
+  dir: ".docingest_cache"
+  # Key = sha256(model_id + file_content_hash + relevant_config_hash)

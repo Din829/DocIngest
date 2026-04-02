@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.docingest_cache/
+knowledge/sources/
+knowledge/assets/
+knowledge/index.json
+knowledge/chunks.jsonl
+errors.json
+*.egg
+.venv/
+.env
