@@ -1,18 +1,21 @@
 """
-Vision module — AI-powered image/chart description.
+Vision module — per-page AI enrichment.
 
-Handles the decision logic for when to use Vision (page_strategy),
-image filtering (size/dimensions), and calls the model provider
-with caching.
+Design philosophy: NO code-level judgment about what needs Vision.
+Every page gets sent to AI with its Docling-extracted text as context.
+The AI decides what to do:
+  - Text is complete? → Clean up and return.
+  - Has charts/images? → Describe them.
+  - Scanned/OCR garbage? → Re-OCR from the image.
+  - Both text + charts? → Merge both.
 
-Design:
-  - page_strategy "auto": per-page decision based on image area
-  - Filtering by size/dimensions avoids wasting API calls on icons
-  - Results cached by image content hash (same image → same description)
+The prompt does all the "thinking". Code just sends and receives.
+Results are cached by content hash — same page = same result, zero cost.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -20,100 +23,78 @@ from ..config import get_nested
 from ..models.provider import describe_image
 from ..models.cache import AICache, content_hash_file
 
+logger = logging.getLogger(__name__)
 
-def should_describe_image(
-    image_path: Path,
-    config: dict[str, Any],
-) -> bool:
+# The prompt that makes AI the decision-maker, not the code.
+_PAGE_PROMPT = """\
+You are a document preprocessing assistant. You receive:
+1. A page image from a document (PDF, PPT, etc.)
+2. Text that was extracted from this page by an OCR/parsing engine (may be incomplete, garbled, or empty)
+
+Your job: produce the BEST possible Markdown representation of this page's content.
+
+Rules:
+- If the extracted text is already complete and accurate, return it cleaned up (fix formatting only)
+- If the page has charts, graphs, diagrams, or images, describe them in detail with all data points
+- If the extracted text is empty or garbled (OCR failure), read the page image yourself and extract all text
+- If the page has both good text AND visual elements, combine: keep the text + add descriptions for visuals
+- Output clean Markdown. Use tables for tabular data, lists for bullet points, headings for titles
+- Preserve the original language of the document (Japanese, Chinese, English, etc.)
+- Be precise with numbers, percentages, dates, and proper nouns
+- Do NOT add commentary — only output the page content
+
+Extracted text from this page (may be incomplete):
+---
+{page_text}
+---
+
+Now look at the page image and produce the best Markdown for this page."""
+
+
+def describe_page(
+    image_path: str | Path,
+    page_text: str,
+    model_config: dict[str, Any],
+) -> str:
     """
-    Decide whether an image should be sent to Vision model.
+    Send a page image + extracted text to Vision AI.
 
-    Based on config's vision.min_image_size_kb and vision.min_dimensions.
-    Also checks vision.enabled and vision.page_strategy.
-
-    Args:
-        image_path: Path to the extracted image file.
-        config: Full config dict.
-
-    Returns:
-        True if the image should be described by Vision model.
+    The AI decides how to handle it based on the prompt.
+    No code-level filtering or threshold logic.
     """
-    vision_cfg = get_nested(config, "parsing.vision", {})
+    image_path = Path(image_path)
+    if not image_path.exists():
+        raise FileNotFoundError(f"Page image not found: {image_path}")
 
-    if not vision_cfg.get("enabled", True):
-        return False
+    prompt = _PAGE_PROMPT.format(page_text=page_text if page_text.strip() else "(empty — no text extracted)")
 
-    strategy = vision_cfg.get("page_strategy", "auto")
-    if strategy == "never":
-        return False
-    if strategy == "all_pages":
-        return True
-
-    # "auto" and "images_only" modes: apply size/dimension filters
-    min_size_kb = vision_cfg.get("min_image_size_kb", 20)
-    min_dims = vision_cfg.get("min_dimensions", [200, 200])
-
-    # Check file size
-    file_size_kb = image_path.stat().st_size / 1024
-    if file_size_kb < min_size_kb:
-        return False
-
-    # Check dimensions (if PIL available)
-    try:
-        from PIL import Image
-        with Image.open(image_path) as img:
-            w, h = img.size
-            if w < min_dims[0] and h < min_dims[1]:
-                return False
-    except ImportError:
-        # PIL not available → skip dimension check, rely on file size only
-        pass
-    except Exception:
-        # Can't read image dimensions → allow (don't block on this)
-        pass
-
-    return True
+    return describe_image(image_path, prompt, model_config)
 
 
-def describe_image_cached(
-    image_path: Path,
+def describe_page_cached(
+    image_path: str | Path,
+    page_text: str,
     config: dict[str, Any],
     cache: AICache | None = None,
 ) -> str:
     """
-    Get AI description of an image, with caching.
+    Per-page Vision with caching.
 
-    Args:
-        image_path: Path to the image file.
-        config: Full config dict.
-        cache: Optional AICache instance. If None, no caching.
-
-    Returns:
-        Text description of the image. Empty string if Vision disabled
-        or image filtered out.
+    Cache key includes image content hash, so same page = cache hit.
     """
-    if not should_describe_image(image_path, config):
-        return ""
-
+    image_path = Path(image_path)
     vision_model_config = get_nested(config, "models.vision", {})
 
-    # Build model name for cache key
     primary = vision_model_config.get("primary", {})
-    model_name = f"{primary.get('provider', 'openai')}/{primary.get('model', 'gpt-5.4-mini')}"
-
-    prompt = (
-        "Describe this image in detail. "
-        "If it contains a chart, graph, or table, extract all data points, "
-        "labels, values, and trends. Be precise with numbers."
-    )
+    model_name = f"{primary.get('provider', 'openai')}/{primary.get('model', 'gpt-4o-mini')}"
 
     if cache:
         img_hash = content_hash_file(image_path)
         return cache.get_or_call(
             model_name=model_name,
             content_hash=img_hash,
-            call_fn=lambda: describe_image(image_path, prompt, vision_model_config),
-            extra_key="vision_describe",
+            call_fn=lambda: describe_page(image_path, page_text, vision_model_config),
+            extra_key="page_vision",
         )
     else:
-        return describe_image(image_path, prompt, vision_model_config)
+        return describe_page(image_path, page_text, vision_model_config)

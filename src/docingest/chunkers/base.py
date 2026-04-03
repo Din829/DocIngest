@@ -187,7 +187,19 @@ class BaseChunker(ABC):
         """
         Estimate token count from text.
 
-        Uses ~4 chars per token heuristic (industry standard).
-        Not exact, but consistent and free (no API call).
+        CJK-aware: CJK characters ≈ 1.5 tokens each, ASCII ≈ 0.25 tokens each.
+        The naive len//4 underestimates CJK by 5-7x, breaking all chunk size logic.
         """
-        return max(1, len(text) // 4)
+        cjk = 0
+        for ch in text:
+            cp = ord(ch)
+            # CJK Unified Ideographs + common CJK ranges
+            if (0x2E80 <= cp <= 0x9FFF    # CJK radicals, Kangxi, ideographs
+                or 0xF900 <= cp <= 0xFAFF  # CJK compatibility
+                or 0xFE30 <= cp <= 0xFE4F  # CJK compatibility forms
+                or 0x3040 <= cp <= 0x30FF  # Hiragana + Katakana
+                or 0xAC00 <= cp <= 0xD7AF  # Korean Hangul
+                or 0x20000 <= cp <= 0x2FA1F):  # CJK extension B+
+                cjk += 1
+        ascii_chars = len(text) - cjk
+        return max(1, int(cjk * 1.5 + ascii_chars * 0.25))

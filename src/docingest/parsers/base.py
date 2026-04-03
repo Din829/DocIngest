@@ -10,10 +10,21 @@ passed to __init__. This makes them easy to test and swap.
 
 from __future__ import annotations
 
+# Shared marker used by Docling export and pipeline page splitting
+PAGEBREAK_MARKER = "<!-- pagebreak -->"
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+@dataclass
+class PageData:
+    """Per-page data extracted by parser, for Vision enrichment."""
+    page_no: int
+    text: str              # Docling-extracted text for this page
+    image_path: str = ""   # Path to saved page image (for Vision)
 
 
 @dataclass
@@ -27,10 +38,11 @@ class ParseResult:
     metadata: dict[str, Any] = field(default_factory=dict)
     # Expected keys: format, title, language, pages, has_tables, has_images
 
-    # Extracted images (path on disk → description if available)
+    # Per-page data (page text + image path) for Vision enrichment
+    pages: list[PageData] = field(default_factory=list)
+
+    # Legacy: kept for backward compatibility with TextParser
     images: dict[str, str] = field(default_factory=dict)
-    # key: asset output path (e.g. "assets/report-p12-chart.png")
-    # value: description text (empty string if no Vision description yet)
 
     # Whether parsing succeeded (False = fallback was used or partial result)
     success: bool = True

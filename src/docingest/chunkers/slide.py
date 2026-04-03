@@ -24,6 +24,7 @@ from .recursive import RecursiveChunker
 
 
 # Patterns for slide boundary detection (priority order)
+_PAGEBREAK_RE = re.compile(r"^<!-- pagebreak\s*-->", re.IGNORECASE)
 _DOCLING_SLIDE_RE = re.compile(r"^<!-- slide\b", re.IGNORECASE)
 _HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$")
 _SLIDE_HEADING_RE = re.compile(
@@ -58,18 +59,24 @@ class SlideChunker(BaseChunker):
             if not slide_text:
                 continue
 
+            # Extract slide title from first non-empty, non-comment line
+            slide_title = self._extract_slide_title(slide_text)
+            slide_meta = {
+                **metadata,
+                "slide_index": i,
+                "title_path": slide_title,
+            }
+
             tokens = self.estimate_tokens(slide_text)
 
             if tokens <= self._max_tokens:
                 all_chunks.append(Chunk(
                     text=slide_text,
-                    metadata={**metadata, "slide_index": i},
+                    metadata=slide_meta,
                 ))
             else:
                 # Slide too large → subdivide
-                sub_chunks = self._recursive.chunk(slide_text, {
-                    **metadata, "slide_index": i,
-                })
+                sub_chunks = self._recursive.chunk(slide_text, slide_meta)
                 all_chunks.extend(sub_chunks)
 
         # Renumber
@@ -89,7 +96,12 @@ class SlideChunker(BaseChunker):
         """
         lines = markdown.split("\n")
 
-        # Priority 1: Docling markers
+        # Priority 0: Page break placeholder (from Docling export_to_markdown)
+        boundaries = self._find_boundaries(lines, _PAGEBREAK_RE)
+        if boundaries:
+            return self._split_at(lines, boundaries)
+
+        # Priority 1: Docling slide markers
         boundaries = self._find_boundaries(lines, _DOCLING_SLIDE_RE)
         if boundaries:
             return self._split_at(lines, boundaries)
@@ -129,8 +141,21 @@ class SlideChunker(BaseChunker):
         # Each boundary starts a new slide
         for i, start in enumerate(boundaries):
             end = boundaries[i + 1] if i + 1 < len(boundaries) else len(lines)
-            slide_text = "\n".join(lines[start:end]).strip()
+            # Skip the boundary line itself if it's a pure separator (pagebreak/HR)
+            content_start = start + 1 if _PAGEBREAK_RE.match(lines[start]) else start
+            slide_text = "\n".join(lines[content_start:end]).strip()
             if slide_text:
                 slides.append(slide_text)
 
         return slides
+
+    @staticmethod
+    def _extract_slide_title(text: str) -> str:
+        """Extract title from slide: first non-empty, non-comment line."""
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("<!--"):
+                continue
+            # Strip heading markers
+            return stripped.lstrip("#").strip()
+        return ""

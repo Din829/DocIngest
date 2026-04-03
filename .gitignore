@@ -8,7 +8,11 @@ knowledge/sources/
 knowledge/assets/
 knowledge/index.json
 knowledge/chunks.jsonl
+knowledge/knowledge_map.yaml
+knowledge/knowledge_search.SKILL.md
 errors.json
+test_output*/
+test_docs/
 *.egg
 .venv/
 .env

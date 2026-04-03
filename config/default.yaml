@@ -9,7 +9,7 @@ models:
   vision:
     primary:
       provider: "google"
-      model: "gemini-3-flash"
+      model: "gemini-3-flash-preview"
       api_key_env: "GEMINI_API_KEY"
     fallback:
       provider: "openai"
@@ -19,7 +19,7 @@ models:
   chunking_assist:
     primary:
       provider: "google"
-      model: "gemini-3-flash"
+      model: "gemini-3-flash-preview"
       api_key_env: "GEMINI_API_KEY"
     fallback:
       provider: "openai"
@@ -48,18 +48,11 @@ parsing:
   language_detection: "auto"  # auto | fixed value ("ja", "en", "zh", etc.)
   # auto: detect via character distribution (no AI, fast)
 
-  # Vision (per-page AI description for charts/images)
+  # Vision (per-page AI enrichment)
+  # Every page is sent to Vision AI with Docling text as context.
+  # The AI decides what to do (no code-level thresholds or filtering).
   vision:
-    enabled: true
-    page_strategy: "auto"     # auto | all_pages | images_only | never
-    # auto: per-page decision (text→Docling, charts→Vision, scan→Vision)
-    # all_pages: send every page to Vision (expensive, for high-value docs)
-    # images_only: only describe standalone images, no full-page Vision
-    # never: no Vision at all
-    image_area_threshold: 0.3 # image area > 30% of page → full-page Vision
-    min_image_size_kb: 20     # < 20KB → icon/decoration, skip
-    min_dimensions: [200, 200] # < 200x200px → skip
-    parallel_calls: 8         # concurrent Vision API calls (page-level parallelism)
+    enabled: true             # true | false — master switch
 
   # PDF-specific
   pdf:
@@ -164,4 +157,13 @@ error_handling:
 cache:
   enabled: true
   dir: ".docingest_cache"
+
+# =============================================================================
+# Knowledge Map (search guide for Agents)
+# =============================================================================
+knowledge_map:
+  enabled: true
+  ai_summary: true              # true: AI generates summary + search guide (1 API call)
+                                # false: Stage 1 only (zero cost, structure + keywords only)
+  output_file: "knowledge_map.yaml"
   # Key = sha256(model_id + file_content_hash + relevant_config_hash)

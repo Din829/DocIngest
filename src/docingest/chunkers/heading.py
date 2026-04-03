@@ -54,6 +54,47 @@ class HeadingChunker(BaseChunker):
             # No headings found → fall back to recursive
             return self._recursive.chunk(markdown, metadata)
 
+        # Pre-process: merge heading-only sections into the next section
+        # (e.g., "## Title" with no body should attach to the content that follows)
+        merged_sections: list[dict] = []
+        pending_prefix = ""
+        pending_title = ""
+        for section in sections:
+            section_text = section["text"]
+            # Check if section has meaningful content beyond the heading line itself
+            lines = section_text.strip().split("\n")
+            non_heading_lines = [l for l in lines if not _HEADING_RE.match(l) and l.strip()]
+            # A section "has content" if any line is real text (not just HTML comments)
+            has_content = any(
+                l.strip() and not l.strip().startswith("<!--") for l in non_heading_lines
+            )
+            if not has_content and not merged_sections:
+                # First section with no content — accumulate as prefix
+                pending_prefix = (pending_prefix + "\n\n" + section_text).strip()
+                pending_title = section["title_path"]
+            elif not has_content and merged_sections:
+                # No content — accumulate to prepend to next section
+                pending_prefix = (pending_prefix + "\n\n" + section_text).strip()
+                pending_title = section["title_path"]
+            else:
+                if pending_prefix:
+                    section_text = pending_prefix + "\n\n" + section_text
+                    pending_prefix = ""
+                merged_sections.append({
+                    "text": section_text,
+                    "title_path": pending_title or section["title_path"],
+                })
+                pending_title = ""
+
+        # Flush any remaining pending prefix into last section
+        if pending_prefix:
+            if merged_sections:
+                merged_sections[-1]["text"] += "\n\n" + pending_prefix
+            else:
+                merged_sections.append({"text": pending_prefix, "title_path": pending_title})
+
+        sections = merged_sections
+
         # Process each section
         all_chunks: list[Chunk] = []
 

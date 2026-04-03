@@ -60,6 +60,7 @@ def describe_image(
     image_path: Path | str,
     prompt: str = "Describe this image in detail. If it's a chart or graph, extract all data points and trends.",
     model_config: dict[str, Any] | None = None,
+    max_tokens: int = 4096,
 ) -> str:
     """
     Send an image to a Vision model and get a text description.
@@ -122,7 +123,7 @@ def describe_image(
             response = litellm.completion(
                 model=model_name,
                 messages=messages,
-                max_tokens=500,
+                max_tokens=max_tokens,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
