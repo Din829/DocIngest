@@ -391,6 +391,10 @@ def process_single_file(
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):
         _enrich_with_vision(parse_result, config)
 
+    # Detect language early (so frontmatter and chunks both have it)
+    if "language" not in parse_result.metadata:
+        parse_result.metadata["language"] = _detect_language(parse_result.markdown)
+
     # --- Phase 2: Write Markdown + assets ---
     output_path = write_markdown(
         parse_result=parse_result,

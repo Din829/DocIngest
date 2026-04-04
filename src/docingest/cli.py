@@ -14,6 +14,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+# Load .env file if present (for API keys)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv not installed — user manages env vars manually
+
 import typer
 from rich.console import Console
 from rich.table import Table

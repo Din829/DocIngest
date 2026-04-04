@@ -125,7 +125,8 @@ def describe_image(
                 messages=messages,
                 max_tokens=max_tokens,
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            return content.strip() if content else ""
         except Exception as e:
             last_error = e
             continue
@@ -183,7 +184,8 @@ def text_completion(
                 messages=messages,
                 max_tokens=max_tokens,
             )
-            return response.choices[0].message.content.strip()
+            content = response.choices[0].message.content
+            return content.strip() if content else ""
         except Exception as e:
             last_error = e
             continue

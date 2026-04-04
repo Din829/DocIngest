@@ -89,7 +89,48 @@ class RecursiveChunker(BaseChunker):
         return None
 
     def _build_chunks(self, segments: list[dict]) -> list[str]:
-        """Build chunk texts from segments, respecting max_tokens."""
+        """Build chunk texts from segments, respecting max_tokens + overlap."""
+        chunks = self._split_segments(segments)
+
+        # Apply overlap: prepend tail of previous chunk to next chunk
+        if self._overlap > 0 and len(chunks) > 1:
+            chunks = self._apply_overlap(chunks)
+
+        return chunks
+
+    def _apply_overlap(self, chunks: list[str]) -> list[str]:
+        """Add overlap tokens from the end of each chunk to the start of the next."""
+        result = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prev = chunks[i - 1]
+            # Extract tail ~overlap tokens from previous chunk
+            overlap_text = self._extract_tail(prev, self._overlap)
+            if overlap_text:
+                result.append(overlap_text + "\n\n" + chunks[i])
+            else:
+                result.append(chunks[i])
+        return result
+
+    @staticmethod
+    def _extract_tail(text: str, target_tokens: int) -> str:
+        """Extract approximately target_tokens worth of text from the end."""
+        # Work backwards by sentences/paragraphs
+        parts = text.split("\n\n")
+        tail_parts: list[str] = []
+        tail_tokens = 0
+        for part in reversed(parts):
+            from .base import BaseChunker
+            part_tokens = BaseChunker.estimate_tokens(part)
+            if tail_tokens + part_tokens > target_tokens and tail_parts:
+                break
+            tail_parts.insert(0, part)
+            tail_tokens += part_tokens
+            if tail_tokens >= target_tokens:
+                break
+        return "\n\n".join(tail_parts) if tail_parts else ""
+
+    def _split_segments(self, segments: list[dict]) -> list[str]:
+        """Split segments into raw chunk texts (no overlap yet)."""
         chunks: list[str] = []
         current_parts: list[str] = []
         current_tokens = 0

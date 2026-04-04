@@ -1,7 +1,8 @@
 # DocIngest 設計ドキュメント
 
-> Version: 0.1 Draft
-> Date: 2026-04-02
+> Version: 0.2
+> Date: 2026-04-04
+> Updated: Phase 1.5 (Per-page Vision), Phase 4 (Knowledge Map), CJK token estimation, section name injection, overlap implementation
 
 ---
 
@@ -74,10 +75,41 @@
 └─────────────────────────────────────────────────────────────┘
   │
   ▼
-双軌出力:
-  ✅ sources/*.md    → Agentic Search (grep/glob)
-  ✅ chunks.jsonl    → RAG (vector search)
-  ✅ index.json      → Agent のファイル発見
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 1.5: Vision 増強（ページ単位、並列実行）               │
+│                                                               │
+│ 各ページ画像 + Docling テキスト → Vision AI                   │
+│   AI が自動判断:                                              │
+│     テキスト十分 → 整形して返す                                │
+│     図表あり → 図表を記述                                      │
+│     スキャン → OCR して全テキスト抽出                          │
+│   失敗時 → Docling テキストをそのまま保持（fallback）          │
+│                                                               │
+│ 出力: 増強された Markdown (メモリ上)                           │
+└─────────────────────────────────────────────────────────────┘
+  │
+  ▼
+Phase 2 + Phase 3 (既存の通り)
+  │
+  ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Phase 4: Knowledge Map 生成                                   │
+│                                                               │
+│ Stage 1 (自動、ゼロコスト):                                    │
+│   ファイル一覧 + セクション + キーワード逆引き索引              │
+│ Stage 2 (AI、1回の API 呼出):                                  │
+│   全体要約 + 検索戦略ガイド                                    │
+│                                                               │
+│ 出力: knowledge_map.yaml + knowledge_search.SKILL.md           │
+└─────────────────────────────────────────────────────────────┘
+  │
+  ▼
+出力:
+  ✅ sources/*.md              → Agentic Search (grep/glob)
+  ✅ chunks.jsonl              → RAG (vector search)
+  ✅ index.json                → Agent のファイル発見
+  ✅ knowledge_map.yaml        → 構造化検索ガイド
+  ✅ knowledge_search.SKILL.md → Agent 用自然言語検索指示
 ```
 
 ---
@@ -667,42 +699,35 @@ DocIngest/
 ├── DESIGN.md                    # 本ドキュメント
 ├── config/
 │   └── default.yaml             # デフォルト設定
-├── src/
-│   ├── __init__.py
-│   ├── cli.py                   # CLI エントリ
+├── src/docingest/
+│   ├── cli.py                   # CLI エントリ (.env 自動読込)
 │   ├── config.py                # 設定ロード (default < project < CLI args)
-│   ├── pipeline.py              # メイン Pipeline 編成
+│   ├── pipeline.py              # メイン Pipeline 編成 (Phase 1-4)
 │   ├── parsers/                 # Phase 1: 解析 (可插拔)
-│   │   ├── __init__.py          # Parser レジストリ
-│   │   ├── base.py              # BaseParser 抽象クラス
-│   │   ├── docling_parser.py    # Docling アダプタ
+│   │   ├── base.py              # ParseResult + PageData + PAGEBREAK_MARKER
+│   │   ├── docling_parser.py    # Docling アダプタ + セクション名注入
 │   │   ├── text_parser.py       # テキスト/Markdown 透過
-│   │   └── vision.py            # Vision Model 呼出
+│   │   └── vision.py            # ページ単位 Vision AI (プロンプト駆動)
 │   ├── chunkers/                # Phase 3: 切分 (可插拔)
-│   │   ├── __init__.py          # Chunker レジストリ + auto ルーティング
-│   │   ├── base.py              # BaseChunker 抽象クラス + 保護ルール
-│   │   ├── recursive.py         # 再帰文字切分 (デフォルト)
-│   │   ├── heading.py           # 見出し切分 + 再帰フォールバック
-│   │   ├── slide.py             # PPTX スライド切分
-│   │   ├── sheet.py             # XLSX/CSV シート・行グループ切分
-│   │   ├── agentic.py           # LLM 補助切分
-│   │   └── validator.py         # 切分結果検証 + AI 修正
-│   ├── enrichment/              # Chunk 増強
-│   │   ├── __init__.py
+│   │   ├── base.py              # BaseChunker + CJK トークン推定 + 保護ルール
+│   │   ├── recursive.py         # 再帰文字切分 + overlap
+│   │   ├── heading.py           # 見出し切分 + 空見出し合併
+│   │   ├── slide.py             # pagebreak/HR 検出 + スライドタイトル抽出
+│   │   ├── sheet.py             # pagebreak シート分割 + 多テーブル検出
+│   │   ├── agentic.py           # (未実装) LLM 補助切分
+│   │   └── validator.py         # (未実装) 切分結果検証 + AI 修正
+│   ├── enrichment/
 │   │   ├── path_injector.py     # パス注入 (必須)
-│   │   └── contextual.py        # LLM 要約 (オプション)
-│   ├── models/                  # AI モデル抽象層
-│   │   ├── __init__.py
-│   │   ├── provider.py          # マルチプロバイダー
-│   │   └── cache.py             # 呼出キャッシュ
-│   └── output/                  # Phase 2: 出力管理
-│       ├── __init__.py
-│       ├── markdown_writer.py
-│       ├── index_builder.py
-│       └── chunks_writer.py
+│   │   └── contextual.py        # (未実装) LLM 要約 (オプション)
+│   ├── models/
+│   │   ├── provider.py          # マルチプロバイダー + fallback チェーン
+│   │   └── cache.py             # AI 呼出キャッシュ (diskcache + memory)
+│   └── output/
+│       ├── markdown_writer.py   # Markdown + frontmatter 出力
+│       ├── index_builder.py     # index.json 生成
+│       ├── chunks_writer.py     # chunks.jsonl 出力
+│       └── knowledge_map.py     # Knowledge Map + SKILL.md 生成 (Phase 4)
 ├── knowledge/                   # デフォルト出力
-│   ├── sources/
-│   └── assets/
 └── tests/
 ```
 

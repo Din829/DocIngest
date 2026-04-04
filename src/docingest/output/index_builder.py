@@ -87,7 +87,8 @@ class IndexBuilder:
         except ValueError:
             rel_path = str(output_path)
 
-        tokens_est = len(parse_result.markdown) // 4
+        from ..chunkers.base import BaseChunker
+        tokens_est = BaseChunker.estimate_tokens(parse_result.markdown)
         sections = _extract_sections(parse_result.markdown)
         metadata = parse_result.metadata
 
