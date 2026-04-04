@@ -32,7 +32,9 @@ class TextParser(BaseParser):
         except Exception as e:
             return ParseResult(markdown="", success=False, error=f"Cannot read: {e}")
 
-        encodings = ["utf-8", "shift_jis", "latin-1"]
+        # Try encodings in order (most common first)
+        # utf-8-sig: handles BOM; cp932: Japanese Windows superset of Shift-JIS
+        encodings = ["utf-8", "utf-8-sig", "cp932", "shift_jis", "euc-jp", "latin-1"]
 
         for enc in encodings:
             try:
@@ -49,10 +51,16 @@ class TextParser(BaseParser):
             except (UnicodeDecodeError, UnicodeError):
                 continue
 
+        # Last resort: UTF-8 with replacement (keeps most content, replaces bad bytes with �)
+        content = raw.decode("utf-8", errors="replace")
         return ParseResult(
-            markdown="",
-            success=False,
-            error=f"Cannot decode as text (tried {encodings}): {file_path.name}",
+            markdown=content,
+            metadata={
+                "format": file_path.suffix.lstrip(".") or "txt",
+                "title": file_path.stem,
+                "encoding_detected": "utf-8 (lossy)",
+            },
+            success=True,
         )
 
     def supported_extensions(self) -> set[str]:
