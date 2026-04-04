@@ -74,6 +74,45 @@ python -m docingest.cli ./docs/ --strategy heading --no-chunks
 python -m docingest.cli ./docs/ -c ./my-config.yaml
 ```
 
+## Python API
+
+```python
+from pathlib import Path
+from docingest.config import load_config
+from docingest.parsers import create_parser
+from docingest.chunkers import create_chunker
+from docingest.pipeline import run_pipeline
+
+# Load config (auto-merges default.yaml + project docingest.yaml + overrides)
+config = load_config(cli_overrides={
+    "output": {"dir": "./knowledge"},
+    "parsing": {"vision": {"enabled": True}},
+})
+
+# Create parser and chunker
+parser = create_parser(config)
+chunker = create_chunker(config)
+
+# Run pipeline
+result = run_pipeline(
+    input_paths=[Path("./docs")],
+    config=config,
+    parser=parser,
+    chunker=chunker,
+)
+
+# Result
+print(f"Processed: {result.successful}/{result.total_files}")
+print(f"Chunks: {result.total_chunks}, Tokens: {result.total_tokens}")
+
+# Output files ready at:
+#   knowledge/sources/*.md          → grep/glob
+#   knowledge/chunks.jsonl          → vector embedding
+#   knowledge/index.json            → file directory
+#   knowledge/knowledge_map.yaml    → structured search guide
+#   knowledge/knowledge_search.SKILL.md → agent instructions
+```
+
 ## CLI Options
 
 ```
