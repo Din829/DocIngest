@@ -31,6 +31,9 @@ from .output.index_builder import IndexBuilder
 from .output.chunks_writer import write_chunks
 from .enrichment.path_injector import inject_paths
 
+import logging
+_pipeline_logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Pipeline result types
@@ -134,6 +137,69 @@ def _detect_language(text: str, sample_size: int = 2000) -> str:
         return "en"
 
     return "mixed"
+
+
+# ---------------------------------------------------------------------------
+# Garbled text detection + pymupdf fallback
+# ---------------------------------------------------------------------------
+
+def _detect_garbled(markdown: str, threshold: int = 10) -> bool:
+    """
+    Detect garbled output from Docling (broken CID-to-Unicode mapping).
+
+    Checks for 'glyph<c=' patterns which indicate font encoding failures.
+    Returns True if garbled text count exceeds threshold.
+    """
+    count = markdown.count("glyph<") + markdown.count("glyph&lt;")
+    return count >= threshold
+
+
+def _pymupdf_fallback(file_path: Path, original_parse_result) -> None:
+    """
+    Re-extract text using pymupdf (fitz) when Docling produces garbled output.
+
+    Replaces parse_result.markdown in-place. Preserves pages/metadata from Docling
+    (images, page count etc.) — only replaces the text content.
+
+    Minimal invasion: only called when garbled text is detected.
+    """
+    try:
+        import fitz
+    except ImportError:
+        _pipeline_logger.warning("pymupdf not installed, cannot fallback. pip install pymupdf")
+        return
+
+    try:
+        doc = fitz.open(str(file_path))
+        pages_text = []
+        for page in doc:
+            pages_text.append(page.get_text())
+        doc.close()
+
+        # Rebuild markdown from pymupdf text
+        # Use PAGEBREAK_MARKER between pages to maintain page structure
+        markdown_parts = []
+        for i, text in enumerate(pages_text):
+            # Clean up and convert to basic markdown
+            lines = text.strip().split("\n")
+            cleaned = "\n".join(line.strip() for line in lines if line.strip())
+            markdown_parts.append(cleaned)
+
+        new_markdown = f"\n{PAGEBREAK_MARKER}\n".join(markdown_parts)
+
+        # Also update page text data (for Vision enrichment)
+        if original_parse_result.pages:
+            for i, page_data in enumerate(original_parse_result.pages):
+                if i < len(pages_text):
+                    page_data.text = pages_text[i]
+
+        original_parse_result.markdown = new_markdown
+        _pipeline_logger.info(
+            f"pymupdf fallback: replaced garbled Docling output with pymupdf text "
+            f"({len(pages_text)} pages)"
+        )
+    except Exception as e:
+        _pipeline_logger.warning(f"pymupdf fallback failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +452,14 @@ def process_single_file(
         return result, []
 
     result.format = parse_result.metadata.get("format", "unknown")
+
+    # --- Phase 1.1: Garbled text detection + pymupdf fallback ---
+    if parse_result.markdown and _detect_garbled(parse_result.markdown):
+        _pipeline_logger.warning(
+            f"Garbled text detected in Docling output for {file_path.name}, "
+            f"attempting pymupdf fallback"
+        )
+        _pymupdf_fallback(file_path, parse_result)
 
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):

@@ -26,6 +26,12 @@ Phase 1: Parse
   → Output: Markdown + per-page data (text + page images)
   │
   ▼
+Phase 1.1: Garbled Text Detection (automatic)
+  Detect broken CID-to-Unicode mapping (e.g. embedded JP fonts)
+  If garbled → pymupdf (fitz) re-extracts clean text
+  Transparent: normal PDFs unaffected, no config needed
+  │
+  ▼
 Phase 1.5: Vision Enrichment (per-page, parallel)
   Every page image + Docling text → Vision AI
   AI decides: text complete? → clean up. Has charts? → describe. Scanned? → OCR.
@@ -202,6 +208,7 @@ AI Agent のツール設計と実装に関する技術文書群...
 | **Multi-provider** | Gemini / OpenAI with automatic fallback |
 | **Caching** | AI call results cached by content hash (no duplicate API costs) |
 | **Config-driven** | All thresholds, strategies, models configurable via YAML |
+| **Garbled text recovery** | Auto-detects broken font encoding (CID-to-Unicode) → pymupdf fallback. Zero config, transparent |
 | **Error resilient** | One file fails → skip + log, others continue. Vision fails → Docling text fallback |
 
 ## Configuration
