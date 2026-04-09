@@ -50,6 +50,11 @@ def _build_frontmatter(metadata: dict[str, Any], original_file: str) -> str:
 
     lines.append(f"processed_at: {datetime.datetime.now().isoformat(timespec='seconds')}")
 
+    # Surface warnings to frontmatter so both humans and Agents can see them
+    if "warnings" in metadata and metadata["warnings"]:
+        for w in metadata["warnings"]:
+            lines.append(f"warning: \"{w}\"")
+
     lines.append("---")
     return "\n".join(lines)
 

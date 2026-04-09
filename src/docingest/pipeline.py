@@ -203,6 +203,337 @@ def _pymupdf_fallback(file_path: Path, original_parse_result) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Excel denoising (applied to ALL xlsx/xls — unified path)
+# ---------------------------------------------------------------------------
+
+def _dedup_table_row(line: str) -> str:
+    """
+    Collapse merged-cell noise within a single Markdown table row.
+
+    Two strategies (both safe):
+
+    1. ALL cells identical → collapse to 1 cell
+       '| foo | foo | foo |' → '| foo |'
+
+    2. GROUPS of consecutive identical cells → each group collapses to 1
+       '| A | A | A | B | B | B | C | C |' → '| A | B | C |'
+       This handles multi-column merged cells (e.g., header spans 5 cols,
+       data spans 20 cols — each column's merge expands independently).
+
+    Safety: only collapses when the dedup removes ≥50% of cells.
+    A row like '| a | a | b |' (3 cells → 2, only 33% reduction) is kept.
+    This prevents accidentally merging legitimate adjacent duplicate values
+    in small tables while aggressively cleaning layout-heavy noise.
+    """
+    if not line.strip().startswith("|"):
+        return line
+    cells = [c.strip() for c in line.split("|")]
+    cells = [c for c in cells if c]
+    if len(cells) <= 2:
+        return line
+
+    # Run-length dedup: collapse consecutive identical cells
+    deduped: list[str] = [cells[0]]
+    for c in cells[1:]:
+        if c != deduped[-1]:
+            deduped.append(c)
+
+    # Safety check: only apply if we removed ≥50% of cells
+    # (strong signal of merged-cell noise, not coincidental duplicates)
+    if len(deduped) < len(cells) and len(deduped) <= len(cells) * 0.5:
+        return "| " + " | ".join(deduped) + " |"
+    return line
+
+
+def _strip_empty_cells(line: str) -> str:
+    """
+    Remove empty cells from a Markdown table row, but only when the row
+    is *predominantly* empty (sparse layout noise, not a data table).
+
+    Safe:   '| | | 画面ID | | A15S010 | | |'  → '| 画面ID | A15S010 |'
+            (2 values in 7 cells = 71% empty → strip)
+    Safe:   '| 商品名 | | 価格 |'              → untouched
+            (2 values in 3 cells = 33% empty → keep, might be intentional)
+    Safe:   '| a | b | c | d |'                 → untouched (no empties)
+
+    Threshold: only strip when >50% of cells are empty.
+    This preserves data tables with occasional blank columns while cleaning
+    layout-heavy Excel noise (where most cells are empty spacers).
+
+    Entirely empty rows are always removed (zero information).
+    """
+    if not line.strip().startswith("|"):
+        return line
+    # Don't touch separator rows
+    if re.match(r"^\s*\|[-:\s|]+\|\s*$", line):
+        return line
+    cells = [c.strip() for c in line.split("|")]
+    cells = [c for c in cells if c is not None]  # keep bookend-stripped list
+    # Filter: treat "None" (Docling artifact) same as empty
+    non_empty = [c for c in cells if c and c.lower() != "none"]
+    if not non_empty:
+        return ""  # entire row is empty → remove
+    # Only strip empty cells when the row is predominantly empty (>50%)
+    empty_ratio = 1 - len(non_empty) / max(len(cells), 1)
+    if empty_ratio > 0.5:
+        return "| " + " | ".join(non_empty) + " |"
+    return line
+
+
+def _extract_metadata_kv(lines: list[str], max_rows: int) -> dict[str, str]:
+    """
+    Try to extract key-value metadata from the first N rows of Excel output.
+
+    Recognises patterns like:
+      '| 画面ID | A15S010 |'  → {"画面ID": "A15S010"}
+      '| 作成者 | | 山田 |'  → {"作成者": "山田"}
+
+    Only extracts rows that look like label-value pairs (2 non-empty cells).
+    Data table headers (3+ non-empty cells) are left alone.
+    """
+    kv: dict[str, str] = {}
+    for line in lines[:max_rows]:
+        if not line.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.split("|")]
+        cells = [c for c in cells if c and c.lower() != "none"]
+        if len(cells) == 2:
+            kv[cells[0]] = cells[1]
+    return kv
+
+
+def _clean_excel_markdown(
+    markdown: str,
+    config: dict[str, Any],
+) -> str:
+    """
+    Denoise Docling's Markdown output for Excel files.
+
+    Applied to ALL Excel files uniformly:
+      - Data-heavy spreadsheets have little noise → minimal change
+      - Layout-heavy spreadsheets get significant cleanup
+
+    Three passes:
+      1. dedup_cells:  collapse identical consecutive cells in each row
+      2. strip_empty:  remove empty cells from table rows, drop empty rows
+      3. metadata:     extract key-value pairs from first N rows into metadata
+
+    Returns cleaned markdown. Metadata extraction is best-effort (non-destructive).
+    """
+    xlsx_denoise = get_nested(config, "parsing.xlsx.denoising", {})
+    if not xlsx_denoise.get("enabled", True):
+        return markdown
+
+    do_dedup = xlsx_denoise.get("dedup_cells", True)
+    do_strip = xlsx_denoise.get("strip_empty_cells", True)
+
+    lines = markdown.split("\n")
+    cleaned: list[str] = []
+
+    for line in lines:
+        if do_dedup:
+            line = _dedup_table_row(line)
+        if do_strip:
+            line = _strip_empty_cells(line)
+        # _strip_empty_cells returns "" for all-empty rows → skip them
+        if line == "":
+            cleaned.append("")
+        else:
+            cleaned.append(line)
+
+    # Pass 3: Inter-row dedup — collapse consecutive identical table rows,
+    # but ONLY for single-cell rows (the merged-cell noise signature).
+    # Multi-column rows with identical content are legitimate data
+    # (e.g., repeated status values across records) — never collapsed.
+    if do_dedup:
+        deduped: list[str] = []
+        for line in cleaned:
+            stripped = line.strip()
+            is_table = stripped.startswith("|")
+            is_separator = is_table and re.match(r"^\s*\|[-:\s|]+\|\s*$", stripped)
+            if is_table and not is_separator and deduped:
+                # Count non-empty cells — only dedup single-value rows
+                cells = [c.strip() for c in stripped.split("|") if c.strip()]
+                prev_stripped = deduped[-1].strip()
+                if len(cells) <= 1 and prev_stripped == stripped:
+                    continue  # skip: single-cell duplicate (merged-cell noise)
+            deduped.append(line)
+        cleaned = deduped
+
+    result = "\n".join(cleaned)
+    # Collapse excessive blank lines created by removed rows
+    result = re.sub(r"\n{4,}", "\n\n\n", result)
+
+    original_len = len(markdown)
+    new_len = len(result)
+    if original_len > 0 and new_len < original_len * 0.8:
+        _pipeline_logger.info(
+            f"Excel denoising: {original_len:,} → {new_len:,} chars "
+            f"({(1 - new_len / original_len) * 100:.0f}% reduction)"
+        )
+
+    return result
+
+
+def _downscale_image(image_path: str, max_pixels: int) -> None:
+    """
+    Downscale an image file in-place if it exceeds max_pixels.
+
+    Preserves aspect ratio. Uses Lanczos resampling for quality.
+    Does nothing if the image is already within limits.
+    """
+    try:
+        from PIL import Image
+        img = Image.open(image_path)
+        w, h = img.size
+        pixels = w * h
+        if pixels <= max_pixels:
+            return
+        scale = (max_pixels / pixels) ** 0.5
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        img.save(image_path)
+        _pipeline_logger.info(
+            f"Downscaled image: {w}x{h} → {new_w}x{new_h} ({image_path})"
+        )
+    except Exception as e:
+        _pipeline_logger.debug(f"Image downscale failed: {e}")
+
+
+def _ensure_excel_page_images(
+    file_path: Path,
+    parse_result,
+    config: dict[str, Any],
+) -> None:
+    """
+    Ensure Excel files have page images for Vision enrichment.
+
+    If Docling didn't produce page images (typical for xlsx), use
+    LibreOffice headless → PDF → page screenshots.
+
+    Protections:
+      - max_page_images: caps how many pages are sent to Vision.
+        Excess pages are skipped (text-only) with a warning in metadata.
+      - max_image_pixels: oversized images are downscaled to this pixel count.
+        Prevents Vision API failures and excessive token cost.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    from .parsers.base import PageData
+
+    xlsx_denoise = get_nested(config, "parsing.xlsx.denoising", {})
+    if not xlsx_denoise.get("ensure_page_images", True):
+        return
+
+    # Already has images → nothing to do
+    if parse_result.pages and any(p.image_path for p in parse_result.pages):
+        return
+
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        _pipeline_logger.debug(
+            "LibreOffice not found — cannot generate Excel page images"
+        )
+        return
+
+    max_pages = xlsx_denoise.get("max_page_images", 10)
+    max_pixels = xlsx_denoise.get("max_image_pixels", 4_000_000)
+
+    assets_dir = Path(get_nested(
+        config, "output.dir", "./knowledge"
+    )) / get_nested(config, "output.assets_dir", "assets")
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Step 1: Excel → PDF via LibreOffice
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf",
+                 "--outdir", tmpdir, str(file_path)],
+                capture_output=True, timeout=120,
+            )
+            pdf_files = list(Path(tmpdir).glob("*.pdf"))
+            if not pdf_files:
+                return
+
+            # Step 2: PDF → page images
+            pages_data: list = []
+            total_pages = 0
+
+            try:
+                from pdf2image import convert_from_path
+                images = convert_from_path(str(pdf_files[0]), dpi=150)
+                total_pages = len(images)
+                for i, img in enumerate(images):
+                    if i >= max_pages:
+                        break
+                    name = f"{file_path.stem}-page-{i + 1:03d}.png"
+                    out = assets_dir / name
+                    img.save(str(out))
+                    _downscale_image(str(out), max_pixels)
+                    pages_data.append(PageData(
+                        page_no=i + 1,
+                        text="",
+                        image_path=str(out),
+                    ))
+            except ImportError:
+                # pdf2image unavailable → try Docling PDF re-parse
+                try:
+                    from docling.document_converter import DocumentConverter, PdfFormatOption
+                    from docling.datamodel.pipeline_options import PdfPipelineOptions
+                    from docling.datamodel.base_models import InputFormat
+
+                    opts = PdfPipelineOptions()
+                    opts.generate_page_images = True
+                    conv = DocumentConverter(
+                        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+                    )
+                    pdf_result = conv.convert(str(pdf_files[0]))
+                    total_pages = len(pdf_result.document.pages) if hasattr(pdf_result.document, "pages") else 0
+                    for page_no, page in pdf_result.document.pages.items():
+                        if len(pages_data) >= max_pages:
+                            break
+                        pil = getattr(page.image, "pil_image", None) if page.image else None
+                        if pil is None:
+                            continue
+                        name = f"{file_path.stem}-page-{page_no:03d}.png"
+                        out = assets_dir / name
+                        pil.save(str(out))
+                        _downscale_image(str(out), max_pixels)
+                        pages_data.append(PageData(
+                            page_no=page_no,
+                            text="",
+                            image_path=str(out),
+                        ))
+                except Exception:
+                    pass
+
+            # Apply results
+            if pages_data:
+                parse_result.pages = pages_data
+                _pipeline_logger.info(
+                    f"Excel page images: generated {len(pages_data)} pages "
+                    f"via LibreOffice for {file_path.name}"
+                )
+
+            # Emit warning if pages were capped (visible in frontmatter + logs)
+            if total_pages > max_pages:
+                warn_msg = (
+                    f"Excel produced {total_pages} pages, "
+                    f"only first {max_pages} sent to Vision "
+                    f"(max_page_images={max_pages}). "
+                    f"Remaining pages use text-only extraction."
+                )
+                _pipeline_logger.warning(warn_msg)
+                warnings = parse_result.metadata.setdefault("warnings", [])
+                warnings.append(warn_msg)
+
+    except Exception as e:
+        _pipeline_logger.debug(f"Excel page image generation failed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Vision enrichment
 # ---------------------------------------------------------------------------
 
@@ -460,6 +791,16 @@ def process_single_file(
             f"attempting pymupdf fallback"
         )
         _pymupdf_fallback(file_path, parse_result)
+
+    # --- Phase 1.2: Excel denoising (all xlsx/xls/csv, unified path) ---
+    if result.format in ("xlsx", "xls", "csv") and parse_result.markdown:
+        parse_result.markdown = _clean_excel_markdown(
+            parse_result.markdown, config,
+        )
+
+    # --- Phase 1.3: Ensure Excel has page images for Vision ---
+    if result.format in ("xlsx", "xls"):
+        _ensure_excel_page_images(file_path, parse_result, config)
 
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):

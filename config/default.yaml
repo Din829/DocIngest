@@ -70,6 +70,19 @@ parsing:
     max_rows: 10000
     include_formulas: false
 
+    # Excel denoising (applied to ALL xlsx/xls, not just 仕様書)
+    # Data-heavy spreadsheets pass through with minimal change;
+    # layout-heavy ones get significant noise removed.
+    denoising:
+      enabled: true
+      dedup_cells: true           # collapse identical consecutive cells in a row
+      strip_empty_cells: true     # remove empty cells from table rows
+      extract_metadata_rows: 5    # first N rows: try to pull key-value pairs into metadata
+      extract_images: true        # pull embedded images from xlsx zip (xl/media/)
+      ensure_page_images: true    # LibreOffice → PDF → page screenshots when Docling has none
+      max_page_images: 10         # cap page screenshots sent to Vision (excess → text-only, with warning)
+      max_image_pixels: 4000000   # single image pixel cap (≈2000x2000). Larger images are scaled down.
+
 # =============================================================================
 # Phase 2: Output Structure
 # =============================================================================
@@ -157,6 +170,19 @@ error_handling:
 cache:
   enabled: true
   dir: ".docingest_cache"
+
+# =============================================================================
+# Refine (optional: AI-powered Markdown cleanup for human readability)
+# =============================================================================
+# NOT part of the main pipeline — invoked separately via `docingest refine`.
+# Produces readable/ versions of sources/ files without modifying originals.
+refine:
+  output_dir: "readable"          # output subdirectory inside knowledge/
+  model: "chunking_assist"        # reuse models.chunking_assist config
+  max_input_tokens: 8000          # skip files larger than this (with warning)
+  max_output_tokens: 8000         # LLM response cap
+  default_skill: "refine_default" # SKILL file name (without .SKILL.md)
+  skills_dir: "skills"            # directory containing .SKILL.md files
 
 # =============================================================================
 # Knowledge Map (search guide for Agents)

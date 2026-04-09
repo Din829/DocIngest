@@ -154,7 +154,12 @@ class DoclingParser(BaseParser):
             metadata = self._extract_metadata(doc, file_path)
 
             # Build per-page data (text + image path) for Vision enrichment
+            self._last_parse_metadata = {}
             pages = self._build_page_data(doc, file_path)
+
+            # Merge xlsx embedded image paths into metadata (if any were extracted)
+            if self._last_parse_metadata.get("xlsx_embedded_images"):
+                metadata["xlsx_embedded_images"] = self._last_parse_metadata["xlsx_embedded_images"]
 
             return ParseResult(
                 markdown=markdown,
@@ -314,6 +319,15 @@ class DoclingParser(BaseParser):
                 image_path=image_path,
             ))
 
+        # Extract embedded images from xlsx zip (xl/media/)
+        xlsx_denoise = get_nested(self.config, "parsing.xlsx.denoising", {})
+        if xlsx_denoise.get("extract_images", True) and file_path.suffix.lower() in (".xlsx", ".xls"):
+            embedded = self._extract_xlsx_images(file_path, assets_dir)
+            if embedded:
+                parse_meta = getattr(self, "_last_parse_metadata", {})
+                parse_meta["xlsx_embedded_images"] = embedded
+                self._last_parse_metadata = parse_meta
+
         # If no page images from Docling (e.g., PPT SimplePipeline),
         # try external conversion as fallback
         has_any_image = any(p.image_path for p in pages_data)
@@ -321,6 +335,43 @@ class DoclingParser(BaseParser):
             self._try_external_page_images(file_path, assets_dir, pages_data)
 
         return pages_data
+
+    @staticmethod
+    def _extract_xlsx_images(file_path: Path, assets_dir: Path) -> list[str]:
+        """
+        Extract embedded images from an xlsx file's zip structure.
+
+        xlsx is a zip containing xl/media/image1.png, image2.jpeg, etc.
+        These are the images pasted into cells (screenshots, diagrams).
+        Works for ALL xlsx — data-heavy ones simply have no images (returns []).
+        """
+        import zipfile
+
+        if not zipfile.is_zipfile(str(file_path)):
+            return []
+
+        image_exts = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".emf", ".wmf")
+        extracted: list[str] = []
+
+        try:
+            with zipfile.ZipFile(str(file_path), "r") as zf:
+                for name in zf.namelist():
+                    if not name.startswith("xl/media/"):
+                        continue
+                    lower = name.lower()
+                    if not any(lower.endswith(ext) for ext in image_exts):
+                        continue
+                    data = zf.read(name)
+                    out_name = f"{file_path.stem}-{Path(name).name}"
+                    out_path = assets_dir / out_name
+                    out_path.write_bytes(data)
+                    extracted.append(str(out_path))
+        except Exception as e:
+            logger.debug(f"xlsx image extraction failed: {e}")
+
+        if extracted:
+            logger.info(f"Extracted {len(extracted)} embedded images from {file_path.name}")
+        return extracted
 
     def _try_external_page_images(
         self, file_path: Path, assets_dir: Path, pages_data: list

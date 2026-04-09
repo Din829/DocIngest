@@ -1,0 +1,50 @@
+# DocIngest - Pinned dependencies
+# Generated from working environment 2026-04-09
+#
+# Why pin versions: Docling's ML pipeline (transformers → torch → numpy)
+# is sensitive to binary compatibility. A numpy major version mismatch
+# (e.g. packages compiled with numpy 1.x running under numpy 2.x)
+# causes "dtype size changed" crashes at import time.
+#
+# Install: pip install -r requirements.txt
+
+# === Core: document parsing engine ===
+docling>=2.32,<3
+docling-core>=2.31,<3
+docling-ibm-models>=3.4,<4
+docling-parse>=4.0,<5
+
+# === Core: AI/LLM ===
+litellm>=1.80,<2
+
+# === Core: CLI & config ===
+typer>=0.12,<1
+pyyaml>=6.0,<7
+rich>=13.0,<15
+
+# === Core: caching ===
+diskcache>=5.6,<6
+
+# === Scientific stack (MUST be compatible with each other) ===
+# If you upgrade numpy, upgrade ALL of these together.
+numpy>=2.2,<3
+pandas>=2.3,<3
+scikit-learn>=1.7,<2
+scikit-image>=0.25,<1
+numexpr>=2.14
+bottleneck>=1.6
+
+# === ML / Vision pipeline ===
+transformers>=4.50,<5
+torch>=2.5,<3
+easyocr>=1.7,<2
+pillow>=10.0,<12
+openpyxl>=3.1,<4
+
+# === Pydantic (Docling dependency) ===
+pydantic>=2.11,<3
+click>=8.1,<8.2
+
+# === Optional: PDF fallback ===
+# pymupdf>=1.24           # Uncomment if you need garbled-text recovery
+# pdf2image>=1.17         # Uncomment if you need PPT→PDF→image pipeline

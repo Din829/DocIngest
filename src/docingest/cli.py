@@ -34,11 +34,20 @@ app = typer.Typer(
     name="docingest",
     help="Universal document preprocessing for RAG and Agentic Search.",
     add_completion=False,
+    invoke_without_command=True,
 )
 console = Console()
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
+def _default(ctx: typer.Context):
+    """Fallback: show help if no subcommand given."""
+    if ctx.invoked_subcommand is None:
+        # If arguments were passed without subcommand, treat as "run"
+        pass
+
+
+@app.command("run")
 def main(
     inputs: list[Path] = typer.Argument(
         ...,
@@ -144,6 +153,86 @@ def _print_results(result) -> None:
             console.print(f"  [red]✗[/red] {err['file']}: {err['error']}")
 
     console.print()
+
+
+# ---------------------------------------------------------------------------
+# Refine subcommand
+# ---------------------------------------------------------------------------
+
+@app.command("refine")
+def refine_cmd(
+    files: list[Path] = typer.Argument(
+        ...,
+        help="Markdown files to refine (e.g. knowledge/sources/spec.md)",
+        exists=True,
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
+        "-o", "--output",
+        help="Base output directory (default: parent of sources/).",
+    ),
+    skill: Optional[str] = typer.Option(
+        None,
+        "--skill",
+        help="SKILL name to use (default: refine_default).",
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "-c", "--config",
+        help="Path to project config YAML.",
+    ),
+) -> None:
+    """Refine Markdown files for human readability (AI-powered)."""
+    from .refine import refine_files
+
+    config = load_config(project_config_path=config_file)
+
+    # Infer output_dir from first file if not specified
+    # e.g. knowledge/sources/xxx.md → knowledge/
+    if output_dir is None:
+        first = files[0].resolve()
+        if first.parent.name == "sources":
+            output_dir = first.parent.parent
+        else:
+            output_dir = first.parent
+
+    console.print(f"\n[bold]DocIngest Refine[/bold]")
+    console.print(f"  Files:  {len(files)}")
+    console.print(f"  Skill:  {skill or config.get('refine', {}).get('default_skill', 'refine_default')}")
+    console.print(f"  Output: {output_dir / config.get('refine', {}).get('output_dir', 'readable')}")
+    console.print()
+
+    results = refine_files(files, config, output_dir, skill)
+
+    # Print results
+    refined_count = sum(1 for r in results if not r["skipped"])
+    skipped_count = sum(1 for r in results if r["skipped"])
+
+    table = Table(title="Refine Results")
+    table.add_column("File", style="bold")
+    table.add_column("Status")
+    table.add_column("Tokens", justify="right")
+
+    for r in results:
+        name = Path(r["source"]).name
+        if r["skipped"]:
+            table.add_row(name, f"[yellow]skipped[/yellow]", r.get("warning", ""))
+        else:
+            table.add_row(
+                name,
+                f"[green]refined[/green]",
+                f"{r['tokens_in']:,} → {r['tokens_out']:,}",
+            )
+
+    console.print(table)
+
+    if skipped_count:
+        console.print(f"\n[yellow]Skipped {skipped_count} file(s)[/yellow]")
+        for r in results:
+            if r["skipped"]:
+                console.print(f"  {Path(r['source']).name}: {r['warning']}")
+
+    console.print(f"\n[green]Refined: {refined_count}[/green] / {len(results)} files\n")
 
 
 if __name__ == "__main__":

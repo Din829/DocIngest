@@ -4,15 +4,27 @@ __pycache__/
 dist/
 build/
 .docingest_cache/
+
+# Pipeline output (generated, not source code)
 knowledge/sources/
+knowledge/readable/
 knowledge/assets/
 knowledge/index.json
 knowledge/chunks.jsonl
 knowledge/knowledge_map.yaml
 knowledge/knowledge_search.SKILL.md
-errors.json
+knowledge/errors.json
+
+# Test output directories
 test_output*/
+test_shiyousho/
+
+# Test input files (large, downloaded samples)
 test_docs/
+仕様書サンプル/
+
+# Misc
+errors.json
 *.egg
 .venv/
 .env
