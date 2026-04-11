@@ -155,6 +155,45 @@ def _print_results(result) -> None:
 
     console.print(table)
 
+    # Quality summary (if quality_report was generated)
+    quality = getattr(result, "quality", None) or {}
+    if quality.get("total_files", 0) > 0:
+        q = quality.get("total_questions", 0)
+        u = quality.get("total_unreadable", 0)
+        issues = quality.get("files_with_issues", 0)
+        total = quality.get("total_files", 0)
+        score = quality.get("quality_score", 1.0)
+
+        if q == 0 and u == 0:
+            console.print(
+                f"\n[green]✓ Vision quality:[/green] clean ({total} files, "
+                f"zero uncertainty markers)"
+            )
+        else:
+            color = "green" if score >= 0.9 else ("yellow" if score >= 0.7 else "red")
+            console.print(
+                f"\n[{color}]Vision quality:[/{color}] "
+                f"{issues}/{total} files have markers "
+                f"— [yellow]{q}[/yellow] partial reads [?], "
+                f"[red]{u}[/red] unreadable "
+                f"(score: {score:.2f})"
+            )
+            # Show top 3 files with most issues for quick triage
+            files_with_issues = quality.get("files", [])
+            if files_with_issues:
+                top = sorted(
+                    files_with_issues,
+                    key=lambda f: f["question_count"] + f["unreadable_count"] * 2,
+                    reverse=True,
+                )[:3]
+                console.print("  [dim]Top files to review:[/dim]")
+                for f in top:
+                    name = Path(f["file"]).name
+                    console.print(
+                        f"    [dim]•[/dim] {name}: "
+                        f"{f['question_count']} [?], {f['unreadable_count']} [unreadable]"
+                    )
+
     if result.errors:
         console.print(f"\n[yellow]Errors ({len(result.errors)}):[/yellow]")
         for err in result.errors:

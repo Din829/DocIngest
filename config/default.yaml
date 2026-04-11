@@ -53,6 +53,13 @@ parsing:
   # The AI decides what to do (no code-level thresholds or filtering).
   vision:
     enabled: true             # true | false — master switch
+    image_dpi: 180            # resolution for page images sent to Vision.
+                              # 72 = fastest/smallest (readable for large text only)
+                              # 150 = good balance (main elements clear, small labels fuzzy)
+                              # 180 = recommended default (both main + small labels clear)
+                              # 200+ = diminishing returns, risks 4MP cap downscale
+                              # Gemini charges per-image regardless of DPI,
+                              # OpenAI/Claude charge by tile/pixel count.
 
   # PDF-specific
   pdf:
@@ -185,6 +192,17 @@ error_handling:
 cache:
   enabled: true
   dir: ".docingest_cache"
+
+# =============================================================================
+# Quality report (Vision uncertainty marker scan)
+# =============================================================================
+# Scans sources/*.md for [?] (partial reads) and [unreadable] markers that
+# the Vision prompt uses when it cannot fully transcribe content. Provides
+# a quick health check and identifies files that need manual review or
+# higher DPI re-processing.
+quality_report:
+  enabled: true                       # scan after pipeline completes
+  output_file: "quality_report.json"  # full report path (relative to output.dir)
 
 # =============================================================================
 # Incremental processing (content-addressed pipeline output cache)

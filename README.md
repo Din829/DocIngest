@@ -12,6 +12,7 @@ Accepts any document (PDF/PPT/Excel/HTML/images/...) → parses with Docling + V
 | `chunks.jsonl` | Chunked text with metadata (RAG vector search) |
 | `index.json` | File directory (Agent file discovery) |
 | `knowledge_map.yaml` + `knowledge_search.SKILL.md` | Auto-generated search guide |
+| `quality_report.json` | Vision accuracy health check (`[?]` + `[unreadable]` scan) |
 | `readable/*.md` | Human-readable version (optional, via `refine`) |
 
 ## Install
@@ -129,14 +130,21 @@ models:
     # claude-opus-4-6, gpt-5.4, gpt-5.4-mini, ...
 
 parsing:
+  vision:
+    image_dpi: 180                   # page image resolution for Vision (72/150/180/200)
   xlsx:
     denoising: { enabled: true }     # merged-cell cleanup for layout-heavy Excel
   docx:
-    vision_page_images: true          # LibreOffice → PDF → Vision for Word
+    vision_page_images: true         # LibreOffice → PDF → Vision for Word
     max_page_images: 20
+  pptx:
+    vision_page_images: true         # same for PowerPoint
+    max_page_images: 30
 
 incremental:
   enabled: true                      # content-addressed output cache
+quality_report:
+  enabled: true                      # scan output for [?] / [unreadable] markers
 ```
 
 ### Environment variables (for runtime tuning)
@@ -173,7 +181,9 @@ Also works via `.env` file at project root.
 - **Per-page Vision AI** — AI decides per page: clean up text / describe charts / OCR scan. Parallel execution, cached by content hash.
 - **Smart chunking** — auto strategy selection by format + structure scoring. CJK-aware token estimation. Protected blocks (tables, code, lists, quotes) kept intact.
 - **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction. Layout-heavy Excel (仕様書) → ~97% noise reduction. Data Excel unaffected.
-- **Excel Vision fallback** — LibreOffice → PDF → page screenshots → Vision AI. Recovers diagrams and margin notes Docling can't extract.
+- **Office Vision fallback** — Excel/Word/PPT all use LibreOffice → PDF → page screenshots → Vision AI for content Docling can't extract (diagrams, screen mockups, margin notes). Configurable per format (`parsing.{xlsx,docx,pptx}.vision_page_images`).
+- **Tunable image DPI** — page image resolution (default 180 DPI) balances clarity vs cost. `parsing.vision.image_dpi` controls all Vision render paths uniformly.
+- **Anti-hallucination Vision** — prompt enforces `[?]` for partial reads and `[unreadable]` for truly illegible content. AI never invents values. Post-run quality report scans all output for these markers and flags files needing review.
 - **Incremental cache** — content-addressed, per-file, crash-safe. 100 specs + 1 new file → only 1 file re-runs.
 - **AI Refine** — standalone `refine` command for human-readable output with Mermaid flowcharts, customizable via SKILL files.
 - **Knowledge Map** — auto-generated search guide + keyword reverse index + optional AI summary.
@@ -186,15 +196,18 @@ Also works via `.env` file at project root.
 config/default.yaml              # Default configuration
 skills/                          # SKILL templates (refine prompts, customizable)
 src/docingest/
-├── cli.py                       # CLI: run + refine
-├── pipeline.py                  # Main pipeline (Phase 1-4) + Excel denoising
-├── incremental.py               # Content-addressed output cache
-├── refine.py                    # AI Refine (standalone)
-├── parsers/                     # Phase 1: Docling, text, vision
-├── chunkers/                    # Phase 3: recursive, heading, slide, sheet
-├── enrichment/                  # path injection
-├── models/                      # LLM provider + cache
-└── output/                      # markdown_writer, chunks_writer, knowledge_map
+├── cli.py                       # CLI: run + refine subcommands
+├── config.py                    # YAML + env var loader (DOCINGEST__* overrides)
+├── pipeline.py                  # Main pipeline (Phase 1.1→1.5, 2, 3, 4) +
+│                                #   Excel denoising + Office Vision fallbacks
+├── incremental.py               # Content-addressed output cache (cache_key + meta.json)
+├── refine.py                    # AI Refine standalone command (sources/ → readable/)
+├── parsers/                     # Phase 1: Docling, text fallback, vision (anti-hallucination prompt)
+├── chunkers/                    # Phase 3: recursive, heading, slide, sheet, auto router
+├── enrichment/                  # path injection ([来源: file > section])
+├── models/                      # LLM provider (litellm) + AI call cache (diskcache)
+└── output/                      # markdown_writer, chunks_writer, index_builder,
+                                 #   knowledge_map, quality_report
 test_incremental/                # Regression tests for cache mechanism
 DESIGN.md                        # Full design document (architecture, rationale)
 ```

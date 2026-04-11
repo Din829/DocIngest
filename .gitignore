@@ -14,6 +14,7 @@ knowledge/chunks.jsonl
 knowledge/knowledge_map.yaml
 knowledge/knowledge_search.SKILL.md
 knowledge/errors.json
+knowledge/quality_report.json
 
 # Test output directories
 test_output*/

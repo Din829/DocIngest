@@ -73,6 +73,10 @@ class PipelineResult:
     total_tokens: int = 0
     elapsed_ms: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
+    # Quality report summary (populated after Phase 4 if enabled).
+    # Keys: total_files, files_with_issues, total_questions, total_unreadable,
+    #       quality_score, files (only files with issues).
+    quality: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -468,12 +472,15 @@ def _generate_page_images_via_libreoffice(
                 return
 
             # Step 2: PDF → page images
+            # Resolve target DPI from config (unified across all render paths)
+            image_dpi = get_nested(config, "parsing.vision.image_dpi", 180)
+
             pages_data: list = []
             total_pages = 0
 
             try:
                 from pdf2image import convert_from_path
-                images = convert_from_path(str(pdf_files[0]), dpi=150)
+                images = convert_from_path(str(pdf_files[0]), dpi=image_dpi)
                 total_pages = len(images)
                 for i, img in enumerate(images):
                     if i >= max_pages:
@@ -496,6 +503,7 @@ def _generate_page_images_via_libreoffice(
 
                     opts = PdfPipelineOptions()
                     opts.generate_page_images = True
+                    opts.images_scale = image_dpi / 72.0
                     conv = DocumentConverter(
                         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
                     )
@@ -1311,6 +1319,25 @@ def run_pipeline(
             json.dumps(pipeline_result.errors, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+    # Quality report: scan sources/*.md for [?] and [unreadable] markers
+    # left by Vision when it encountered partially-readable content. Gives
+    # a quick health check on output accuracy.
+    if get_nested(config, "quality_report.enabled", True):
+        try:
+            from .output.quality_report import generate_report
+            sources_dir = output_dir / get_nested(
+                config, "output.sources_dir", "sources"
+            )
+            report_filename = get_nested(
+                config, "quality_report.output_file", "quality_report.json"
+            )
+            pipeline_result.quality = generate_report(
+                sources_dir=sources_dir,
+                output_path=output_dir / report_filename,
+            )
+        except Exception as e:
+            _pipeline_logger.warning(f"Quality report generation failed: {e}")
 
     pipeline_result.elapsed_ms = int((time.monotonic() - t_start) * 1000)
     return pipeline_result

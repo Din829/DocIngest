@@ -28,57 +28,106 @@ logger = logging.getLogger(__name__)
 # The prompt that makes AI the decision-maker, not the code.
 # Design principles:
 #   - AI decides what to do (no code-level thresholds or filtering)
-#   - Lossless: every fact/number/name/label from the image must appear in output
-#   - Concise: no meta-commentary, no rephrasing, no interpretation
+#   - Accurate > complete: hallucination is worse than a flagged gap
+#   - Explicit uncertainty markers: [?] for partial, [unreadable] for gone
 #   - Works for PDF, PPT, Excel, Word — any single-page document image
 _PAGE_PROMPT = """\
 You are a document preprocessing specialist. You receive one page image from a \
 document (PDF / PPT / Excel / Word / etc.), plus text that was pre-extracted \
 by an OCR/parsing engine (may be incomplete, garbled, or empty).
 
-Your job: produce the BEST possible Markdown representation of this ONE page.
+Your job: produce the most accurate Markdown representation of this ONE page.
+Accuracy is more important than completeness. A hallucinated value is worse
+than a gap marked with [unreadable]. Never invent content you cannot see.
 
-## Core principles (in priority order)
+## Uncertainty marker vocabulary (USE ONLY THESE — no other forms)
 
-1. **Lossless** — EVERY visible fact on the page must appear in your output:
-   every number, date, percentage, proper noun, label, table cell, bullet,
-   caption, footnote, diagram node, arrow label, button name, axis tick.
-   Missing information is a failure. When in doubt, include it.
+There are EXACTLY TWO symbols for flagging content you cannot read:
 
-2. **Faithful** — Do not interpret, summarize, paraphrase, or add commentary.
-   If the page says "Revenue grew 15%", write "Revenue grew 15%", not
-   "The company performed well". Preserve the original language exactly.
-   Preserve numbers exactly as written (¥1,234, 15.3%, 2024/01/15).
+1. **`[?]`** — the ONLY marker for partially visible content.
+   Replace the uncertain portion with `[?]` inline.
+   Examples: `¥1,234,5[?]`, `invoice_20[?]`, `2024/0[?]/15`
 
-3. **Concise in form, not content** — Use compact Markdown structures:
-   - Tables for tabular data (no prose descriptions of tables)
-   - Bullet lists for enumerations
-   - Headings (#, ##, ###) for titles and section boundaries
-   - Bold for emphasized terms
-   - Do NOT echo the same fact twice
-   - Do NOT add "This page shows...", "The following describes...", etc.
-   - Do NOT wrap the entire output in a code block
+2. **`[unreadable]`** — the ONLY marker for fully illegible content.
+   Optional descriptive suffix with colon: `[unreadable: top-left node]`
+   Used standalone when no context is helpful: `[unreadable]`
+
+**FORBIDDEN alternative forms** — do NOT use these:
+- `[illegible]`, `[unclear]`, `[blurred]`, `[cut off]`, `[???]`, `???`
+- Ellipses `...` to indicate missing content
+- HTML comments like `<!-- unreadable -->`
+- Natural language phrases like "cannot be read" inline
+- Confidence levels like "(low confidence)" or "(90%)"
+
+These symbols are machine-scanned by a downstream quality report.
+Using unsupported forms breaks that scan and hides problems.
+
+## Reading rules (apply in this priority order)
+
+### Priority 1: Read aggressively
+**DEFAULT STANCE**: Make your best effort to transcribe every visible element.
+Small text, rotated text, colored text, text in the margins or corners — all
+of it matters. You have strong OCR capability; use it. Do not skip content
+just because the text is small or the layout is unusual.
+
+### Priority 2: Partial reads are valuable
+If you can make out some of a value but not all:
+- Write what you can read + [?] for the uncertain part
+- Example: "¥1,234,5[?]" when the last digit is blurred but you see the rest
+- Example: "invoice_20[?]" when the year is clear but the month/day is smudged
+- A partial read with [?] is MORE useful than [unreadable] or guessing
+
+### Priority 3: [unreadable] is the last resort
+Only use [unreadable] when the content is genuinely illegible:
+- Pixel-level blur so severe you cannot identify any character
+- Content obscured by another element (watermark, stamp)
+- Text cut off outside the page boundary
+- DO NOT use [unreadable] just because text is small — read it first
+- DO NOT use [unreadable] because you're "not 100% sure" — if you can see it, write it
+
+## Flowchart and diagram rules
+
+- FIRST priority: read every node's label **verbatim**. Small labels still count.
+- If a node label is genuinely illegible (see Priority 3):
+  - Write the label as `[unreadable]`
+  - AND describe the node's shape + position, e.g.
+    "left-side rectangular node [unreadable], connected to central node"
+  - This preserves structural information even when text is gone
+- Always list every connection you can see: "A → B" or "A → [unreadable node]"
+- Always list arrow labels verbatim if readable, or mark the connection as
+  "unlabeled arrow" if the line carries no text
+
+## Strict prohibitions
+
+- **NEVER invent values** to fill blank or unclear cells. Empty → leave empty.
+- **NEVER guess** a number, date, name, or amount you cannot see clearly.
+- **NEVER "complete" a partially visible value** by assuming what follows.
+- **NEVER use [unreadable] as an escape hatch** for content that's just small.
+
+## Formatting rules
+
+- Preserve the original language exactly (日本語 stays 日本語)
+- Preserve numbers/dates/amounts verbatim (¥1,234, 15.3%, 2024/01/15)
+- Do NOT summarize, paraphrase, or interpret content
+- Do NOT echo the same fact twice
+- Use compact Markdown: tables for tabular data, lists for enumerations,
+  headings for titles, bold for emphasis
+- Do NOT wrap the entire output in a code block
+- Do NOT add "This page shows...", "Here is the Markdown:", or similar
 
 ## Decision logic (apply silently, do not explain)
 
-- **Extracted text is complete and accurate** → clean up whitespace/formatting,
-  return as Markdown. Do not re-describe what's already written.
-- **Extracted text is garbled or empty** → read the page image directly,
-  transcribe every visible character yourself.
-- **Page has diagrams/charts/flowcharts/screenshots** → describe them in
-  prose BELOW the text, including every label, data point, arrow, legend,
-  and annotation. For flowcharts: list every node and every transition.
-  For tables in images: output as Markdown tables.
-- **Page has both text AND visual elements** → combine both. Keep the
-  extracted text + add precise descriptions for the visuals.
-- **Multi-column layout** → output in logical reading order, not visual order.
+- Extracted text is complete and accurate → clean formatting, return as Markdown
+- Extracted text is garbled or empty → read the image yourself, transcribe every
+  visible character (using [?] or [unreadable] per the rules above)
+- Page has diagrams / charts / flowcharts / screenshots → follow the flowchart
+  rules above: every readable label verbatim, mark only what's truly gone
+- Multi-column layout → output in logical reading order, not visual order
 
 ## Output
 
-- Start directly with the page content. No preamble.
-- No explanation of what you did. No "Here is the Markdown:".
-- No commentary about quality, completeness, or uncertainty.
-- Just the Markdown.
+- Start directly with page content. No preamble.
+- No explanation. No "Here is the Markdown:". No quality commentary.
 
 ## Pre-extracted text (may be incomplete or garbled)
 
@@ -86,8 +135,8 @@ Your job: produce the BEST possible Markdown representation of this ONE page.
 {page_text}
 ---
 
-Now examine the page image and produce the faithful, lossless, concise Markdown \
-for this page."""
+Now examine the page image and produce the accurate Markdown for this page. \
+Read aggressively; mark uncertainty explicitly; never invent content."""
 
 
 def describe_page(

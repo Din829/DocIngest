@@ -1,9 +1,69 @@
 # DocIngest 設計ドキュメント
 
-> Version: 0.3
-> Date: 2026-04-09
-> Updated: Phase 1.2 (Excel Denoising), Phase 1.3 (Excel Page Images), AI Refine command, requirements.txt, LibreOffice integration
-> Previous: v0.2 (Phase 1.5 Vision, Phase 4 Knowledge Map, CJK tokens, section injection, overlap)
+> Version: 0.4
+> Date: 2026-04-11
+> Updated:
+>   - Incremental cache (content-addressed, per-file meta.json, crash-safe)
+>   - Env variable overrides (DOCINGEST__* → config; CLI > env > YAML > default)
+>   - Phase 1.3 unified for Excel + Word + PPT (LibreOffice → PDF → page screenshots)
+>   - Vision DPI tunable (default 180, single config for all formats)
+>   - Anti-hallucination Vision prompt ([?] for partial reads, [unreadable] for gaps,
+>     strict vocabulary, never invent)
+>   - Quality report module (post-run scan of sources/*.md for uncertainty markers)
+>   - Vision injection bug fix (Mode B for documents without pagebreak markers)
+>   - PPT Phase 1.3 alignment (was parser-internal only)
+> Previous:
+>   - v0.3 (Excel denoising, Excel page images via LibreOffice, AI Refine command,
+>     requirements.txt)
+>   - v0.2 (Phase 1.5 Vision, Phase 4 Knowledge Map, CJK tokens, section injection,
+>     overlap)
+
+---
+
+## Architecture snapshot (v0.4)
+
+```
+discover_files()
+    ↓
+[for each file] partition by incremental cache:
+    cached → reuse from .cache/{cache_key}.meta.json + old chunks.jsonl
+    new    → process_single_file():
+        Phase 1   Docling parse → Markdown + pages + metadata
+        Phase 1.1 garbled text detection → pymupdf fallback (PDF only)
+        Phase 1.2 Excel denoising (xlsx/xls/csv): merged-cell dedup,
+                  sparse cell strip, embedded image extraction
+        Phase 1.3 LibreOffice page image generation (when Docling has no pages):
+                  xlsx/xls → _ensure_excel_page_images
+                  docx/doc → _ensure_docx_page_images
+                  pptx/ppt → _ensure_pptx_page_images
+                  All wrap _generate_page_images_via_libreoffice (shared backend)
+                  Resolution: parsing.vision.image_dpi (default 180)
+        Phase 1.5 Vision enrichment (per-page parallel):
+                  - send page image + Docling text to LLM
+                  - anti-hallucination prompt: [?] partial / [unreadable] gone
+                  - Mode A: pagebreak-aligned section injection
+                  - Mode B: append at document end (DOCX without pagebreaks)
+                  Cache by image content hash → repeat pages free
+        Phase 2   write_markdown(sources/) + assets/
+        Phase 3   chunker (auto/heading/recursive/slide/sheet) → chunks
+                  + path injection [来源: file > section] + post-process
+        write meta.json for incremental cache
+        ↓
+merge reused_chunks + new_chunks → chunks.jsonl
+write index.json
+Phase 4   knowledge_map.yaml + knowledge_search.SKILL.md (zero-cost stage 1
+          + optional AI summary stage 2)
+[optional] quality_report.json (scan sources/*.md for [?] / [unreadable])
+```
+
+**Optional standalone command** (not part of main pipeline):
+```
+docingest refine sources/spec.md → readable/spec.md
+  Loads skills/refine_default.SKILL.md as system prompt
+  Calls models.chunking_assist (cheap LLM)
+  Cleans formula residue, HTML comments, merges Docling+Vision overlap,
+  generates Mermaid for flowcharts described in text
+```
 
 ---
 

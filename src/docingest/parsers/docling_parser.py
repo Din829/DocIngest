@@ -118,6 +118,10 @@ class DoclingParser(BaseParser):
         vision_enabled = get_nested(self.config, "parsing.vision.enabled", True)
         if vision_enabled:
             pipeline_options.generate_page_images = True
+            # Docling's images_scale is a multiplier of the PDF's native 72 DPI.
+            # 180 DPI → scale 2.5 → 1488×2105 for A4, ~3.1 Mpx (under 4MP cap).
+            image_dpi = get_nested(self.config, "parsing.vision.image_dpi", 180)
+            pipeline_options.images_scale = image_dpi / 72.0
 
         # Build converter with PDF options
         self._converter = DocumentConverter(
@@ -403,10 +407,13 @@ class DoclingParser(BaseParser):
                 if not pdf_files:
                     return
 
+                # Resolve target DPI from config (unified across all paths)
+                image_dpi = get_nested(self.config, "parsing.vision.image_dpi", 180)
+
                 # Step 2: PDF pages → images via Docling or pdf2image
                 try:
                     from pdf2image import convert_from_path
-                    images = convert_from_path(str(pdf_files[0]), dpi=150)
+                    images = convert_from_path(str(pdf_files[0]), dpi=image_dpi)
                     for i, img in enumerate(images):
                         if i < len(pages_data):
                             name = f"{file_path.stem}-page-{pages_data[i].page_no:03d}.png"
@@ -422,6 +429,7 @@ class DoclingParser(BaseParser):
 
                     opts = PdfPipelineOptions()
                     opts.generate_page_images = True
+                    opts.images_scale = image_dpi / 72.0
                     conv = DocumentConverter(
                         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
                     )
