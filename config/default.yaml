@@ -61,8 +61,14 @@ parsing:
     max_pages: null           # null = no limit
 
   # PPT-specific
+  # Docling extracts text from PPT but image generation depends on the backend
+  # pipeline. When page images are missing, render via LibreOffice → PDF →
+  # screenshots so Vision AI can describe slide visuals.
   pptx:
-    include_notes: true       # include speaker notes
+    include_notes: true         # include speaker notes
+    vision_page_images: true    # LibreOffice → PDF → page screenshots → Vision
+    max_page_images: 30         # PPT can have many slides — cap for cost control
+    max_image_pixels: 4000000   # auto-downscale oversized page images
 
   # Word-specific
   # Docling extracts text + table structure from DOCX, but does NOT render page

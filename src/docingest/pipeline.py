@@ -595,6 +595,40 @@ def _ensure_docx_page_images(
     )
 
 
+def _ensure_pptx_page_images(
+    file_path: Path,
+    parse_result,
+    config: dict[str, Any],
+) -> None:
+    """
+    PPT-specific page image fallback (thin wrapper around the generic backend).
+
+    DoclingParser has an older PPT fallback in _try_external_page_images that
+    only triggers when Docling returned pages_data but with empty image_paths.
+    If Docling returns no pages at all (some PPT backends / simple pipeline),
+    this Phase 1.3 hook fills the gap — it creates pages from scratch via
+    LibreOffice rendering so Vision can still describe every slide.
+
+    The generic backend's first check `parse_result.pages and any(p.image_path)`
+    means this is a no-op when the parser-level fallback already succeeded,
+    so there's no double work.
+
+    Reads config from parsing.pptx.{vision_page_images, max_page_images, max_image_pixels}.
+    """
+    pptx_cfg = get_nested(config, "parsing.pptx", {})
+    if not pptx_cfg.get("vision_page_images", True):
+        return
+
+    _generate_page_images_via_libreoffice(
+        file_path=file_path,
+        parse_result=parse_result,
+        config=config,
+        max_pages=pptx_cfg.get("max_page_images", 30),
+        max_pixels=pptx_cfg.get("max_image_pixels", 4_000_000),
+        format_label="PPT",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vision enrichment
 # ---------------------------------------------------------------------------
@@ -882,10 +916,14 @@ def process_single_file(
         )
 
     # --- Phase 1.3: Ensure page images for Vision (formats without native page rendering) ---
+    # All three Office formats route through the same LibreOffice → PDF → screenshots
+    # backend. Each has its own config section so limits can be tuned per format.
     if result.format in ("xlsx", "xls"):
         _ensure_excel_page_images(file_path, parse_result, config)
     elif result.format in ("docx", "doc"):
         _ensure_docx_page_images(file_path, parse_result, config)
+    elif result.format in ("pptx", "ppt"):
+        _ensure_pptx_page_images(file_path, parse_result, config)
 
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):

@@ -22,6 +22,8 @@ test_pdf_incremental/
 test_incremental/out/
 test_word/
 test_word_*/
+test_pptx/
+test_pptx_*/
 
 # Test input files (large, downloaded samples)
 test_docs/
