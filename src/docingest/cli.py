@@ -79,6 +79,11 @@ def main(
         "--parallel",
         help="Number of files to process in parallel.",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Ignore incremental cache and re-process all files.",
+    ),
 ) -> None:
     """Process documents for RAG and Agentic Search."""
 
@@ -95,6 +100,9 @@ def main(
 
     if parallel:
         cli_overrides.setdefault("performance", {})["parallel_files"] = parallel
+
+    if force:
+        cli_overrides.setdefault("incremental", {})["force"] = True
 
     # Load config
     try:

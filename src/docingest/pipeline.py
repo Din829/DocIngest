@@ -30,6 +30,15 @@ from .output.markdown_writer import write_markdown
 from .output.index_builder import IndexBuilder
 from .output.chunks_writer import write_chunks
 from .enrichment.path_injector import inject_paths
+from .incremental import (
+    compute_cache_key,
+    compute_config_hash,
+    load_cached_meta,
+    save_cached_meta,
+    is_cache_valid,
+    load_chunks_by_id,
+    build_meta,
+)
 
 import logging
 _pipeline_logger = logging.getLogger(__name__)
@@ -896,6 +905,35 @@ def process_single_file(
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+def _collect_asset_rels_for_file(
+    file_path: Path,
+    output_dir: Path,
+    config: dict[str, Any],
+) -> list[str]:
+    """
+    Collect asset files belonging to a given source file.
+
+    Assets are named with the source file's stem as prefix:
+      - {stem}-page-NNN.png   (LibreOffice page screenshots)
+      - {stem}-image*.png     (xlsx embedded images)
+      - {stem}-p{N}-chart.png (PDF chart extractions)
+
+    Returns relative paths from output_dir (forward-slash normalized).
+    """
+    assets_dir_name = get_nested(config, "output.assets_dir", "assets")
+    assets_dir = output_dir / assets_dir_name
+    if not assets_dir.exists():
+        return []
+
+    stem = file_path.stem
+    rels: list[str] = []
+    for asset in assets_dir.iterdir():
+        if asset.is_file() and asset.name.startswith(f"{stem}-"):
+            rel = f"{assets_dir_name}/{asset.name}"
+            rels.append(rel)
+    return sorted(rels)
+
+
 def _make_index_parse_result(
     file_result: FileResult,
     output_dir: Path,
@@ -961,11 +999,106 @@ def run_pipeline(
     # Index builder for index.json
     index_builder = IndexBuilder(config)
 
-    # Collect all chunks for writing to chunks.jsonl
-    all_chunks: list = []
+    # Collect all chunks for writing to chunks.jsonl.
+    # Note: final chunks.jsonl = reused_chunk_records (from cache) + new_chunks (from processing)
+    new_chunks: list = []
+    reused_chunk_records: list[dict[str, Any]] = []
 
-    # Process each file
-    for file_path in files:
+    # --- Incremental mode setup ---
+    incremental_enabled = get_nested(config, "incremental.enabled", True)
+    force_rebuild = get_nested(config, "incremental.force", False)
+
+    cache_dir = output_dir / get_nested(config, "incremental.cache_dir", ".cache")
+    config_hash = compute_config_hash(config) if incremental_enabled else ""
+
+    # Load old chunks.jsonl once for cache validation + reuse
+    old_chunks_file = output_dir / get_nested(config, "chunking.output_file", "chunks.jsonl")
+    old_chunks_by_id: dict[str, dict[str, Any]] = {}
+    if incremental_enabled and not force_rebuild:
+        old_chunks_by_id = load_chunks_by_id(old_chunks_file)
+        _pipeline_logger.info(
+            f"Incremental: loaded {len(old_chunks_by_id)} existing chunks from {old_chunks_file.name}"
+        )
+
+    # Partition files: cached vs. to_process
+    cached_files: list[tuple[Path, dict[str, Any], str]] = []  # (path, meta, cache_key)
+    to_process: list[Path] = []
+
+    if incremental_enabled and not force_rebuild:
+        for file_path in files:
+            try:
+                cache_key = compute_cache_key(file_path)
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                _pipeline_logger.warning(f"Cannot hash {file_path.name}: {e}")
+                to_process.append(file_path)
+                continue
+
+            meta = load_cached_meta(cache_dir, cache_key)
+            if meta is None:
+                to_process.append(file_path)
+                continue
+
+            valid, reason = is_cache_valid(meta, config_hash, output_dir, old_chunks_by_id)
+            if valid:
+                cached_files.append((file_path, meta, cache_key))
+            else:
+                _pipeline_logger.debug(
+                    f"Cache miss for {file_path.name}: {reason}"
+                )
+                to_process.append(file_path)
+
+        _pipeline_logger.info(
+            f"Incremental: {len(cached_files)} cached, {len(to_process)} to process "
+            f"(out of {len(files)} total)"
+        )
+    else:
+        to_process = list(files)
+        if force_rebuild:
+            _pipeline_logger.info("Incremental: --force flag set, full rebuild")
+
+    # --- Process cached files: reuse outputs, no Phase 1-3 work ---
+    for file_path, meta, cache_key in cached_files:
+        # Populate FileResult for reporting
+        file_result = FileResult(
+            original_file=str(file_path),
+            output_path=meta["outputs"]["source_md"],
+            format=meta.get("format", "unknown"),
+            success=True,
+            chunks_count=len(meta["outputs"].get("chunk_ids", [])),
+            tokens_estimated=meta.get("index_entry", {}).get("tokens_estimated", 0),
+            parse_time_ms=0,
+            chunk_time_ms=0,
+        )
+        pipeline_result.files.append(file_result)
+        pipeline_result.successful += 1
+        pipeline_result.total_chunks += file_result.chunks_count
+        pipeline_result.total_tokens += file_result.tokens_estimated
+
+        # Reuse index entry
+        index_builder.add_cached_entry(meta["index_entry"])
+
+        # Reuse chunks (lookup by id in old chunks.jsonl)
+        for chunk_id in meta["outputs"].get("chunk_ids", []):
+            record = old_chunks_by_id.get(chunk_id)
+            if record is not None:
+                reused_chunk_records.append(record)
+
+        # Reserve output filename so new files don't collide with cached ones
+        source_md_rel = meta["outputs"].get("source_md", "")
+        if source_md_rel:
+            existing_names.add(Path(source_md_rel).name)
+
+        # Update last_seen_path if it changed (file moved/renamed)
+        new_path_str = str(file_path.resolve()).replace("\\", "/")
+        if meta.get("last_seen_path") != new_path_str:
+            meta["last_seen_path"] = new_path_str
+            try:
+                save_cached_meta(cache_dir, meta)
+            except OSError as e:
+                _pipeline_logger.warning(f"Could not update meta for {file_path.name}: {e}")
+
+    # --- Process uncached files: full pipeline ---
+    for file_path in to_process:
         file_result, file_chunks = process_single_file(
             file_path=file_path,
             parser=parser,
@@ -981,16 +1114,39 @@ def run_pipeline(
             pipeline_result.successful += 1
             pipeline_result.total_chunks += file_result.chunks_count
             pipeline_result.total_tokens += file_result.tokens_estimated
-            all_chunks.extend(file_chunks)
+            new_chunks.extend(file_chunks)
 
-            # Add to index
-            index_builder.add_file(
+            # Add to index (returns the entry so we can store it in meta.json)
+            index_entry = index_builder.add_file(
                 parse_result=_make_index_parse_result(file_result, output_dir),
                 original_file=file_path,
                 output_path=output_dir / file_result.output_path,
                 output_dir=output_dir,
                 chunks_count=file_result.chunks_count,
             )
+
+            # Persist meta.json for next incremental run
+            if incremental_enabled:
+                try:
+                    from .output.chunks_writer import build_chunk_id
+                    cache_key = compute_cache_key(file_path)
+                    chunk_ids = [build_chunk_id(c) for c in file_chunks]
+                    asset_rels = _collect_asset_rels_for_file(file_path, output_dir, config)
+                    meta = build_meta(
+                        file_path=file_path,
+                        cache_key=cache_key,
+                        config_hash=config_hash,
+                        format_str=file_result.format,
+                        source_md_rel=file_result.output_path,
+                        asset_rels=asset_rels,
+                        chunk_ids=chunk_ids,
+                        index_entry=index_entry,
+                    )
+                    save_cached_meta(cache_dir, meta)
+                except Exception as e:
+                    _pipeline_logger.warning(
+                        f"Could not save incremental cache for {file_path.name}: {e}"
+                    )
         else:
             pipeline_result.failed += 1
             pipeline_result.errors.append({
@@ -1002,9 +1158,20 @@ def run_pipeline(
     # Write index.json
     index_builder.write_index(output_dir)
 
-    # Write chunks.jsonl (all chunks from all files)
-    if all_chunks and get_nested(config, "chunking.enabled", True):
-        write_chunks(all_chunks, output_dir, config)
+    # Write chunks.jsonl: merge reused (from cache) + new chunks
+    if get_nested(config, "chunking.enabled", True):
+        from .output.chunks_writer import build_chunk_id, write_chunk_records
+        new_records = [
+            {
+                "id": build_chunk_id(c),
+                "text": c.text,
+                "metadata": c.metadata,
+            }
+            for c in new_chunks
+        ]
+        all_final_records = reused_chunk_records + new_records
+        if all_final_records:
+            write_chunk_records(all_final_records, output_dir, config)
 
     # Generate knowledge map (Phase 4)
     if get_nested(config, "knowledge_map.enabled", True):

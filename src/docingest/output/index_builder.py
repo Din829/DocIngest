@@ -70,7 +70,7 @@ class IndexBuilder:
         output_path: Path,
         output_dir: Path,
         chunks_count: int = 0,
-    ) -> None:
+    ) -> dict[str, Any]:
         """
         Add a processed file to the index.
 
@@ -80,6 +80,9 @@ class IndexBuilder:
             output_path: Absolute path to the written .md file.
             output_dir: Base output directory (for relative path calculation).
             chunks_count: Number of chunks generated for this file.
+
+        Returns:
+            The index entry dict that was just added (for reuse in meta.json).
         """
         # Compute relative path from output_dir
         try:
@@ -115,6 +118,22 @@ class IndexBuilder:
         self.files.append(entry)
         self.total_chunks += chunks_count
         self.total_tokens += tokens_est
+        return entry
+
+    def add_cached_entry(self, entry: dict[str, Any]) -> None:
+        """
+        Add a pre-computed index entry from incremental cache.
+
+        Used when a file is reused from cache — we already have its full
+        index entry from the previous run, no need to re-extract sections
+        or re-count tokens.
+
+        Args:
+            entry: The index entry dict as stored in meta.json["index_entry"].
+        """
+        self.files.append(entry)
+        self.total_chunks += entry.get("chunks_count", 0)
+        self.total_tokens += entry.get("tokens_estimated", 0)
 
     def add_error(self) -> None:
         """Record that a file failed processing."""

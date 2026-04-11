@@ -165,11 +165,27 @@ error_handling:
   report_file: "errors.json"
 
 # =============================================================================
-# Cache
+# Cache (AI call result caching — Vision/LLM responses by content hash)
 # =============================================================================
 cache:
   enabled: true
   dir: ".docingest_cache"
+
+# =============================================================================
+# Incremental processing (content-addressed pipeline output cache)
+# =============================================================================
+# Skips re-processing files whose content hasn't changed since last run.
+# Cache key = md5(head + tail bytes) + file_size (content-based, NOT path-based).
+# Invalidates automatically when:
+#   - File content changes
+#   - Output config changes (relevant subset only)
+#   - Output files (sources/, assets/) are manually deleted
+#   - chunk_ids are missing from chunks.jsonl
+# Cache stored at: {output.dir}/{incremental.cache_dir}/*.meta.json
+incremental:
+  enabled: true                   # master toggle
+  force: false                    # true → ignore cache, full rebuild
+  cache_dir: ".cache"             # relative to output.dir
 
 # =============================================================================
 # Refine (optional: AI-powered Markdown cleanup for human readability)

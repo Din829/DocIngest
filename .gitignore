@@ -18,10 +18,19 @@ knowledge/errors.json
 # Test output directories
 test_output*/
 test_shiyousho/
+test_pdf_incremental/
+test_incremental/out/
 
 # Test input files (large, downloaded samples)
 test_docs/
 仕様書サンプル/
+
+# User knowledge bases
+knowledge/
+knowledge_*/
+
+# Reference projects (cloned externally)
+参考项目/
 
 # Misc
 errors.json
