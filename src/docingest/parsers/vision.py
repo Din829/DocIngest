@@ -26,29 +26,68 @@ from ..models.cache import AICache, content_hash_file
 logger = logging.getLogger(__name__)
 
 # The prompt that makes AI the decision-maker, not the code.
+# Design principles:
+#   - AI decides what to do (no code-level thresholds or filtering)
+#   - Lossless: every fact/number/name/label from the image must appear in output
+#   - Concise: no meta-commentary, no rephrasing, no interpretation
+#   - Works for PDF, PPT, Excel, Word — any single-page document image
 _PAGE_PROMPT = """\
-You are a document preprocessing assistant. You receive:
-1. A page image from a document (PDF, PPT, etc.)
-2. Text that was extracted from this page by an OCR/parsing engine (may be incomplete, garbled, or empty)
+You are a document preprocessing specialist. You receive one page image from a \
+document (PDF / PPT / Excel / Word / etc.), plus text that was pre-extracted \
+by an OCR/parsing engine (may be incomplete, garbled, or empty).
 
-Your job: produce the BEST possible Markdown representation of this page's content.
+Your job: produce the BEST possible Markdown representation of this ONE page.
 
-Rules:
-- If the extracted text is already complete and accurate, return it cleaned up (fix formatting only)
-- If the page has charts, graphs, diagrams, or images, describe them in detail with all data points
-- If the extracted text is empty or garbled (OCR failure), read the page image yourself and extract all text
-- If the page has both good text AND visual elements, combine: keep the text + add descriptions for visuals
-- Output clean Markdown. Use tables for tabular data, lists for bullet points, headings for titles
-- Preserve the original language of the document (Japanese, Chinese, English, etc.)
-- Be precise with numbers, percentages, dates, and proper nouns
-- Do NOT add commentary — only output the page content
+## Core principles (in priority order)
 
-Extracted text from this page (may be incomplete):
+1. **Lossless** — EVERY visible fact on the page must appear in your output:
+   every number, date, percentage, proper noun, label, table cell, bullet,
+   caption, footnote, diagram node, arrow label, button name, axis tick.
+   Missing information is a failure. When in doubt, include it.
+
+2. **Faithful** — Do not interpret, summarize, paraphrase, or add commentary.
+   If the page says "Revenue grew 15%", write "Revenue grew 15%", not
+   "The company performed well". Preserve the original language exactly.
+   Preserve numbers exactly as written (¥1,234, 15.3%, 2024/01/15).
+
+3. **Concise in form, not content** — Use compact Markdown structures:
+   - Tables for tabular data (no prose descriptions of tables)
+   - Bullet lists for enumerations
+   - Headings (#, ##, ###) for titles and section boundaries
+   - Bold for emphasized terms
+   - Do NOT echo the same fact twice
+   - Do NOT add "This page shows...", "The following describes...", etc.
+   - Do NOT wrap the entire output in a code block
+
+## Decision logic (apply silently, do not explain)
+
+- **Extracted text is complete and accurate** → clean up whitespace/formatting,
+  return as Markdown. Do not re-describe what's already written.
+- **Extracted text is garbled or empty** → read the page image directly,
+  transcribe every visible character yourself.
+- **Page has diagrams/charts/flowcharts/screenshots** → describe them in
+  prose BELOW the text, including every label, data point, arrow, legend,
+  and annotation. For flowcharts: list every node and every transition.
+  For tables in images: output as Markdown tables.
+- **Page has both text AND visual elements** → combine both. Keep the
+  extracted text + add precise descriptions for the visuals.
+- **Multi-column layout** → output in logical reading order, not visual order.
+
+## Output
+
+- Start directly with the page content. No preamble.
+- No explanation of what you did. No "Here is the Markdown:".
+- No commentary about quality, completeness, or uncertainty.
+- Just the Markdown.
+
+## Pre-extracted text (may be incomplete or garbled)
+
 ---
 {page_text}
 ---
 
-Now look at the page image and produce the best Markdown for this page."""
+Now examine the page image and produce the faithful, lossless, concise Markdown \
+for this page."""
 
 
 def describe_page(

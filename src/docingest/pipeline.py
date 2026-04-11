@@ -409,31 +409,32 @@ def _downscale_image(image_path: str, max_pixels: int) -> None:
         _pipeline_logger.debug(f"Image downscale failed: {e}")
 
 
-def _ensure_excel_page_images(
+def _generate_page_images_via_libreoffice(
     file_path: Path,
     parse_result,
     config: dict[str, Any],
+    max_pages: int,
+    max_pixels: int,
+    format_label: str,
 ) -> None:
     """
-    Ensure Excel files have page images for Vision enrichment.
+    Generic LibreOffice → PDF → page screenshots for formats without native page images.
 
-    If Docling didn't produce page images (typical for xlsx), use
-    LibreOffice headless → PDF → page screenshots.
+    Works for any LibreOffice-supported format (xlsx, xls, docx, doc, pptx, odt, etc.).
+    This is the shared backend for _ensure_excel_page_images and _ensure_docx_page_images.
 
-    Protections:
-      - max_page_images: caps how many pages are sent to Vision.
-        Excess pages are skipped (text-only) with a warning in metadata.
-      - max_image_pixels: oversized images are downscaled to this pixel count.
-        Prevents Vision API failures and excessive token cost.
+    Args:
+        file_path: Source file.
+        parse_result: ParseResult to mutate (adds pages).
+        config: Full config dict.
+        max_pages: Cap on number of page images sent to Vision.
+        max_pixels: Auto-downscale images exceeding this pixel count.
+        format_label: "Excel" / "Word" / etc., used only in log messages and warnings.
     """
     import shutil
     import subprocess
     import tempfile
     from .parsers.base import PageData
-
-    xlsx_denoise = get_nested(config, "parsing.xlsx.denoising", {})
-    if not xlsx_denoise.get("ensure_page_images", True):
-        return
 
     # Already has images → nothing to do
     if parse_result.pages and any(p.image_path for p in parse_result.pages):
@@ -442,12 +443,9 @@ def _ensure_excel_page_images(
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
         _pipeline_logger.debug(
-            "LibreOffice not found — cannot generate Excel page images"
+            f"LibreOffice not found — cannot generate {format_label} page images"
         )
         return
-
-    max_pages = xlsx_denoise.get("max_page_images", 10)
-    max_pixels = xlsx_denoise.get("max_image_pixels", 4_000_000)
 
     assets_dir = Path(get_nested(
         config, "output.dir", "./knowledge"
@@ -456,14 +454,17 @@ def _ensure_excel_page_images(
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Step 1: Excel → PDF via LibreOffice
+            # Step 1: → PDF via LibreOffice
             subprocess.run(
                 [soffice, "--headless", "--convert-to", "pdf",
                  "--outdir", tmpdir, str(file_path)],
-                capture_output=True, timeout=120,
+                capture_output=True, timeout=180,
             )
             pdf_files = list(Path(tmpdir).glob("*.pdf"))
             if not pdf_files:
+                _pipeline_logger.debug(
+                    f"LibreOffice produced no PDF for {file_path.name}"
+                )
                 return
 
             # Step 2: PDF → page images
@@ -522,14 +523,14 @@ def _ensure_excel_page_images(
             if pages_data:
                 parse_result.pages = pages_data
                 _pipeline_logger.info(
-                    f"Excel page images: generated {len(pages_data)} pages "
+                    f"{format_label} page images: generated {len(pages_data)} pages "
                     f"via LibreOffice for {file_path.name}"
                 )
 
             # Emit warning if pages were capped (visible in frontmatter + logs)
             if total_pages > max_pages:
                 warn_msg = (
-                    f"Excel produced {total_pages} pages, "
+                    f"{format_label} produced {total_pages} pages, "
                     f"only first {max_pages} sent to Vision "
                     f"(max_page_images={max_pages}). "
                     f"Remaining pages use text-only extraction."
@@ -539,7 +540,59 @@ def _ensure_excel_page_images(
                 warnings.append(warn_msg)
 
     except Exception as e:
-        _pipeline_logger.debug(f"Excel page image generation failed: {e}")
+        _pipeline_logger.debug(f"{format_label} page image generation failed: {e}")
+
+
+def _ensure_excel_page_images(
+    file_path: Path,
+    parse_result,
+    config: dict[str, Any],
+) -> None:
+    """
+    Excel-specific page image fallback (thin wrapper around the generic backend).
+
+    Reads config from parsing.xlsx.denoising.{ensure_page_images, max_page_images, max_image_pixels}.
+    """
+    xlsx_denoise = get_nested(config, "parsing.xlsx.denoising", {})
+    if not xlsx_denoise.get("ensure_page_images", True):
+        return
+
+    _generate_page_images_via_libreoffice(
+        file_path=file_path,
+        parse_result=parse_result,
+        config=config,
+        max_pages=xlsx_denoise.get("max_page_images", 10),
+        max_pixels=xlsx_denoise.get("max_image_pixels", 4_000_000),
+        format_label="Excel",
+    )
+
+
+def _ensure_docx_page_images(
+    file_path: Path,
+    parse_result,
+    config: dict[str, Any],
+) -> None:
+    """
+    Word-specific page image fallback (thin wrapper around the generic backend).
+
+    Docling's DOCX pipeline extracts text but does NOT produce page images,
+    so embedded diagrams and figures are lost. This function renders the DOCX
+    via LibreOffice → PDF → screenshots, feeding them to Vision for description.
+
+    Reads config from parsing.docx.{vision_page_images, max_page_images, max_image_pixels}.
+    """
+    docx_cfg = get_nested(config, "parsing.docx", {})
+    if not docx_cfg.get("vision_page_images", True):
+        return
+
+    _generate_page_images_via_libreoffice(
+        file_path=file_path,
+        parse_result=parse_result,
+        config=config,
+        max_pages=docx_cfg.get("max_page_images", 20),
+        max_pixels=docx_cfg.get("max_image_pixels", 4_000_000),
+        format_label="Word",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -617,18 +670,39 @@ def _enrich_with_vision(
             else:
                 failed += 1
 
-    # Inject results into markdown sections
+    # Inject results into markdown sections.
+    # Two modes depending on whether the source has pagebreak markers:
+    #   A) pagebreak-aligned (PDF, PPT): inject each page's result into its section
+    #   B) no pagebreaks (DOCX via LibreOffice): append all results in page order
+    #      at the end of the document. We can't align to text sections because
+    #      LibreOffice-rendered pages don't correspond to Docling's text layout.
     pagebreak = PAGEBREAK_MARKER
     sections = parse_result.markdown.split(pagebreak)
+    has_pagebreaks = len(sections) > 1
 
-    for idx, text in results.items():
-        if idx < len(sections):
-            sections[idx] = (
-                sections[idx].rstrip()
-                + f"\n\n<!-- vision-enriched -->\n{text}\n"
+    if has_pagebreaks:
+        # Mode A: align by section index
+        for idx, text in results.items():
+            if idx < len(sections):
+                sections[idx] = (
+                    sections[idx].rstrip()
+                    + f"\n\n<!-- vision-enriched -->\n{text}\n"
+                )
+        parse_result.markdown = pagebreak.join(sections)
+    else:
+        # Mode B: append all Vision results in page order at end of document
+        if results:
+            ordered = sorted(results.items())
+            appended = "\n\n".join(
+                f"<!-- vision-enriched page={idx + 1} -->\n{text}"
+                for idx, text in ordered
             )
-
-    parse_result.markdown = pagebreak.join(sections)
+            parse_result.markdown = (
+                parse_result.markdown.rstrip()
+                + "\n\n"
+                + appended
+                + "\n"
+            )
 
     if cache_enabled:
         cache.close()
@@ -807,9 +881,11 @@ def process_single_file(
             parse_result.markdown, config,
         )
 
-    # --- Phase 1.3: Ensure Excel has page images for Vision ---
+    # --- Phase 1.3: Ensure page images for Vision (formats without native page rendering) ---
     if result.format in ("xlsx", "xls"):
         _ensure_excel_page_images(file_path, parse_result, config)
+    elif result.format in ("docx", "doc"):
+        _ensure_docx_page_images(file_path, parse_result, config)
 
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):

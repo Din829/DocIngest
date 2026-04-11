@@ -64,6 +64,15 @@ parsing:
   pptx:
     include_notes: true       # include speaker notes
 
+  # Word-specific
+  # Docling extracts text + table structure from DOCX, but does NOT render page
+  # images, so embedded diagrams, screenshots, and figures are lost. Rendering
+  # the document via LibreOffice → PDF → screenshots lets Vision AI describe them.
+  docx:
+    vision_page_images: true    # LibreOffice → PDF → page screenshots → Vision
+    max_page_images: 20         # cap pages sent to Vision (excess → text-only + warning)
+    max_image_pixels: 4000000   # auto-downscale oversized page images
+
   # Excel-specific
   xlsx:
     row_to_text: true         # convert rows to natural language sentences

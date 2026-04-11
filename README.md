@@ -96,7 +96,26 @@ print(f"{result.successful}/{result.total_files} files, {result.total_chunks} ch
 
 ## Configuration
 
-All settings in `config/default.yaml`. Override per project with `docingest.yaml` or CLI args:
+Four layers, highest wins:
+
+```
+CLI args (this one run)
+  ↓
+environment variables (this machine / this deployment)
+  ↓
+project docingest.yaml (team baseline, checked into git)
+  ↓
+config/default.yaml (ship defaults)
+```
+
+**When to use which:**
+- **YAML** — project-wide defaults shared by the team
+- **env** — per-machine tuning (e.g. `.env` sets bigger limits on your dev box)
+- **CLI** — one-off overrides for a single run (`--force`, `--strategy heading`)
+
+CLI is highest so you can always break out of env settings for ad-hoc runs.
+
+### YAML
 
 ```yaml
 chunking:
@@ -106,14 +125,47 @@ chunking:
 models:
   vision:
     primary: { provider: "google", model: "gemini-3-flash-preview" }
+    # swap to any multimodal model: gemini-3-pro-preview,
+    # claude-opus-4-6, gpt-5.4, gpt-5.4-mini, ...
 
 parsing:
   xlsx:
     denoising: { enabled: true }     # merged-cell cleanup for layout-heavy Excel
+  docx:
+    vision_page_images: true          # LibreOffice → PDF → Vision for Word
+    max_page_images: 20
 
 incremental:
   enabled: true                      # content-addressed output cache
 ```
+
+### Environment variables (for runtime tuning)
+
+Any config value can be overridden by `DOCINGEST__<path>` env variables.
+Use `__` (double underscore) as the nesting separator.
+
+```bash
+# Tune chunking on the fly
+export DOCINGEST__chunking__max_tokens=1024
+export DOCINGEST__chunking__strategy=heading
+
+# Swap Vision model without touching YAML
+export DOCINGEST__models__vision__primary__model=gemini-3-pro-preview
+
+# Adjust per-format limits
+export DOCINGEST__parsing__docx__max_page_images=50
+export DOCINGEST__parsing__xlsx__denoising__max_page_images=20
+
+# Toggle features
+export DOCINGEST__incremental__enabled=false
+export DOCINGEST__parsing__vision__enabled=false
+
+docingest run ./docs/
+```
+
+Values are type-inferred: `true/false` → bool, digits → int, `1.5` → float,
+everything else → string. Keys are case-insensitive (Windows-compatible).
+Also works via `.env` file at project root.
 
 ## Key Features
 
