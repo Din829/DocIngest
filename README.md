@@ -124,6 +124,30 @@ result = run_pipeline([Path("./docs")], config, parser, chunker)
 print(f"{result.successful}/{result.total_files} files, {result.total_chunks} chunks")
 ```
 
+### MCP Server (for AI Agents)
+
+Exposes DocIngest as 6 MCP tools: inspect, run, refine, search_knowledge, list_knowledge, read_source.
+
+```bash
+pip install -e ".[mcp]"
+python -m docingest.mcp_server              # stdio (Claude Desktop / Claude Code)
+python -m docingest.mcp_server --transport sse   # SSE (web clients)
+```
+
+**Claude Desktop** — add to `claude_desktop_config.json`:
+```json
+{ "mcpServers": { "docingest": { "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+```
+
+**Claude Code** — add to `.claude/settings.json`:
+```json
+{ "mcpServers": { "docingest": { "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+```
+
+**VS Code (Copilot / Continue / etc.)** — check your extension's MCP config format, point to the same command.
+
+See [MCP_README.md](MCP_README.md) for full tool descriptions, examples, and modification guide.
+
 ## Configuration
 
 Four layers, highest wins:
