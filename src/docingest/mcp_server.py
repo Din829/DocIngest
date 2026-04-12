@@ -337,26 +337,29 @@ def list_knowledge(
 def read_source(
     file_name: str,
     knowledge_dir: str = "./knowledge",
+    folder: str = "sources",
     max_lines: int | None = None,
 ) -> dict[str, Any]:
     """
-    Read the full content of a source Markdown file from the knowledge base.
+    Read the full content of a Markdown file from the knowledge base.
 
     Use after search_knowledge or list_knowledge to read a specific file.
-    Returns the raw Markdown content including frontmatter.
+    Set folder="readable" to read AI-refined versions (produced by refine tool).
 
     Args:
-        file_name: Name of the file in sources/ (e.g. "report.md").
+        file_name: Name of the file (e.g. "report.md").
         knowledge_dir: Path to knowledge base directory.
+        folder: Subfolder to read from — "sources" (default, raw parsed) or "readable" (AI-refined).
         max_lines: Optional line limit (None = full file). Use for very large files.
 
     Returns:
         file: The file name.
+        folder: Which folder was read.
         content: The Markdown content (or truncated if max_lines set).
         total_lines: Total line count of the file.
         truncated: Whether the content was truncated.
     """
-    source_path = Path(knowledge_dir) / "sources" / file_name
+    source_path = Path(knowledge_dir) / folder / file_name
     if not source_path.exists():
         return {"error": f"File not found: {source_path}"}
 
@@ -372,6 +375,7 @@ def read_source(
 
         return {
             "file": file_name,
+            "folder": folder,
             "content": text,
             "total_lines": total_lines,
             "truncated": truncated,
