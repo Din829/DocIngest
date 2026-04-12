@@ -51,7 +51,7 @@ python -m docingest.mcp_server --transport sse
 
 ## Claude Desktop Configuration
 
-Add to `claude_desktop_config.json`:
+Add to `claude_desktop_config.json` (open via Settings > Developer > Edit Config):
 
 ```json
 {
@@ -65,20 +65,43 @@ Add to `claude_desktop_config.json`:
 }
 ```
 
+Restart Claude Desktop after saving (fully quit, not just close window).
+
 ## Claude Code Configuration
 
-Add to `.claude/settings.json`:
+Add to `.mcp.json` at project root (shared via git) or `~/.claude.json` (personal, all projects):
 
 ```json
 {
   "mcpServers": {
     "docingest": {
+      "type": "stdio",
       "command": "python",
       "args": ["-m", "docingest.mcp_server"]
     }
   }
 }
 ```
+
+Supports `${VAR}` env expansion for paths and secrets.
+
+## VS Code (GitHub Copilot) Configuration
+
+Add to `.vscode/mcp.json` in your workspace (note: key is `servers`, not `mcpServers`):
+
+```json
+{
+  "servers": {
+    "docingest": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "docingest.mcp_server"]
+    }
+  }
+}
+```
+
+MCP tools appear in Copilot Agent mode (Ctrl+Alt+I).
 
 ## Tool Usage Examples
 

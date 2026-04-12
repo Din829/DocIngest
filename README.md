@@ -134,17 +134,20 @@ python -m docingest.mcp_server              # stdio (Claude Desktop / Claude Cod
 python -m docingest.mcp_server --transport sse   # SSE (web clients)
 ```
 
-**Claude Desktop** — add to `claude_desktop_config.json`:
+**Claude Desktop** — add to `claude_desktop_config.json` (Settings > Developer > Edit Config):
 ```json
 { "mcpServers": { "docingest": { "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
 ```
 
-**Claude Code** — add to `.claude/settings.json`:
+**Claude Code** — add to `.mcp.json` at project root (shared) or `~/.claude.json` (personal):
 ```json
-{ "mcpServers": { "docingest": { "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+{ "mcpServers": { "docingest": { "type": "stdio", "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
 ```
 
-**VS Code (Copilot / Continue / etc.)** — check your extension's MCP config format, point to the same command.
+**VS Code (Copilot)** — add to `.vscode/mcp.json` (note: key is `servers`, not `mcpServers`):
+```json
+{ "servers": { "docingest": { "type": "stdio", "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+```
 
 See [MCP_README.md](MCP_README.md) for full tool descriptions, examples, and modification guide.
 
