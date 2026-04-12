@@ -83,12 +83,21 @@ Options:
 --force              Ignore cache, full rebuild
 ```
 
-**Incremental mode is on by default.** Second run skips unchanged files:
+**Incremental mode is on by default.** Second run skips unchanged files. All outputs (index.json, chunks.jsonl, knowledge_map, SKILL.md) are fully regenerated each run to include both cached and new files:
 
 ```bash
 docingest run ./docs/                 # run 1: full pipeline
 docingest run ./docs/                 # run 2: 100% cache hit, seconds
 docingest run ./docs/ --force         # ignore cache, full rebuild
+```
+
+### Inspect documents before processing
+
+Pre-flight check — reports file size, page count, and recommendations without parsing:
+
+```bash
+docingest inspect ./docs/             # Rich table output (for humans)
+docingest inspect report.pdf --json   # JSON output (for Agents / MCP)
 ```
 
 ### Refine for human readability (optional)

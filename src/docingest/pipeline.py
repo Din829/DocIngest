@@ -837,13 +837,19 @@ def _enrich_with_vision(
     if not isinstance(structured_per_page, dict):
         structured_per_page = {}
 
-    # Build vision task list with optional triage filtering
+    # Build vision task list with optional triage filtering + global cap
     triage_cfg = get_nested(config, "parsing.vision.triage", {})
     triage_enabled = triage_cfg.get("enabled", False)
+
+    # Global Vision page cap — prevents runaway API cost on huge documents.
+    # null = no limit (use with caution on large documents).
+    max_vision_raw = get_nested(config, "parsing.vision.max_pages", 50)
+    max_vision_pages = int(max_vision_raw) if max_vision_raw is not None else None
 
     vision_tasks = []
     no_image = 0
     triage_skipped = 0
+    cap_skipped = 0
     for i, page_data in enumerate(parse_result.pages):
         if not page_data.image_path:
             no_image += 1
@@ -851,12 +857,21 @@ def _enrich_with_vision(
         if triage_enabled and _should_skip_vision(page_data, structured_per_page, triage_cfg):
             triage_skipped += 1
             continue
+        if max_vision_pages is not None and len(vision_tasks) >= max_vision_pages:
+            cap_skipped += 1
+            continue
         vision_tasks.append((i, page_data))
 
     if triage_skipped:
         logger.info(
             f"Vision triage: {triage_skipped} page(s) skipped (text-only), "
             f"{len(vision_tasks)} page(s) sent to Vision"
+        )
+    if cap_skipped:
+        logger.warning(
+            f"Vision cap: {cap_skipped} page(s) skipped — "
+            f"max_pages={max_vision_pages} reached. "
+            f"Increase parsing.vision.max_pages or set to null to remove limit."
         )
 
     if not vision_tasks:
@@ -940,7 +955,8 @@ def _enrich_with_vision(
 
     logger.info(
         f"Vision enrichment: {described} described, {failed} failed, "
-        f"{no_image} no-image, {triage_skipped} triage-skipped (parallel={parallel})"
+        f"{no_image} no-image, {triage_skipped} triage-skipped, "
+        f"{cap_skipped} cap-skipped (parallel={parallel})"
     )
 
 

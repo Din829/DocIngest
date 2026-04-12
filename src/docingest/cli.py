@@ -25,7 +25,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .config import load_config
+from .config import load_config, get_nested
 from .parsers import create_parser
 from .chunkers import create_chunker
 from .pipeline import run_pipeline
@@ -199,6 +199,76 @@ def _print_results(result) -> None:
         for err in result.errors:
             console.print(f"  [red]✗[/red] {err['file']}: {err['error']}")
 
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Inspect subcommand
+# ---------------------------------------------------------------------------
+
+@app.command("inspect")
+def inspect_cmd(
+    inputs: list[Path] = typer.Argument(
+        ...,
+        help="Files or directories to inspect.",
+        exists=True,
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "-c", "--config",
+        help="Path to project config YAML.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Output as JSON (for Agent/MCP consumption).",
+    ),
+) -> None:
+    """Inspect documents before processing — reports size, pages, and recommendations."""
+    import json as json_mod
+    from .inspect import inspect_files
+
+    config = load_config(project_config_path=config_file)
+    results = inspect_files(inputs, config)
+
+    if json_output:
+        console.print(json_mod.dumps(results, indent=2, ensure_ascii=False))
+        return
+
+    # Rich table output
+    table = Table(title="Document Inspection")
+    table.add_column("File", style="bold", max_width=40)
+    table.add_column("Format")
+    table.add_column("Size", justify="right")
+    table.add_column("Pages", justify="right")
+    table.add_column("Recommendation")
+
+    total_pages = 0
+    for r in results:
+        pages = r.get("pages")
+        pages_str = str(pages) if pages is not None else "?"
+        if r.get("pages_estimated"):
+            pages_str += " (est)"
+        if pages:
+            total_pages += pages
+
+        size_str = f"{r['size_mb']:.1f}MB" if r['size_mb'] >= 1 else f"{r['size_mb']*1024:.0f}KB"
+
+        rec = r.get("recommendation", "")
+        rec_style = "[green]" if rec == "Ready" else "[yellow]"
+        rec_display = f"{rec_style}{rec}[/{rec_style[1:]}"
+
+        table.add_row(r["name"], r["format"], size_str, pages_str, rec_display)
+
+    console.print(table)
+
+    max_vision = get_nested(config, "parsing.vision.max_pages", 50)
+    vision_est = min(total_pages, int(max_vision)) if max_vision else total_pages
+    console.print(
+        f"\n  Total: {len(results)} file(s), ~{total_pages} pages, "
+        f"~{vision_est} Vision API calls"
+        f"{f' (capped at {max_vision})' if max_vision and total_pages > int(max_vision) else ''}"
+    )
     console.print()
 
 
