@@ -31,8 +31,9 @@ pip install -e ".[mcp]"
 | `inspect` | Pre-flight check (size, pages, cost estimate) | `inspect_files()` |
 | `run` | Process documents → knowledge base | `run_pipeline()` |
 | `refine` | AI-powered Markdown cleanup | `refine_files()` |
-| `search_knowledge` | Search processed knowledge base | grep on sources/*.md |
-| `list_knowledge` | List knowledge base contents | reads index.json |
+| `search_knowledge` | Keyword search in processed knowledge base | grep on sources/*.md |
+| `list_knowledge` | List knowledge base contents (files, stats) | reads index.json |
+| `read_source` | Read full content of a source Markdown file | reads sources/*.md |
 
 ## Running
 
@@ -119,11 +120,12 @@ Agent: Use docingest list_knowledge with knowledge_dir="./knowledge"
 ## Typical Agent Workflow
 
 ```
-1. inspect(["./new_docs/"])          → Understand what we're dealing with
+1. inspect(["./new_docs/"])          → Understand files (size, pages, cost estimate)
 2. run(["./new_docs/"])              → Process (incremental — skips cached files)
-3. list_knowledge("./knowledge")     → See what's in the knowledge base
-4. search_knowledge("契約", "./knowledge")  → Find specific content
-5. refine(["./knowledge/sources/contract.md"])  → Optional: make human-readable
+3. list_knowledge("./knowledge")     → Browse knowledge base contents
+4. search_knowledge("契約", "./knowledge")  → Find specific content by keyword
+5. read_source("contract.md")        → Read full file content
+6. refine(["./knowledge/sources/contract.md"])  → Optional: AI cleanup for humans
 ```
 
 ## Adding a New Tool

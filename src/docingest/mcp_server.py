@@ -37,10 +37,19 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     name="DocIngest",
     instructions=(
-        "DocIngest is a document preprocessing tool for RAG and Agentic Search. "
-        "Use 'inspect' first to check files before processing. "
-        "Use 'run' to convert documents to Markdown + chunks. "
-        "Use 'search_knowledge' to find content in processed knowledge bases."
+        "DocIngest preprocesses documents (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs) "
+        "into Markdown + chunks for RAG and Agentic Search.\n\n"
+        "Recommended workflow:\n"
+        "1. inspect — Check file sizes and page counts BEFORE processing (fast, no API cost)\n"
+        "2. run — Process documents into a knowledge base (incremental: skips unchanged files)\n"
+        "3. list_knowledge — Browse what's in the knowledge base (files, formats, sections)\n"
+        "4. search_knowledge — Find specific content by keyword (grep on sources/*.md)\n"
+        "5. refine — Optional: AI-powered cleanup for human readability\n\n"
+        "Tips:\n"
+        "- Always inspect first for large/unknown files to estimate Vision API cost\n"
+        "- Use config_overrides to dynamically adjust behavior (e.g. increase max_pages for large PDFs)\n"
+        "- run is incremental by default — safe to call repeatedly on the same directory\n"
+        "- search_knowledge also returns the knowledge_map summary for quick overview"
     ),
 )
 
@@ -53,14 +62,15 @@ _cached_config: dict[str, Any] | None = None
 
 
 def _get_config(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Load config with optional overrides. Cached for performance."""
+    """Load base config (cached) and apply per-call overrides without mutation."""
     global _cached_config
     if _cached_config is None:
         from .config import load_config
         _cached_config = load_config()
     if overrides:
+        import copy
         from .config import deep_merge
-        return deep_merge(_cached_config, overrides)
+        return deep_merge(copy.deepcopy(_cached_config), overrides)
     return _cached_config
 
 
@@ -221,18 +231,22 @@ def search_knowledge(
     """
     Search a processed knowledge base using keyword matching.
 
-    Searches index.json and knowledge_map.yaml to find relevant files,
-    then greps sources/*.md for the query string. Lightweight local
+    Greps sources/*.md for the query string and returns matching lines
+    with surrounding context. Also loads the knowledge_map summary for
+    a quick overview of the knowledge base contents. Lightweight local
     search — no vector database needed.
 
     Args:
-        query: Search query string.
+        query: Search query string (case-insensitive).
         knowledge_dir: Path to knowledge base directory.
-        max_results: Maximum number of matching chunks to return.
+        max_results: Maximum number of matching lines to return.
 
     Returns:
-        matches: list of {file, line_number, context} dicts.
-        knowledge_map_summary: knowledge base overview from YAML.
+        query: The search query.
+        matches: list of {file, line, context} dicts.
+        total_matches: Number of matches found.
+        knowledge_map_summary: Overall knowledge base description (if available).
+        stats: File/chunk/token counts (if available).
     """
     import re
 
@@ -313,6 +327,57 @@ def list_knowledge(
         return json.loads(index_path.read_text(encoding="utf-8"))
     except Exception as e:
         return {"error": f"Failed to read index.json: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Tool: read_source
+# ---------------------------------------------------------------------------
+
+@mcp.tool
+def read_source(
+    file_name: str,
+    knowledge_dir: str = "./knowledge",
+    max_lines: int | None = None,
+) -> dict[str, Any]:
+    """
+    Read the full content of a source Markdown file from the knowledge base.
+
+    Use after search_knowledge or list_knowledge to read a specific file.
+    Returns the raw Markdown content including frontmatter.
+
+    Args:
+        file_name: Name of the file in sources/ (e.g. "report.md").
+        knowledge_dir: Path to knowledge base directory.
+        max_lines: Optional line limit (None = full file). Use for very large files.
+
+    Returns:
+        file: The file name.
+        content: The Markdown content (or truncated if max_lines set).
+        total_lines: Total line count of the file.
+        truncated: Whether the content was truncated.
+    """
+    source_path = Path(knowledge_dir) / "sources" / file_name
+    if not source_path.exists():
+        return {"error": f"File not found: {source_path}"}
+
+    try:
+        text = source_path.read_text(encoding="utf-8")
+        lines = text.split("\n")
+        total_lines = len(lines)
+        truncated = False
+
+        if max_lines is not None and total_lines > max_lines:
+            text = "\n".join(lines[:max_lines])
+            truncated = True
+
+        return {
+            "file": file_name,
+            "content": text,
+            "total_lines": total_lines,
+            "truncated": truncated,
+        }
+    except Exception as e:
+        return {"error": f"Failed to read {file_name}: {e}"}
 
 
 # ---------------------------------------------------------------------------
