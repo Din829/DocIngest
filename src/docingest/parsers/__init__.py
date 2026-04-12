@@ -1,22 +1,27 @@
 """
 Document parsers — Phase 1: Raw document → Markdown.
 
-Parser routing:
-  1. DoclingParser (default, handles 15+ formats)
-  2. TextParser (fallback for plain text / unknown formats)
+Parser routing (priority order):
+  1. MediaParser (audio/video files — subtitle-first + ASR fallback)
+  2. DoclingParser (default, handles 15+ document formats)
+  3. TextParser (fallback for plain text / unknown formats)
 
-No manual extension-based routing — Docling handles format detection internally.
-If Docling fails, TextParser tries to read as plain text.
+MediaParser is checked first because Docling cannot handle audio/video.
+The check is cheap (extension match), so non-media files skip it instantly.
 """
 
 from __future__ import annotations
 
+import logging
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 from .base import BaseParser, ParseResult
 from .docling_parser import DoclingParser
 from .text_parser import TextParser
+
+logger = logging.getLogger(__name__)
 
 
 def create_parser(config: dict[str, Any]) -> BaseParser:
@@ -42,10 +47,16 @@ def create_parser(config: dict[str, Any]) -> BaseParser:
 
 class _DoclingWithFallback(BaseParser):
     """
-    Composite parser: tries Docling first, falls back to TextParser.
+    Composite parser: routes to the best parser for each file.
 
-    This is the default parser. It's not a user-facing class — users
-    configure via `parsing.engine: "docling"` in YAML.
+    Priority:
+      1. MediaParser — handles audio/video (Docling can't).
+         Check is cheap (extension match), non-media files skip instantly.
+      2. DoclingParser — 15+ document formats.
+      3. TextParser — plain text / unknown formats.
+
+    This is the default parser. Users configure via
+    `parsing.engine: "docling"` in YAML.
     """
 
     def __init__(self, config: dict[str, Any]) -> None:
@@ -53,21 +64,61 @@ class _DoclingWithFallback(BaseParser):
         self._docling = DoclingParser(config)
         self._fallback = TextParser(config)
 
-    def parse(self, file_path: Path) -> ParseResult:
-        """Try Docling, fall back to text extraction."""
-        # First try Docling
-        result = self._docling.parse(file_path)
+        # MediaParser is lazily loaded to keep non-media pipelines fast
+        # and to avoid hard-coupling to audio dependencies.
+        self._media: Any = None  # Actually MediaParser, typed as Any for lazy load
+        self._media_init_attempted = False
+
+    def _get_media_parser(self) -> Any:
+        """Lazy-init MediaParser. Returns None if unavailable."""
+        if self._media_init_attempted:
+            return self._media
+        self._media_init_attempted = True
+        try:
+            from .media_parser import MediaParser
+            self._media = MediaParser(self.config)
+        except Exception as e:
+            logger.debug(f"MediaParser not available: {e}")
+        return self._media
+
+    def parse(
+        self,
+        file_path: Path,
+        *,
+        override_stream: BytesIO | None = None,
+    ) -> ParseResult:
+        """Route to the best parser for this file type."""
+
+        # Priority 1: MediaParser for audio/video files.
+        # The accepts() check is a simple extension match — O(1), no I/O.
+        media = self._get_media_parser()
+        if media is not None and media.accepts(file_path):
+            result = media.parse(file_path)
+            if result.success:
+                return result
+            # MediaParser failed (e.g. ASR API down) — don't fall through
+            # to Docling for audio files; Docling can't handle them either.
+            # Fall through to TextParser instead.
+            fallback_result = self._fallback.parse(file_path)
+            if fallback_result.success:
+                fallback_result.metadata["parser_fallback"] = True
+                return fallback_result
+            return result  # return MediaParser's error, not TextParser's
+
+        # Priority 2: Docling (forwards override_stream when a pre-parse
+        # hook produced a replacement stream, e.g. DOCX OMML preprocessing).
+        result = self._docling.parse(file_path, override_stream=override_stream)
         if result.success:
             return result
 
-        # Docling failed → try plain text fallback
+        # Priority 3: TextParser fallback. Reads raw bytes from disk, so
+        # override_stream (which targets Docling) is NOT forwarded.
         fallback_result = self._fallback.parse(file_path)
         if fallback_result.success:
-            # Mark that we used fallback
             fallback_result.metadata["parser_fallback"] = True
             return fallback_result
 
-        # Both failed
+        # All failed
         return ParseResult(
             markdown="",
             success=False,
@@ -75,4 +126,8 @@ class _DoclingWithFallback(BaseParser):
         )
 
     def supported_extensions(self) -> set[str]:
-        return self._docling.supported_extensions() | self._fallback.supported_extensions()
+        exts = self._docling.supported_extensions() | self._fallback.supported_extensions()
+        media = self._get_media_parser()
+        if media is not None:
+            exts |= media.supported_extensions()
+        return exts

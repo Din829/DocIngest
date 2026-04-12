@@ -29,6 +29,7 @@ from typing import Any
 import yaml
 
 from ..config import get_nested
+from .keyword_extractor import create_keyword_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -37,54 +38,24 @@ logger = logging.getLogger(__name__)
 # Stage 1: Automatic extraction (zero cost)
 # ---------------------------------------------------------------------------
 
-def _extract_keywords_from_text(text: str, min_len: int = 2) -> list[str]:
-    """
-    Extract keywords from text using simple rules (no NLP library needed).
-
-    Strategy:
-      - Latin words: split by whitespace/punctuation, keep len >= min_len
-      - CJK sequences: keep runs of CJK chars with len >= min_len
-      - Filter out common stop words
-    """
-    words: list[str] = []
-
-    # Extract latin words (English, acronyms, etc.)
-    latin_words = re.findall(r"[A-Za-z][A-Za-z0-9_]{1,}", text)
-    words.extend(w for w in latin_words if len(w) >= min_len)
-
-    # Extract CJK word-like sequences
-    # CJK runs between punctuation/whitespace/latin chars
-    cjk_runs = re.findall(r"[\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]{2,}", text)
-    words.extend(cjk_runs)
-
-    return words
-
-
-# Common stop words (keep minimal — don't over-filter)
-_STOP_WORDS = {
-    # Japanese particles/common words
-    "の", "は", "を", "が", "に", "で", "と", "も", "から", "まで",
-    "する", "ある", "いる", "なる", "できる", "れる", "られる",
-    "この", "その", "あの", "こと", "もの", "ため", "よう",
-    "した", "して", "され", "について", "おける", "および",
-    # English common words
-    "the", "and", "for", "with", "from", "that", "this", "are", "was",
-    "not", "but", "can", "has", "have", "will", "all", "any", "our",
-    "None", "none", "True", "False", "true", "false",
-    # Docling internal group names (not meaningful keywords)
-    "group", "slide", "list",
-}
-
-
 def build_stage1(
     index_data: dict[str, Any],
     chunks: list[dict[str, Any]],
+    config: dict[str, Any],
 ) -> dict[str, Any]:
     """
     Build Stage 1 knowledge map from index.json and chunks.jsonl data.
 
     Returns a dict ready to be serialized to YAML.
     """
+    kw_cfg = get_nested(config, "knowledge_map.keywords", {})
+    extractor = create_keyword_extractor(config)
+    max_per_file: int = int(kw_cfg.get("max_per_file", 15))
+    max_index: int = int(kw_cfg.get("max_index", 50))
+
+    # Docling internal group names that carry no semantic meaning
+    _noise_re = re.compile(r"^(group|slide-\d+|list)$", re.IGNORECASE)
+
     # --- File-level info ---
     files_info: list[dict[str, Any]] = []
     all_keywords_by_file: dict[str, Counter] = defaultdict(Counter)
@@ -96,7 +67,7 @@ def build_stage1(
         # Collect sections from index (filter out meaningless group names)
         sections = [
             s for s in file_entry.get("sections", [])
-            if s and not re.match(r"^(group|slide-\d+|list)$", s, re.IGNORECASE)
+            if s and not _noise_re.match(s)
         ]
 
         # Collect sheet names and title_paths from chunks
@@ -107,26 +78,21 @@ def build_stage1(
             if c.get("metadata", {}).get("sheet_name")
         ))
         title_paths = sorted(set(
-            c["metadata"]["title_path"]
-            for c in file_chunks
-            if c.get("metadata", {}).get("title_path")
+            tp for c in file_chunks
+            if (tp := c.get("metadata", {}).get("title_path"))
+            and not _noise_re.match(tp)
         ))
 
         # Extract keywords from headings/title_paths (highest quality source)
         keyword_sources = sections + title_paths + sheet_names
         raw_keywords: list[str] = []
         for text in keyword_sources:
-            raw_keywords.extend(_extract_keywords_from_text(text))
+            raw_keywords.extend(extractor.extract(text))
 
-        # Count and filter
+        # Count and deduplicate
         kw_counter = Counter(raw_keywords)
-        filtered_keywords = [
-            kw for kw, _ in kw_counter.most_common(30)
-            if kw not in _STOP_WORDS
-        ]
-        all_keywords_by_file[path] = Counter(dict(
-            (kw, cnt) for kw, cnt in kw_counter.items() if kw not in _STOP_WORDS
-        ))
+        filtered_keywords = [kw for kw, _ in kw_counter.most_common(max_per_file)]
+        all_keywords_by_file[path] = kw_counter
 
         # Detect language: prefer index, fallback to chunks metadata
         language = file_entry.get("language", "")
@@ -150,7 +116,7 @@ def build_stage1(
         if sheet_names:
             file_info["sheets"] = sheet_names
         if filtered_keywords:
-            file_info["keywords"] = filtered_keywords[:15]
+            file_info["keywords"] = filtered_keywords
 
         files_info.append(file_info)
 
@@ -165,8 +131,7 @@ def build_stage1(
         keyword_to_files.items(),
         key=lambda x: (-len(x[1]), x[0]),
     )
-    # Keep top 50 most relevant keywords
-    keyword_index = {kw: files for kw, files in sorted_keywords[:50]}
+    keyword_index = {kw: files for kw, files in sorted_keywords[:max_index]}
 
     # --- Languages and formats ---
     languages = sorted(set(
@@ -430,7 +395,7 @@ def generate_knowledge_map(
         pass  # chunks may not exist if chunking disabled
 
     # Stage 1: automatic
-    knowledge_map = build_stage1(index_data, chunks)
+    knowledge_map = build_stage1(index_data, chunks, config)
 
     # Stage 2: AI summary (if enabled)
     if get_nested(config, "knowledge_map.ai_summary", True):

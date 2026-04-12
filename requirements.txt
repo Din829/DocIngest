@@ -41,6 +41,15 @@ easyocr>=1.7,<2
 pillow>=10.0,<12
 openpyxl>=3.1,<4
 
+# === Document enrichment hooks ===
+# These are required by the hook system (hooks/) for PPTX chart extraction,
+# DOCX OMML→LaTeX, and XML safety. They may already be pulled in by
+# docling or other transitive deps, but we pin them here so a clean
+# `pip install -r requirements.txt` reliably brings them in.
+python-pptx>=1.0,<2      # PPTX chart data direct-read (hook #1)
+beautifulsoup4>=4.12,<5   # DOCX OMML→LaTeX preprocessing (hook #2)
+defusedxml>=0.7,<1        # XML safety for OMML and EPUB parsing
+
 # === Pydantic (Docling dependency) ===
 pydantic>=2.11,<3
 click>=8.1,<8.2
@@ -48,3 +57,11 @@ click>=8.1,<8.2
 # === Optional: PDF fallback ===
 # pymupdf>=1.24           # Uncomment if you need garbled-text recovery
 # pdf2image>=1.17         # Uncomment if you need PPT→PDF→image pipeline
+
+# === Optional: enhanced capabilities ===
+# magika>=1.0             # Content-based file type detection (ML, ~25MB model)
+                          # Enables format correction for weak/missing extensions
+                          # Install: pip install magika
+# pyexiftool>=0.5         # EXIF/XMP metadata extraction (requires exiftool on PATH)
+                          # Enables author/date/GPS in frontmatter
+                          # Install: pip install pyexiftool

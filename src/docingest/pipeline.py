@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from .config import get_nested
 from .parsers.base import BaseParser, PAGEBREAK_MARKER
 from .chunkers.base import BaseChunker
@@ -39,6 +41,7 @@ from .incremental import (
     load_chunks_by_id,
     build_meta,
 )
+from .hooks import run_pre_parse_hooks, run_post_parse_hooks
 
 import logging
 _pipeline_logger = logging.getLogger(__name__)
@@ -83,28 +86,122 @@ class PipelineResult:
 # File discovery
 # ---------------------------------------------------------------------------
 
-def discover_files(input_paths: list[Path]) -> list[Path]:
+def discover_files(
+    input_paths: list[Path | str],
+    config: dict[str, Any] | None = None,
+) -> list[Path]:
     """
     Discover all processable files from input paths.
 
+    Accepts a mix of:
+      * Local file/directory paths (Path objects or strings)
+      * HTTP/HTTPS URLs (strings — YouTube, Bilibili, direct media, etc.)
+
+    Directories are expanded recursively (hidden dirs/files skipped).
+    URLs are resolved via yt-dlp (audio + subtitles + metadata downloaded
+    to a persistent cache directory).
+    Zip archives are expanded into their contents.
+
     Args:
-        input_paths: List of file or directory paths.
+        input_paths: List of file paths, directory paths, or URL strings.
+            Path objects that look like URLs (https://...) are detected
+            and handled as URLs, but passing URLs as plain strings is
+            preferred because Path() mangles URL slashes on Windows.
+        config: Full DocIngest config dict. When None, zip/URL expansion
+            is disabled.
 
     Returns:
-        Flat list of individual file paths (directories recursively expanded).
+        Flat list of individual file paths (directories + archives + URLs
+        recursively expanded).
     """
-    files: list[Path] = []
+    # First pass: separate URLs from filesystem paths. We work with raw
+    # strings first because Path("https://...") on Windows mangles the
+    # URL (double slash → single slash), making URL detection unreliable
+    # if done after Path conversion.
+    raw_files: list[Path] = []
+    url_inputs: list[str] = []
+
     for p in input_paths:
-        if p.is_file():
-            files.append(p)
-        elif p.is_dir():
-            # Recursive scan, skip hidden files/dirs
-            for f in sorted(p.rglob("*")):
-                if f.is_file() and not any(
-                    part.startswith(".") for part in f.parts
-                ):
-                    files.append(f)
-    return files
+        # Preserve the original string form for URL detection.
+        # If the caller passed a string, use it directly. If they passed
+        # a Path, str() on Windows gives "https:\..." — so we check the
+        # original type to decide how to detect URLs.
+        original_str = p if isinstance(p, str) else str(p)
+        # On Windows, Path("https://x") → "https:\\x" via str(), but
+        # Path("https://x").as_posix() → "https:/x" (single slash).
+        # Neither preserves the original "https://". So we also check
+        # for the Windows-mangled form.
+        is_url = (
+            original_str.startswith("http://")
+            or original_str.startswith("https://")
+            or original_str.startswith("http:\\")
+            or original_str.startswith("https:\\")
+        )
+        if is_url:
+            # Normalize the URL back to proper form (undo Windows mangling)
+            url = original_str.replace("\\", "/")
+            # Fix double-slash that Path may have collapsed
+            if "://" not in url:
+                url = url.replace(":/", "://", 1)
+            url_inputs.append(url)
+        else:
+            path = Path(p) if isinstance(p, str) else p
+            if path.is_file():
+                raw_files.append(path)
+            elif path.is_dir():
+                # Recursive scan, skip hidden files/dirs
+                for f in sorted(path.rglob("*")):
+                    if f.is_file() and not any(
+                        part.startswith(".") for part in f.parts
+                    ):
+                        raw_files.append(f)
+
+    # Resolve URL inputs → local files (audio + subtitles + metadata).
+    # Only when config is available and URL parsing is enabled.
+    if url_inputs and config is not None and get_nested(config, "parsing.url.enabled", True):
+        from .utils.url_resolver import resolve_url
+        for url in url_inputs:
+            resolved = resolve_url(url, config)
+            if resolved:
+                raw_files.extend(resolved)
+                _pipeline_logger.info(
+                    f"URL resolved: {url} → {len(resolved)} file(s)"
+                )
+            else:
+                _pipeline_logger.warning(f"URL resolution failed: {url}")
+
+    # Second pass: expand zip archives when enabled. We run this after
+    # the directory walk so zip files found INSIDE an input directory
+    # are also expanded, not just zips passed directly on the command
+    # line.
+    if config is None or not get_nested(config, "parsing.zip.enabled", True):
+        return raw_files
+
+    # Lazy import to avoid a hard dependency from non-zip callers and to
+    # keep the top of pipeline.py uncluttered.
+    from .utils.zip_expander import should_expand, expand_zip, get_extract_root
+
+    extract_root = get_extract_root(config)
+    expanded: list[Path] = []
+
+    for f in raw_files:
+        if should_expand(f):
+            extract_root.mkdir(parents=True, exist_ok=True)
+            inner_files = expand_zip(f, extract_root, config)
+            if inner_files is not None:
+                expanded.extend(inner_files)
+                _pipeline_logger.info(
+                    f"Zip expansion: {f.name} → {len(inner_files)} file(s)"
+                )
+            else:
+                # Expansion failed or was refused (corrupt, bomb, password).
+                # Keep the original zip in the list so the pipeline surfaces
+                # the error explicitly through the normal parse-failure path.
+                expanded.append(f)
+        else:
+            expanded.append(f)
+
+    return expanded
 
 
 # ---------------------------------------------------------------------------
@@ -435,16 +532,19 @@ def _generate_page_images_via_libreoffice(
         max_pixels: Auto-downscale images exceeding this pixel count.
         format_label: "Excel" / "Word" / etc., used only in log messages and warnings.
     """
-    import shutil
     import subprocess
     import tempfile
     from .parsers.base import PageData
+    from .utils.binary_finder import find_binary
 
     # Already has images → nothing to do
     if parse_result.pages and any(p.image_path for p in parse_result.pages):
         return
 
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    # Resolve LibreOffice via the cross-platform binary finder rather than
+    # raw shutil.which — on Windows LibreOffice installs under Program Files
+    # without touching PATH, and users can override via config or env var.
+    soffice = find_binary("soffice", config)
     if not soffice:
         _pipeline_logger.debug(
             f"LibreOffice not found — cannot generate {format_label} page images"
@@ -641,6 +741,64 @@ def _ensure_pptx_page_images(
 # Vision enrichment
 # ---------------------------------------------------------------------------
 
+def _should_skip_vision(
+    page_data,
+    structured_per_page: dict,
+    triage_cfg: dict[str, Any],
+) -> bool:
+    """
+    Conservative triage: decide if a page can safely skip Vision enrichment.
+
+    ALL conditions must be met to skip. Any single failure → send to Vision.
+    This ensures we never miss important content — it's acceptable to send
+    a few extra pages (false negatives are cheap, false positives lose info).
+
+    Checks (all must pass to skip):
+      1. No image markers in Docling output (no charts/diagrams to describe)
+      2. No structured data injection (no chart hook data needing visual context)
+      3. Sufficient text extracted (not a scanned/image-only page)
+      4. No garbled text (Docling didn't fail on this page)
+      5. Low replacement character ratio (no CID font issues)
+      6. No complex tables (simple tables are fine, complex ones need Vision)
+    """
+    text = page_data.text
+    stripped = text.strip()
+
+    # Has image/chart markers → Vision needs to describe visual elements
+    if "<!-- image -->" in text:
+        return False
+
+    # Has structured data (e.g. PPTX chart) → Vision describes surrounding visuals
+    if structured_per_page.get(page_data.page_no):
+        return False
+
+    # Too little text → possibly scanned/image-only page
+    min_len = int(triage_cfg.get("min_text_length", 50))
+    if len(stripped) < min_len:
+        return False
+
+    # Garbled text → Docling failed, Vision can re-OCR
+    if "glyph<" in text or "glyph&lt;" in text:
+        return False
+
+    # High U+FFFD ratio → CID font extraction failure
+    max_fffd = float(triage_cfg.get("max_replacement_ratio", 0.05))
+    if len(stripped) > 0 and stripped.count("\ufffd") / len(stripped) > max_fffd:
+        return False
+
+    # Complex Markdown table → Vision may help correct structure
+    table_threshold = int(triage_cfg.get("table_line_threshold", 10))
+    table_lines = sum(
+        1 for line in stripped.split("\n")
+        if "|" in line and line.strip().startswith("|")
+    )
+    if table_lines >= table_threshold:
+        return False
+
+    # All checks passed → pure text page, safe to skip
+    return True
+
+
 def _enrich_with_vision(
     parse_result,
     config: dict[str, Any],
@@ -653,7 +811,8 @@ def _enrich_with_vision(
       2. If Vision succeeds → append AI result to that page section
       3. If Vision fails → keep Docling text as-is (fallback)
 
-    Code does zero content judgment. AI prompt handles all logic.
+    Optional triage (parsing.vision.triage.enabled) skips pages that are
+    purely text with no visual elements — saving API cost without losing info.
     Modifies parse_result.markdown in-place.
     """
     import logging
@@ -670,15 +829,41 @@ def _enrich_with_vision(
     cache_dir = get_nested(config, "cache.dir", ".docingest_cache")
     cache = AICache(cache_dir=cache_dir, enabled=cache_enabled)
 
-    # Filter to pages that have images (Vision needs an image)
-    vision_tasks = [
-        (i, page_data) for i, page_data in enumerate(parse_result.pages)
-        if page_data.image_path
-    ]
-    skipped = len(parse_result.pages) - len(vision_tasks)
+    # Look up per-page structured extractions BEFORE building vision_tasks
+    # (triage needs this to decide whether a page has hook data).
+    structured_per_page = parse_result.metadata.get(
+        "structured_extractions_per_page", {}
+    )
+    if not isinstance(structured_per_page, dict):
+        structured_per_page = {}
+
+    # Build vision task list with optional triage filtering
+    triage_cfg = get_nested(config, "parsing.vision.triage", {})
+    triage_enabled = triage_cfg.get("enabled", False)
+
+    vision_tasks = []
+    no_image = 0
+    triage_skipped = 0
+    for i, page_data in enumerate(parse_result.pages):
+        if not page_data.image_path:
+            no_image += 1
+            continue
+        if triage_enabled and _should_skip_vision(page_data, structured_per_page, triage_cfg):
+            triage_skipped += 1
+            continue
+        vision_tasks.append((i, page_data))
+
+    if triage_skipped:
+        logger.info(
+            f"Vision triage: {triage_skipped} page(s) skipped (text-only), "
+            f"{len(vision_tasks)} page(s) sent to Vision"
+        )
 
     if not vision_tasks:
-        logger.info(f"Vision enrichment: 0 pages with images, {skipped} skipped")
+        logger.info(
+            f"Vision enrichment: 0 pages to process "
+            f"(no_image={no_image}, triage_skipped={triage_skipped})"
+        )
         return
 
     # Parallel Vision calls
@@ -689,11 +874,15 @@ def _enrich_with_vision(
 
     def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
         try:
+            # page_data.page_no is 1-based and matches the hook's
+            # convention for populating structured_extractions_per_page.
+            struct_data = structured_per_page.get(page_data.page_no)
             return idx, describe_page_cached(
                 image_path=page_data.image_path,
                 page_text=page_data.text,
                 config=config,
                 cache=cache,
+                structured_data=struct_data,
             )
         except Exception as e:
             logger.warning(f"Vision failed for page {page_data.page_no}: {e}")
@@ -750,7 +939,8 @@ def _enrich_with_vision(
         cache.close()
 
     logger.info(
-        f"Vision enrichment: {described} described, {skipped} skipped, {failed} failed (parallel={parallel})"
+        f"Vision enrichment: {described} described, {failed} failed, "
+        f"{no_image} no-image, {triage_skipped} triage-skipped (parallel={parallel})"
     )
 
 
@@ -885,10 +1075,16 @@ def process_single_file(
     """
     result = FileResult(original_file=str(file_path))
 
+    # --- Phase 1.0: Pre-parse hooks (e.g. DOCX OMML → LaTeX preprocessing) ---
+    # Hooks can return a BytesIO stream that replaces the file content before
+    # Docling sees it. None means "use original file". Hooks never raise —
+    # failures degrade to the original file with a warning.
+    override_stream = run_pre_parse_hooks(file_path, config)
+
     # --- Phase 1: Parse ---
     t0 = time.monotonic()
     try:
-        parse_result = parser.parse(file_path)
+        parse_result = parser.parse(file_path, override_stream=override_stream)
     except Exception as e:
         result.success = False
         result.error = f"Parse failed: {e}"
@@ -933,6 +1129,12 @@ def process_single_file(
     elif result.format in ("pptx", "ppt"):
         _ensure_pptx_page_images(file_path, parse_result, config)
 
+    # --- Phase 1.4: Post-parse hooks (pre-Vision) ---
+    # Hooks that inject structured data the Vision step should be aware of
+    # (e.g. PPTX chart data read directly from python-pptx). Runs before
+    # Vision so the prompt can reference already-extracted data.
+    run_post_parse_hooks(file_path, parse_result, config, phase="post_parse")
+
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):
         _enrich_with_vision(parse_result, config)
@@ -940,6 +1142,12 @@ def process_single_file(
     # Detect language early (so frontmatter and chunks both have it)
     if "language" not in parse_result.metadata:
         parse_result.metadata["language"] = _detect_language(parse_result.markdown)
+
+    # --- Phase 1.6: Pre-write hooks (post-Vision, pre-frontmatter) ---
+    # Hooks that enrich metadata without touching Vision (e.g. exiftool
+    # metadata extraction). Runs after Vision so language detection and
+    # Vision results are already settled before frontmatter is built.
+    run_post_parse_hooks(file_path, parse_result, config, phase="pre_write")
 
     # --- Phase 2: Write Markdown + assets ---
     output_path = write_markdown(
@@ -1056,6 +1264,24 @@ def _collect_asset_rels_for_file(
     return sorted(rels)
 
 
+def _parse_frontmatter(markdown: str) -> dict[str, Any]:
+    """
+    Extract YAML frontmatter from a Markdown string written by our pipeline.
+
+    Returns parsed dict, or empty dict if no valid frontmatter found.
+    """
+    if not markdown.startswith("---\n"):
+        return {}
+    end = markdown.find("\n---\n", 4)
+    if end == -1:
+        return {}
+    try:
+        data = yaml.safe_load(markdown[4:end])
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _make_index_parse_result(
     file_result: FileResult,
     output_dir: Path,
@@ -1063,8 +1289,9 @@ def _make_index_parse_result(
     """
     Create a lightweight ParseResult from FileResult for IndexBuilder.
 
-    Instead of re-reading the written Markdown file, we read it from disk
-    (it was just written in Phase 2) to get the content for section extraction.
+    Reads the written .md file (just produced in Phase 2) and extracts
+    metadata from its YAML frontmatter so fields like language, pages,
+    has_tables etc. flow into index.json without extra plumbing.
     """
     from .parsers.base import ParseResult
 
@@ -1074,17 +1301,21 @@ def _make_index_parse_result(
     except Exception:
         markdown = ""
 
+    # Start with minimal fallback, then overlay frontmatter fields
+    metadata: dict[str, Any] = {
+        "format": file_result.format,
+        "title": Path(file_result.original_file).stem,
+    }
+    metadata.update(_parse_frontmatter(markdown))
+
     return ParseResult(
         markdown=markdown,
-        metadata={
-            "format": file_result.format,
-            "title": Path(file_result.original_file).stem,
-        },
+        metadata=metadata,
     )
 
 
 def run_pipeline(
-    input_paths: list[Path],
+    input_paths: list[Path | str],
     config: dict[str, Any],
     parser: BaseParser,
     chunker: BaseChunker | None = None,
@@ -1107,8 +1338,8 @@ def run_pipeline(
     output_dir = Path(get_nested(config, "output.dir", "./knowledge"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Discover files
-    files = discover_files(input_paths)
+    # Discover files (with zip expansion when enabled)
+    files = discover_files(input_paths, config=config)
     pipeline_result = PipelineResult(total_files=len(files))
 
     if not files:

@@ -32,6 +32,18 @@ models:
       model: "gpt-5.4-mini"
       api_key_env: "OPENAI_API_KEY"
 
+  # Audio transcription (ASR) — used by MediaParser for audio/video files
+  # when no subtitle file is available. Same primary/fallback chain as Vision.
+  audio_transcription:
+    primary:
+      provider: "dashscope"               # Qwen3-ASR (default, recommended)
+      model: "qwen3-asr-flash"            # base64 multimodal API, fast, no upload needed
+      api_key_env: "DASHSCOPE_API_KEY"
+    fallback:
+      provider: "openai"                  # Whisper (broad language support)
+      model: "whisper-1"
+      api_key_env: "OPENAI_API_KEY"
+
 # =============================================================================
 # Phase 1: Document Parsing
 # =============================================================================
@@ -60,12 +72,20 @@ parsing:
                               # 200+ = diminishing returns, risks 4MP cap downscale
                               # Gemini charges per-image regardless of DPI,
                               # OpenAI/Claude charge by tile/pixel count.
+    triage:
+      enabled: false            # false = all pages sent to Vision (safe default)
+                                # true  = skip pages that are purely text (saves API cost)
+      min_text_length: 50       # Pages with less text than this → always send to Vision
+      max_replacement_ratio: 0.05  # U+FFFD ratio above this → always send to Vision
+      table_line_threshold: 10  # Markdown table rows above this → always send to Vision
 
   # PDF-specific
   pdf:
     table_extraction: true
     image_extraction: true
     max_pages: null           # null = no limit
+    hidden_text_detection:
+      enabled: true           # Detect hidden/invisible elements via Docling ContentLayer
 
   # PPT-specific
   # Docling extracts text from PPT but image generation depends on the backend
@@ -77,6 +97,16 @@ parsing:
     max_page_images: 30         # PPT can have many slides — cap for cost control
     max_image_pixels: 4000000   # auto-downscale oversized page images
 
+    # Chart data direct-read.
+    # Reads chart category / series / values straight from the pptx object
+    # model (python-pptx) and injects them as Markdown tables into the
+    # corresponding slide section, BEFORE Vision runs. This guarantees
+    # 100% accurate chart numbers even when the rendered slide image is
+    # blurry or the chart type defeats Vision OCR. Unsupported chart
+    # types (Waterfall / Treemap / Sunburst etc.) silently fall through
+    # to the existing Vision-only path.
+    extract_chart_data: true
+
   # Word-specific
   # Docling extracts text + table structure from DOCX, but does NOT render page
   # images, so embedded diagrams, screenshots, and figures are lost. Rendering
@@ -85,6 +115,113 @@ parsing:
     vision_page_images: true    # LibreOffice → PDF → page screenshots → Vision
     max_page_images: 20         # cap pages sent to Vision (excess → text-only + warning)
     max_image_pixels: 4000000   # auto-downscale oversized page images
+
+    # Math equations (OMML) → LaTeX preprocessing.
+    # DOCX math is stored in Office Math Markup Language (m:oMath elements)
+    # inside word/document.xml. Docling does NOT convert these to LaTeX —
+    # equations are lost or garbled in the exported Markdown. When this
+    # option is enabled, a pre-parse hook rewrites the DOCX in memory,
+    # replacing every oMath element with a text run holding the LaTeX
+    # equivalent ($E=mc^2$ style), before Docling sees the file. Documents
+    # with zero equations incur zero cost (the hook returns None and the
+    # original file is parsed directly).
+    omml_to_latex: true
+
+  # ZIP archive expansion
+  # Users often hand DocIngest a .zip full of mixed documents. When this
+  # is enabled, zips are unpacked into a dedicated cache subdirectory and
+  # their contents take the zip's place in the file list. Office Open XML
+  # files (docx / pptx / xlsx) are technically zips but are NOT expanded —
+  # they're handled by their native parsers.
+  zip:
+    enabled: true
+    # Persistent extract directory (relative to output.dir/.cache). Kept
+    # across runs so the second run hits the content-addressed cache
+    # on the extracted files directly.
+    extract_dir: "_zip_extract"
+    # ZIP bomb / resource exhaustion defences. Any single limit tripping
+    # refuses the whole archive — the original zip stays in the file
+    # list and Docling surfaces the error.
+    max_nesting_depth: 3              # max recursion for nested zips
+    max_total_extract_size_mb: 500    # total uncompressed size cap
+    max_file_count: 10000             # total entry count cap
+    # Filename encoding fallback chain. Windows zip tools frequently
+    # write CJK names with broken UTF-8 flags; this chain recovers the
+    # real name. CP437 is deliberately NOT in this list — it's what
+    # Python's zipfile defaulted to, and it's what we're trying to
+    # escape. If you add cp437 here it will be auto-skipped.
+    filename_encodings:
+      - utf-8
+      - cp932
+      - shift_jis
+      - euc-jp
+
+  # Content-based format detection (magika, optional)
+  # magika is Google's ML model that identifies file types from content.
+  # DocIngest uses it as a fallback for weak extensions (bin, dat, tmp,
+  # no extension at all) — the most common case is files extracted from
+  # zip archives that lost their extensions. Strong extensions like .pdf
+  # or .docx are trusted by default.
+  # Install: pip install magika
+  magika:
+    enabled: true                 # only effective when `magika` is installed
+    # Extensions that should trigger content-based override unconditionally.
+    # The empty string "" matches files with no extension at all
+    # (Dockerfile, README, etc.).
+    weak_extensions:
+      - ""
+      - bin
+      - dat
+      - tmp
+      - out
+      - raw
+      - dump
+    # Set true to let magika override even strong extensions (.pdf, .docx
+    # etc.). Conservative default is false — a mismatch between content
+    # and a strong extension is more often a legitimate edge case than an
+    # error, and Docling handles most mismatches internally anyway.
+    correct_strong_extensions: false
+
+  # Audio / video transcription
+  # MediaParser handles these formats. Strategy: subtitle-first (look for
+  # .srt/.vtt next to the file — 100% accurate, zero API cost), then ASR
+  # fallback via models.audio_transcription.
+  audio:
+    formats:                               # audio extensions to accept
+      - mp3
+      - wav
+      - m4a
+      - flac
+      - aac
+      - ogg
+      - wma
+      - opus
+    video_formats:                         # video extensions (audio extracted via ffmpeg)
+      - mp4
+      - avi
+      - mkv
+      - webm
+      - mov
+      - wmv
+      - flv
+      - ts
+      - m4v
+    prefer_subtitles: true                 # look for .srt/.vtt before calling ASR
+    language: "auto"                       # "auto" = let ASR detect; or "ja", "en", "zh", ...
+    context: ""                            # hotwords / domain terms for better ASR accuracy
+    include_timestamps: true               # emit [MM:SS] markers in transcript Markdown
+    max_segment_seconds: 150               # long audio split threshold (ffmpeg)
+                                           # Qwen3-ASR-Flash has ~3min per-call limit,
+                                           # 150s (2.5min) is the safe default
+                                           # (same as qwen_asr.py's DEFAULT_SEGMENT_DURATION)
+
+  # URL resolution (yt-dlp)
+  # When users pass an http/https URL as input, DocIngest downloads the
+  # media + subtitles + metadata via yt-dlp (supports 1000+ sites).
+  url:
+    enabled: true
+    download_dir: "_media"                 # relative to output.dir/.cache/
+    yt_dlp_extra_args: []                  # additional yt-dlp flags (advanced)
 
   # Excel-specific
   xlsx:
@@ -113,11 +250,31 @@ output:
   sources_dir: "sources"
   assets_dir: "assets"
   index_file: "index.json"
+  include_bounding_boxes: true  # Extract per-element coordinates from Docling
 
   markdown:
     include_metadata_header: true  # YAML frontmatter in each file
     image_refs: "relative"         # relative | absolute | inline_base64
     max_file_size_mb: 10           # split very large documents
+
+    # Frontmatter field whitelist + order. Fields appear in the generated
+    # frontmatter only if (a) they're in this list AND (b) the hook / parser
+    # actually wrote them to parse_result.metadata. Unknown fields in metadata
+    # are NOT auto-exported — this protects frontmatter from leaking internal
+    # state. Hooks that need a new field should add its name here AND write
+    # the value to parse_result.metadata.
+    frontmatter_fields:
+      # Core identity
+      - format
+      - title
+      - language
+      - pages
+      # Docling origin (promoted by file_metadata hook)
+      - mimetype
+      - binary_hash
+      # Exiftool enrichment (populated when metadata.exiftool.enabled)
+      - author
+      - created_at
 
 # =============================================================================
 # Phase 3: Chunking
@@ -145,10 +302,16 @@ chunking:
       xlsx: "sheet"
       csv: "sheet"
       image: "whole"
+      audio: "timestamp"
+      video: "timestamp"
       default: "scoring"          # all others → structure scoring
 
     # Extensions treated as "image" format
     image_formats: ["png", "jpg", "jpeg", "tiff", "bmp", "webp", "gif"]
+
+    # Extensions treated as "audio" / "video" format (for auto strategy)
+    audio_formats: ["mp3", "wav", "m4a", "flac", "aac", "ogg", "wma", "opus"]
+    video_formats: ["mp4", "avi", "mkv", "webm", "mov", "wmv", "flv", "ts", "m4v"]
 
   # Protection rules (applied across all strategies)
   protection:
@@ -187,11 +350,76 @@ error_handling:
   report_file: "errors.json"
 
 # =============================================================================
+# External binaries
+# =============================================================================
+# Explicit paths for external command-line tools DocIngest can use when
+# present (LibreOffice for office→PDF rendering, ExifTool for metadata,
+# ffmpeg for audio preprocessing). Leave as null to auto-discover via the
+# binary finder, which probes (in order):
+#
+#   1. this config key (highest priority; misconfigured paths fail loud)
+#   2. dedicated env vars (SOFFICE_PATH / EXIFTOOL_PATH / FFMPEG_PATH)
+#   3. shutil.which() — PATH lookup
+#   4. platform-specific standard install locations (Program Files on
+#      Windows, /Applications on macOS, /usr/bin on Linux, …)
+#
+# Only set these when auto-discovery fails (unusual install drive,
+# portable copies, multi-version systems).
+binaries:
+  soffice:
+    path: null           # LibreOffice — e.g. "D:/tools/libreoffice/soffice.exe"
+  exiftool:
+    path: null           # ExifTool — e.g. "C:/Program Files/exiftool/exiftool.exe"
+  ffmpeg:
+    path: null           # ffmpeg — reserved for future audio parser
+
+# =============================================================================
 # Cache (AI call result caching — Vision/LLM responses by content hash)
 # =============================================================================
 cache:
   enabled: true
   dir: ".docingest_cache"
+
+# =============================================================================
+# File metadata enrichment (file_metadata hook)
+# =============================================================================
+# Two data sources surface into parse_result.metadata and then into the
+# sources/*.md frontmatter:
+#
+#   1. Docling origin (always on, zero cost):
+#      mimetype + binary_hash are lifted from Docling's DoclingDocument.origin
+#      into top-level frontmatter keys. This is pure promotion — no external
+#      tools, no extra I/O.
+#
+#   2. ExifTool (opt-in, requires system-level exiftool executable):
+#      Reads PDF Author / CreateDate, image EXIF (GPS, camera, keywords),
+#      audio ID3 tags, etc. Fields that Docling does NOT expose. Requires:
+#        - `exiftool` >= 12.24 (CVE-2021-22204 fix) on PATH, OR
+#          metadata.exiftool.path pointing at an explicit location
+#        - optionally `pyexiftool` Python package for stay_open mode
+#          (pip install pyexiftool) — falls back to subprocess otherwise
+#      When exiftool is unavailable, the hook silently skips this part
+#      and frontmatter simply lacks the exiftool-derived fields.
+metadata:
+  exiftool:
+    enabled: false                # opt-in: flip to true when exiftool is installed
+    path: null                    # null = auto-discover via shutil.which
+    # Per-format field whitelists (merged with Exiftool canonical names).
+    # Fields outside this list are dropped from the nested `exif:` frontmatter
+    # block to keep output focused. Family is picked by file extension:
+    #   image: png/jpg/jpeg/gif/tiff/bmp/webp/heic
+    #   pdf:   pdf
+    #   audio: wav/mp3/m4a/flac/ogg/aac
+    #   office: docx/doc/pptx/ppt/xlsx/xls
+    fields:
+      image: [ImageSize, Title, Caption, Description, Keywords,
+              Artist, Author, DateTimeOriginal, CreateDate, GPSPosition]
+      pdf:   [Title, Author, Subject, Keywords, CreateDate, ModifyDate,
+              Producer, Creator]
+      audio: [Title, Artist, Album, Genre, Track, DateTimeOriginal,
+              CreateDate, Duration]
+      office: [Title, Author, Subject, Keywords, Company, CreateDate,
+               ModifyDate, LastModifiedBy]
 
 # =============================================================================
 # Quality report (Vision uncertainty marker scan)
@@ -241,4 +469,39 @@ knowledge_map:
   ai_summary: true              # true: AI generates summary + search guide (1 API call)
                                 # false: Stage 1 only (zero cost, structure + keywords only)
   output_file: "knowledge_map.yaml"
+  keywords:
+    # --- SudachiPy backend (used when `pip install sudachipy sudachidict_core`) ---
+    pos_keep: ["名詞"]            # POS major categories to keep (Japanese morphology)
+    sudachi_mode: "C"             # A=finest, B=middle, C=coarsest (compound nouns)
+    # --- Regex fallback (used when SudachiPy is not installed) ---
+    latin_min_len: 3              # Minimum Latin word length (filters "No", "of", etc.)
+    cjk_min_len: 3                # Minimum raw CJK run length before strip
+    cjk_strip_patterns:           # Regex patterns stripped from CJK run head/tail
+      - "^[のはをがにでとも]+"
+      - "に関する$"
+      - "について$"
+      - "における$"
+      - "および$"
+    cjk_min_after_strip: 2        # Minimum CJK length after stripping
+    # --- Common to both backends ---
+    extra_stop_words:             # Words to always exclude from keywords
+      - "group"                   # Docling internal group name
+      - "list"                    # Docling internal group name
+      - "slide"                   # Docling internal group name
+    max_per_file: 15              # Max keywords per file in knowledge_map
+    max_index: 50                 # Max entries in keyword_index reverse map
+# =============================================================================
+# Sensitive Data Sanitization (PII masking)
+# =============================================================================
+sanitize:
+  enabled: false                    # Default OFF — opt-in only (risk of false positives)
+  # Rules can be overridden entirely via config. Each rule has:
+  #   name: human-readable label
+  #   pattern: regex pattern
+  #   replacement: replacement string
+  # Default rules (high precision only): email, URL, credit card (Luhn),
+  # IPv4, Japanese phone numbers. No name detection (impossible with regex).
+  # Set rules: [] to disable all defaults and use only your own.
+  rules: null                       # null = use built-in defaults
+
   # Key = sha256(model_id + file_content_hash + relevant_config_hash)

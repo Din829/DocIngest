@@ -25,6 +25,10 @@ ocr = [
 tesseract = [
     "docling[tesserocr]",     # Tesseract OCR support
 ]
+nlp = [
+    "sudachipy>=0.6",         # Japanese morphological analysis (keyword extraction)
+    "sudachidict_core>=20240409",  # SudachiPy core dictionary
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

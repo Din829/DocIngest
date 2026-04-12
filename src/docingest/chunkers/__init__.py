@@ -125,6 +125,12 @@ class AutoChunker(BaseChunker):
         self._image_formats = set(auto_cfg.get("image_formats", [
             "png", "jpg", "jpeg", "tiff", "bmp", "webp", "gif"
         ]))
+        self._audio_formats = set(auto_cfg.get("audio_formats", [
+            "mp3", "wav", "m4a", "flac", "aac", "ogg", "wma", "opus"
+        ]))
+        self._video_formats = set(auto_cfg.get("video_formats", [
+            "mp4", "avi", "mkv", "webm", "mov", "wmv", "flv", "ts", "m4v"
+        ]))
         self._threshold = auto_cfg.get("prefer_heading_threshold", 2)
 
     def chunk(self, markdown: str, metadata: dict[str, Any]) -> list[Chunk]:
@@ -143,7 +149,6 @@ class AutoChunker(BaseChunker):
                           "tokens": self.estimate_tokens(markdown)},
             )]
         elif strategy == "slide":
-            # Imported lazily to avoid circular deps (Step 7 adds slide.py)
             try:
                 from .slide import SlideChunker
                 return SlideChunker(self.config).chunk(markdown, metadata)
@@ -155,6 +160,12 @@ class AutoChunker(BaseChunker):
                 return SheetChunker(self.config).chunk(markdown, metadata)
             except ImportError:
                 return self._recursive.chunk(markdown, metadata)
+        elif strategy == "timestamp":
+            try:
+                from .timestamp import TimestampChunker
+                return TimestampChunker(self.config).chunk(markdown, metadata)
+            except ImportError:
+                return self._recursive.chunk(markdown, metadata)
         else:
             # "recursive" or any unknown → recursive
             return self._recursive.chunk(markdown, metadata)
@@ -163,13 +174,19 @@ class AutoChunker(BaseChunker):
         """
         Select chunking strategy based on format + structure.
 
-        Returns strategy name: "heading", "recursive", "slide", "sheet", "whole".
+        Returns strategy name: "heading", "recursive", "slide", "sheet", "whole", "timestamp".
         """
         doc_format = metadata.get("format", "").lower()
 
         # Check image formats
         if doc_format in self._image_formats:
             return self._format_strategies.get("image", "whole")
+
+        # Check audio/video formats → timestamp chunker
+        if doc_format in self._audio_formats:
+            return self._format_strategies.get("audio", "timestamp")
+        if doc_format in self._video_formats:
+            return self._format_strategies.get("video", "timestamp")
 
         # Check format-specific strategy
         if doc_format in self._format_strategies:

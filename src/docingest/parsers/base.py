@@ -15,6 +15,7 @@ PAGEBREAK_MARKER = "<!-- pagebreak -->"
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -69,12 +70,23 @@ class BaseParser(ABC):
         self.config = config
 
     @abstractmethod
-    def parse(self, file_path: Path) -> ParseResult:
+    def parse(
+        self,
+        file_path: Path,
+        *,
+        override_stream: BytesIO | None = None,
+    ) -> ParseResult:
         """
         Parse a document file and return Markdown + metadata.
 
         Args:
-            file_path: Absolute path to the input file.
+            file_path: Absolute path to the input file. Even when
+                override_stream is provided, file_path is still used for
+                naming, format detection, and metadata.
+            override_stream: Optional BytesIO with transformed file content
+                (e.g. from a pre-parse hook). When provided, implementations
+                should read from the stream instead of file_path. Default
+                None means "read the file on disk as usual".
 
         Returns:
             ParseResult with markdown content and metadata.

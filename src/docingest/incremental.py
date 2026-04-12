@@ -113,9 +113,17 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.docx.vision_page_images",
     "parsing.docx.max_page_images",
     "parsing.docx.max_image_pixels",
+    "parsing.docx.omml_to_latex",          # hook #2: DOCX OMML preprocessing
+    "parsing.zip.enabled",                 # #4: ZIP expansion toggle
+    "parsing.zip.max_nesting_depth",       # #4: affects what gets expanded
+    "parsing.zip.filename_encodings",      # #4: affects resulting filenames
+    "parsing.magika.enabled",              # #8: format detection toggle
+    "parsing.magika.weak_extensions",      # #8: what gets detected
+    "parsing.magika.correct_strong_extensions",  # #8: correction aggressiveness
     "parsing.pptx.vision_page_images",
     "parsing.pptx.max_page_images",
     "parsing.pptx.max_image_pixels",
+    "parsing.pptx.extract_chart_data",     # hook #1: PPTX chart direct-read
     "parsing.pdf.table_extraction",
     "parsing.pdf.image_extraction",
     "parsing.pptx.include_notes",
@@ -137,6 +145,14 @@ _RELEVANT_CONFIG_PATHS = [
     "models.vision.fallback.provider",
     "models.vision.fallback.model",
     "output.markdown.include_metadata_header",
+    "metadata.exiftool.enabled",           # hook #3: exiftool gating
+    "metadata.exiftool.fields",            # hook #3: whitelist changes
+    "parsing.audio.prefer_subtitles",      # #5: subtitle vs ASR path
+    "parsing.audio.language",              # #5: language affects ASR output
+    "parsing.audio.include_timestamps",    # #5: timestamp format in output
+    "parsing.url.enabled",                 # #5: URL resolution toggle
+    "models.audio_transcription.primary.provider",   # #5: ASR engine
+    "models.audio_transcription.primary.model",      # #5: ASR model
 ]
 
 

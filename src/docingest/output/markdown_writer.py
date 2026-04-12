@@ -21,39 +21,94 @@ from ..config import get_nested
 from ..parsers.base import ParseResult
 
 
-def _build_frontmatter(metadata: dict[str, Any], original_file: str) -> str:
+def _yaml_escape(value: Any) -> str:
+    """
+    Minimal YAML scalar escape: wrap in double quotes when the value
+    contains characters that could confuse a YAML parser (colon, newline,
+    leading/trailing whitespace). Numbers and bools pass through.
+    """
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    s = str(value)
+    if not s:
+        return '""'
+    needs_quote = (
+        ":" in s or "\n" in s or "#" in s
+        or s != s.strip()
+        or s[0] in "[]{}|>*&!%@`"
+    )
+    if needs_quote:
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+        return f'"{escaped}"'
+    return s
+
+
+# Default frontmatter field order used when config doesn't override
+# output.markdown.frontmatter_fields. Explicit high-value fields first (for
+# readability), then optional enrichment fields added by hooks. Unknown
+# fields in metadata are NOT auto-exported — only listed fields make it to
+# frontmatter. Hooks that add new metadata keys must either extend this
+# list via config or rely on the nested exif: block below for overflow.
+_DEFAULT_FRONTMATTER_FIELDS: list[str] = [
+    # Core identity (always present)
+    "format",
+    "title",
+    "language",
+    "pages",
+    # Docling origin (promoted by file_metadata hook)
+    "mimetype",
+    "binary_hash",
+    # Exiftool enrichment (populated when metadata.exiftool.enabled)
+    "author",
+    "created_at",
+]
+
+
+def _build_frontmatter(
+    metadata: dict[str, Any],
+    original_file: str,
+    config: dict[str, Any] | None = None,
+) -> str:
     """
     Build YAML frontmatter string from metadata.
 
-    Example output:
-        ---
-        source: report.pdf
-        format: pdf
-        title: Annual Report 2025
-        language: ja
-        pages: 120
-        processed_at: 2026-04-02T10:30:00
-        ---
+    Field selection and order come from config
+    (output.markdown.frontmatter_fields); when absent, fall back to
+    _DEFAULT_FRONTMATTER_FIELDS. Missing fields are skipped silently, so
+    hooks can opportunistically write data without worrying about whether
+    every file carries every field. Additional hook-provided metadata
+    (e.g. the exif dict) is attached as a nested block at the end.
     """
     lines = ["---"]
+    lines.append(f"source: {_yaml_escape(original_file)}")
 
-    lines.append(f"source: {original_file}")
+    # Resolve field list: config > default. Config value must be a list
+    # of strings; anything else falls back to the default to avoid silent
+    # misconfiguration breaking frontmatter output.
+    fields: list[str] = _DEFAULT_FRONTMATTER_FIELDS
+    if config is not None:
+        configured = get_nested(config, "output.markdown.frontmatter_fields", None)
+        if isinstance(configured, list) and all(isinstance(f, str) for f in configured):
+            fields = configured
 
-    if "format" in metadata:
-        lines.append(f"format: {metadata['format']}")
-    if "title" in metadata:
-        lines.append(f"title: {metadata['title']}")
-    if "language" in metadata:
-        lines.append(f"language: {metadata['language']}")
-    if "pages" in metadata:
-        lines.append(f"pages: {metadata['pages']}")
+    for field in fields:
+        if field in metadata and metadata[field] is not None:
+            lines.append(f"{field}: {_yaml_escape(metadata[field])}")
 
     lines.append(f"processed_at: {datetime.datetime.now().isoformat(timespec='seconds')}")
 
     # Surface warnings to frontmatter so both humans and Agents can see them
     if "warnings" in metadata and metadata["warnings"]:
         for w in metadata["warnings"]:
-            lines.append(f"warning: \"{w}\"")
+            lines.append(f"warning: {_yaml_escape(w)}")
+
+    # Nested exif block (from file_metadata hook when exiftool is enabled).
+    # Only emitted when non-empty so noise is minimized.
+    exif = metadata.get("exif")
+    if isinstance(exif, dict) and exif:
+        lines.append("exif:")
+        for k, v in exif.items():
+            lines.append(f"  {k}: {_yaml_escape(v)}")
 
     lines.append("---")
     return "\n".join(lines)
@@ -116,7 +171,9 @@ def write_markdown(
     # Frontmatter (optional)
     include_header = get_nested(config, "output.markdown.include_metadata_header", True)
     if include_header:
-        frontmatter = _build_frontmatter(parse_result.metadata, original_file.name)
+        frontmatter = _build_frontmatter(
+            parse_result.metadata, original_file.name, config=config
+        )
         parts.append(frontmatter)
         parts.append("")  # blank line after frontmatter
 

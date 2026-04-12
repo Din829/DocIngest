@@ -1,44 +1,37 @@
 __pycache__/
 *.pyc
 *.egg-info/
+*.egg
 dist/
 build/
+.venv/
+.env
 .docingest_cache/
 
-# Pipeline output (generated, not source code)
-knowledge/sources/
-knowledge/readable/
-knowledge/assets/
-knowledge/index.json
-knowledge/chunks.jsonl
-knowledge/knowledge_map.yaml
-knowledge/knowledge_search.SKILL.md
-knowledge/errors.json
-knowledge/quality_report.json
+# Knowledge outputs (user-generated, not source code)
+# All output goes under knowledge/<name>/ subdirectories
+knowledge/
 
-# Test output directories
+# Test outputs (generated during test runs)
+tests/incremental/out/
+
+# Test sample documents (large files, not checked in)
+tests/sample_docs/
+
+# Legacy test dirs (may still exist on some machines)
+test_docs/
+test_incremental/
+仕様書サンプル/
 test_output*/
 test_shiyousho/
 test_pdf_incremental/
-test_incremental/out/
 test_word/
 test_word_*/
 test_pptx/
 test_pptx_*/
 
-# Test input files (large, downloaded samples)
-test_docs/
-仕様書サンプル/
-
-# User knowledge bases
-knowledge/
-knowledge_*/
-
-# Reference projects (cloned externally)
+# Reference projects (cloned externally, not checked in)
 参考项目/
 
 # Misc
 errors.json
-*.egg
-.venv/
-.env

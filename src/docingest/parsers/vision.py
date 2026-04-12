@@ -135,28 +135,82 @@ Only use [unreadable] when the content is genuinely illegible:
 {page_text}
 ---
 
+## Pre-extracted structured data (GROUND TRUTH — do not re-transcribe)
+
+The following Markdown block was read **directly from the source document's \
+object model** (e.g. PowerPoint's chart XML via python-pptx). It is \
+**guaranteed accurate** — every number, label, and category name is \
+authoritative. Your job:
+
+1. **Do NOT re-transcribe the values or labels in this block.** They are \
+already correct. Restating them wastes tokens and risks OCR errors.
+2. **DO describe what this block does NOT contain:** visual annotations, \
+arrows, callouts, highlighted regions, neighbouring text referencing the \
+chart, colour legend semantics, manually added text boxes, and anything \
+else you see on the page image that is NOT inside the block below.
+3. **If the block below is "(none)" or empty**, act normally — transcribe \
+the page image as usual per the rules above.
+4. **If you notice the block is missing something important** (e.g. an axis \
+unit visible in the image but absent from the block, or a chart type the \
+block doesn't mention), YOU SHOULD add that detail — that's your job.
+5. Reference the structured block naturally ("as shown in the table above") \
+instead of repeating its content.
+
+---
+{structured_data}
+---
+
 Now examine the page image and produce the accurate Markdown for this page. \
-Read aggressively; mark uncertainty explicitly; never invent content."""
+Read aggressively; mark uncertainty explicitly; never invent content. \
+Trust the structured data block — focus your effort on everything the block \
+cannot see."""
 
 
 def describe_page(
     image_path: str | Path,
     page_text: str,
     model_config: dict[str, Any],
+    structured_data: str | None = None,
 ) -> str:
     """
     Send a page image + extracted text to Vision AI.
 
     The AI decides how to handle it based on the prompt.
     No code-level filtering or threshold logic.
+
+    Args:
+        image_path: Page screenshot.
+        page_text: Docling's text extraction for this page (may be empty).
+        model_config: models.vision dict.
+        structured_data: Optional ground-truth Markdown block read
+            directly from the source document's object model (e.g. PPTX
+            chart data). When provided, the prompt instructs Vision to
+            treat it as authoritative and focus on visual elements the
+            block cannot capture. When None, the prompt renders "(none)"
+            and Vision behaves as it did before this feature.
     """
     image_path = Path(image_path)
     if not image_path.exists():
         raise FileNotFoundError(f"Page image not found: {image_path}")
 
-    prompt = _PAGE_PROMPT.format(page_text=page_text if page_text.strip() else "(empty — no text extracted)")
+    prompt = _PAGE_PROMPT.format(
+        page_text=page_text if page_text.strip() else "(empty — no text extracted)",
+        structured_data=structured_data if structured_data and structured_data.strip() else "(none)",
+    )
 
     return describe_image(image_path, prompt, model_config)
+
+
+def _structured_data_cache_tag(structured_data: str | None) -> str:
+    """
+    Stable short tag to fold into Vision cache keys so the cache invalidates
+    when structured_data content changes. Truncated SHA256 is plenty for
+    cache keying (not a security-sensitive hash).
+    """
+    import hashlib
+    if not structured_data:
+        return "nostruct"
+    return "struct-" + hashlib.sha256(structured_data.encode("utf-8")).hexdigest()[:16]
 
 
 def describe_page_cached(
@@ -164,11 +218,15 @@ def describe_page_cached(
     page_text: str,
     config: dict[str, Any],
     cache: AICache | None = None,
+    structured_data: str | None = None,
 ) -> str:
     """
     Per-page Vision with caching.
 
-    Cache key includes image content hash, so same page = cache hit.
+    Cache key = image content hash + structured_data hash tag. When
+    structured_data changes (hook extracted new/different content), the
+    tag changes → cache miss → Vision re-runs. When structured_data is
+    None or unchanged, cache behaviour is identical to before.
     """
     image_path = Path(image_path)
     vision_model_config = get_nested(config, "models.vision", {})
@@ -181,8 +239,10 @@ def describe_page_cached(
         return cache.get_or_call(
             model_name=model_name,
             content_hash=img_hash,
-            call_fn=lambda: describe_page(image_path, page_text, vision_model_config),
-            extra_key="page_vision",
+            call_fn=lambda: describe_page(
+                image_path, page_text, vision_model_config, structured_data
+            ),
+            extra_key=f"page_vision|{_structured_data_cache_tag(structured_data)}",
         )
     else:
-        return describe_page(image_path, page_text, vision_model_config)
+        return describe_page(image_path, page_text, vision_model_config, structured_data)

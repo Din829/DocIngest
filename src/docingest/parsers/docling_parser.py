@@ -16,6 +16,7 @@ Design:
 from __future__ import annotations
 
 import logging
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -133,13 +134,40 @@ class DoclingParser(BaseParser):
         )
         return self._converter
 
-    def parse(self, file_path: Path) -> ParseResult:
-        """Parse a document using Docling."""
+    def parse(
+        self,
+        file_path: Path,
+        *,
+        override_stream: BytesIO | None = None,
+    ) -> ParseResult:
+        """
+        Parse a document using Docling.
+
+        Args:
+            file_path: Path to the input file (used for naming, metadata,
+                and format detection even when override_stream is provided).
+            override_stream: Optional BytesIO stream to feed Docling instead
+                of reading file_path. Used by pre-parse hooks (e.g. DOCX OMML
+                preprocessing) to transform file content before Docling sees
+                it without touching the original file on disk.
+        """
         from .base import PageData
 
         try:
             converter = self._get_converter()
-            result = converter.convert(str(file_path))
+            if override_stream is not None:
+                # Route through DocumentStream so Docling reads the
+                # transformed bytes while still seeing the original filename
+                # (which it uses for format detection).
+                from docling_core.types.io import DocumentStream
+                override_stream.seek(0)
+                doc_stream = DocumentStream(
+                    name=file_path.name,
+                    stream=override_stream,
+                )
+                result = converter.convert(doc_stream)
+            else:
+                result = converter.convert(str(file_path))
             doc = result.document
 
             # Export full Markdown (with page break markers)
@@ -165,6 +193,16 @@ class DoclingParser(BaseParser):
             if self._last_parse_metadata.get("xlsx_embedded_images"):
                 metadata["xlsx_embedded_images"] = self._last_parse_metadata["xlsx_embedded_images"]
 
+            # Extract per-element bounding boxes (if enabled)
+            if get_nested(self.config, "output.include_bounding_boxes", True):
+                metadata["element_boxes"] = self._extract_bounding_boxes(doc)
+
+            # Detect hidden text via content_layer (if enabled, PDF only)
+            if get_nested(self.config, "parsing.pdf.hidden_text_detection.enabled", True):
+                hidden_info = self._detect_hidden_content(doc)
+                if hidden_info["hidden_element_count"] > 0:
+                    metadata["hidden_text"] = hidden_info
+
             return ParseResult(
                 markdown=markdown,
                 metadata=metadata,
@@ -178,6 +216,96 @@ class DoclingParser(BaseParser):
                 success=False,
                 error=f"Docling parse failed: {e}",
             )
+
+    @staticmethod
+    def _extract_bounding_boxes(doc) -> dict:
+        """
+        Extract per-element bounding boxes from Docling's Document model.
+
+        Returns a dict organized by page number::
+
+            {
+                1: [
+                    {"label": "text", "bbox": [l, t, r, b], "text_preview": "..."},
+                    {"label": "table", "bbox": [l, t, r, b]},
+                ],
+                2: [...],
+            }
+
+        Coordinates are in Docling's coordinate system (origin depends on
+        document, typically top-left for PDF). Only elements with provenance
+        data are included.
+        """
+        boxes: dict[int, list[dict]] = {}
+        try:
+            for item, _level in doc.iterate_items():
+                if not item.prov:
+                    continue
+                prov = item.prov[0]
+                page_no = prov.page_no
+                b = prov.bbox
+                entry: dict = {
+                    "label": item.label.value,
+                    "bbox": [round(b.l, 1), round(b.t, 1), round(b.r, 1), round(b.b, 1)],
+                }
+                # Include short text preview for text elements (aids debugging)
+                if hasattr(item, "text") and item.text:
+                    entry["text_preview"] = item.text[:60]
+                boxes.setdefault(page_no, []).append(entry)
+        except Exception as e:
+            logger.debug(f"Bounding box extraction failed: {e}")
+        return boxes
+
+    @staticmethod
+    def _detect_hidden_content(doc) -> dict:
+        """
+        Detect hidden content using Docling's ContentLayer metadata.
+
+        Checks each element's content_layer field — Docling marks some
+        elements as INVISIBLE (e.g. Excel hidden sheets) or BACKGROUND
+        (watermarks). This is a lightweight check that uses only the
+        high-level Document API (no low-level PDF cell access needed).
+
+        For deeper hidden text detection (rendering mode, font color vs
+        background), PyMuPDF would be needed — but that's a heavier
+        operation reserved for future enhancement.
+
+        Returns::
+
+            {
+                "hidden_element_count": int,
+                "background_element_count": int,
+                "details": [{"page": int, "label": str, "layer": str, "preview": str}],
+            }
+        """
+        from docling_core.types.doc.document import ContentLayer
+
+        hidden_count = 0
+        background_count = 0
+        details: list[dict] = []
+        try:
+            for item, _level in doc.iterate_items():
+                layer = item.content_layer
+                if layer == ContentLayer.INVISIBLE:
+                    hidden_count += 1
+                    page_no = item.prov[0].page_no if item.prov else 0
+                    preview = getattr(item, "text", "")[:60] if hasattr(item, "text") else ""
+                    details.append({
+                        "page": page_no,
+                        "label": item.label.value,
+                        "layer": "invisible",
+                        "preview": preview,
+                    })
+                elif layer == ContentLayer.BACKGROUND:
+                    background_count += 1
+        except Exception as e:
+            logger.debug(f"Hidden content detection failed: {e}")
+
+        return {
+            "hidden_element_count": hidden_count,
+            "background_element_count": background_count,
+            "details": details,
+        }
 
     @staticmethod
     def _extract_group_names(doc) -> list[str]:
@@ -253,10 +381,28 @@ class DoclingParser(BaseParser):
 
     def _extract_metadata(self, doc, file_path: Path) -> dict[str, Any]:
         """Extract document metadata from Docling result."""
+        # Suffix-based format is the baseline. For files with weak or
+        # missing extensions (common after zip expansion, or for
+        # renamed/downloaded files), the format detector can override
+        # this via content-based identification (magika). Strong
+        # extensions are trusted by default — see format_detector for
+        # the decision logic.
+        suffix_format = file_path.suffix.lstrip(".").lower()
+        corrected_format: str | None = None
+        try:
+            from ..utils.format_detector import detect_format
+            corrected_format = detect_format(file_path, self.config)
+        except Exception as e:
+            logger.debug(f"format_detector failed for {file_path.name}: {e}")
+
         metadata: dict[str, Any] = {
-            "format": file_path.suffix.lstrip(".").lower(),
+            "format": corrected_format or suffix_format,
             "title": file_path.stem,
         }
+        if corrected_format and corrected_format != suffix_format:
+            # Preserve the original suffix so debugging and the quality
+            # report can see what magika overrode.
+            metadata["suffix_format"] = suffix_format
 
         try:
             if hasattr(doc, "pages") and doc.pages:
@@ -268,6 +414,26 @@ class DoclingParser(BaseParser):
             md_content = doc.export_to_markdown()
             metadata["has_tables"] = "|" in md_content and "---" in md_content
             metadata["has_images"] = "<!-- image" in md_content
+        except Exception:
+            pass
+
+        # Surface Docling's own minimal metadata (DoclingDocument.origin +
+        # name) so downstream hooks and the frontmatter writer can consume
+        # them without re-parsing the file. Docling itself does NOT expose
+        # author / creation date — those come from the exiftool hook.
+        try:
+            origin = getattr(doc, "origin", None)
+            if origin is not None:
+                docling_origin: dict[str, Any] = {}
+                for field in ("filename", "mimetype", "binary_hash", "uri"):
+                    value = getattr(origin, field, None)
+                    if value:
+                        docling_origin[field] = value
+                if docling_origin:
+                    metadata["docling_origin"] = docling_origin
+            doc_name = getattr(doc, "name", None)
+            if doc_name:
+                metadata["docling_name"] = doc_name
         except Exception:
             pass
 
@@ -386,11 +552,13 @@ class DoclingParser(BaseParser):
         Tries LibreOffice headless → PDF → images pipeline.
         Gracefully does nothing if tools aren't available.
         """
-        import shutil
         import subprocess
         import tempfile
+        from ..utils.binary_finder import find_binary
 
-        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        # Cross-platform LibreOffice lookup — handles Windows Program Files
+        # installs, macOS /Applications bundles, and config/env overrides.
+        soffice = find_binary("soffice", self.config)
         if not soffice:
             logger.debug("LibreOffice not found — skipping PPT page image export")
             return
