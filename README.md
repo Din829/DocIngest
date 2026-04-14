@@ -18,11 +18,20 @@ Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → pa
 ## Install
 
 ```bash
+git clone https://github.com/Din829/DocIngest.git
 cd DocIngest
-pip install -e .
+pip install -e .                     # Core dependencies
+cp .env.example .env                 # Fill in API keys
+docingest doctor                     # Check what's missing
+```
 
-# Optional: Japanese keyword extraction (SudachiPy, ~80MB)
-pip install -e ".[nlp]"
+Optional extras (install as needed):
+
+```bash
+pip install -e ".[nlp]"              # Japanese keyword extraction (SudachiPy)
+pip install -e ".[mcp]"              # MCP Server (FastMCP)
+pip install -e ".[audio]"            # Audio transcription (DashScope Qwen3-ASR)
+pip install -e ".[nlp,mcp,audio]"    # All optional Python packages
 ```
 
 Optional system tools (auto-detected, gracefully skipped if absent):
@@ -33,16 +42,18 @@ winget install TheDocumentFoundation.LibreOffice   # Windows
 brew install --cask libreoffice                    # macOS
 sudo apt install libreoffice                       # Linux
 
-# yt-dlp — enables YouTube/Bilibili/video URL processing
-pip install yt-dlp
-
 # ffmpeg — enables video audio extraction + long audio segmentation
 winget install Gyan.FFmpeg                         # Windows
 brew install ffmpeg                                # macOS
 
+# yt-dlp — enables YouTube/Bilibili/video URL processing
+pip install yt-dlp
+
 # magika — enables content-based file type detection (optional, ~25MB)
 pip install magika
 ```
+
+Run `docingest doctor` at any time to check your environment.
 
 Set API keys in `.env` at the project root:
 
