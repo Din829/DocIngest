@@ -961,6 +961,49 @@ def _enrich_with_vision(
 
 
 # ---------------------------------------------------------------------------
+# Pre-chunking: deduplicate Docling + Vision overlap
+# ---------------------------------------------------------------------------
+
+def _dedup_vision_for_chunking(markdown: str) -> str:
+    """
+    Remove Docling-Vision content overlap BEFORE chunking.
+
+    sources/*.md keeps both versions (for grep/Agentic Search), but
+    chunks.jsonl should not contain duplicate content. For each pagebreak
+    section that has both Docling text and <!-- vision-enriched --> content:
+      - Keep ONLY the vision-enriched part (it's more complete/formatted)
+      - Discard the Docling text portion of that section
+
+    Sections WITHOUT vision-enriched stay untouched.
+    Does NOT modify the source markdown file — only affects chunking input.
+    """
+    pagebreak = PAGEBREAK_MARKER
+    sections = markdown.split(pagebreak)
+
+    deduped_sections = []
+    for section in sections:
+        if "<!-- vision-enriched -->" in section:
+            # Split at the vision marker — keep only the vision part
+            parts = section.split("<!-- vision-enriched -->", 1)
+            # Preserve any frontmatter (first section may have ---...---)
+            pre_vision = parts[0].strip()
+            vision_content = parts[1].strip()
+
+            # Keep frontmatter block if present (starts with ---)
+            if pre_vision.startswith("---\n") and "\n---" in pre_vision[4:]:
+                frontmatter_end = pre_vision.index("\n---", 4) + 4
+                frontmatter = pre_vision[:frontmatter_end]
+                deduped_sections.append(frontmatter + "\n\n" + vision_content)
+            else:
+                deduped_sections.append(vision_content)
+        else:
+            # No vision — keep as-is
+            deduped_sections.append(section)
+
+    return pagebreak.join(deduped_sections)
+
+
+# ---------------------------------------------------------------------------
 # Chunk post-processing
 # ---------------------------------------------------------------------------
 
@@ -1215,8 +1258,12 @@ def process_single_file(
         except Exception:
             pass
 
+        # Pre-chunking: deduplicate Docling + Vision overlap so chunks
+        # don't contain the same content twice. source .md is untouched.
+        chunk_markdown = _dedup_vision_for_chunking(parse_result.markdown)
+
         try:
-            chunks = chunker.chunk(parse_result.markdown, doc_metadata)
+            chunks = chunker.chunk(chunk_markdown, doc_metadata)
         except Exception as e:
             # Chunking failure → fallback behavior from config
             on_failure = get_nested(config, "error_handling.on_chunk_failure", "fallback")
