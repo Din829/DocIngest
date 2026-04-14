@@ -195,10 +195,14 @@ def refine(
     versions in readable/*.md. Removes noise, merges duplicates,
     improves structure.
 
+    Available skills:
+      - "refine_default" (default): readability-first, allows rewriting and polishing
+      - "refine_faithful": preserves original wording word-for-word, only deduplicates and reformats
+
     Args:
         files: List of Markdown file paths to refine.
         output_dir: Output base directory (default: parent of first file).
-        skill: SKILL template name (default: refine_default).
+        skill: SKILL template name. Use "refine_faithful" to preserve original text exactly.
         config_overrides: Optional config overrides dict.
 
     Returns:

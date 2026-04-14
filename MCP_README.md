@@ -126,6 +126,18 @@ Agent: Use docingest run on ["big_report.pdf"] with config_overrides={"parsing":
 → Processes with custom Vision page limit
 ```
 
+### refine — AI cleanup with skill selection
+
+```
+Agent: Use docingest refine on ["./knowledge/sources/report.md"]
+→ Default: rewrites for readability
+
+Agent: Use docingest refine on ["./knowledge/sources/notes.md"] with skill="refine_faithful"
+→ Faithful: preserves original wording, only deduplicates and reformats
+```
+
+Available skills: `refine_default` (readability-first) | `refine_faithful` (word-for-word preservation)
+
 ### search_knowledge — Find content
 
 ```

@@ -114,10 +114,11 @@ docingest inspect report.pdf --json   # JSON output (for Agents / MCP)
 ### Refine for human readability (optional)
 
 ```bash
-docingest refine ./knowledge/sources/spec.md
-docingest refine ./knowledge/sources/*.md
-docingest refine ./knowledge/sources/spec.md --skill my_skill
+docingest refine ./knowledge/sources/spec.md                        # Default: readability-first
+docingest refine ./knowledge/sources/*.md --skill refine_faithful   # Faithful: word-for-word, only dedup + format
 ```
+
+Available skills: `refine_default` (allows rewriting) | `refine_faithful` (preserves original text exactly)
 
 ### Python API
 
