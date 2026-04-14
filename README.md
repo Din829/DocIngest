@@ -55,14 +55,6 @@ pip install magika
 
 Run `docingest doctor` at any time to check your environment.
 
-Set API keys in `.env` at the project root:
-
-```
-GEMINI_API_KEY=...
-DASHSCOPE_API_KEY=...       # For Qwen3-ASR (default audio engine)
-# OPENAI_API_KEY=...        # Optional fallback for Vision/ASR
-```
-
 ## Usage
 
 ### Process documents → knowledge base
@@ -233,7 +225,7 @@ export DOCINGEST__parsing__audio__language=ja
 - **Per-page Vision AI** — AI decides per page: clean up text / describe charts / OCR scan. Parallel execution, cached by content hash.
 - **PPTX chart direct-read** — python-pptx extracts chart data (categories, series, values) as 100% accurate Markdown tables. Vision supplements with visual context.
 - **DOCX math equations** — OMML → LaTeX preprocessing before Docling parses. `$E=mc^{2}$` instead of garbled text.
-- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks (tables, code, lists).
+- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks (tables, code, lists). Docling+Vision dedup before chunking (prevents duplicate chunks).
 - **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction.
 - **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
@@ -254,11 +246,14 @@ export DOCINGEST__parsing__audio__language=ja
 config/default.yaml              # Default configuration
 skills/                          # SKILL templates (refine prompts)
 src/docingest/
-├── cli.py                       # CLI: run + refine subcommands
+├── cli.py                       # CLI: run + inspect + refine + doctor
 ├── config.py                    # YAML + env var loader
 ├── pipeline.py                  # Main pipeline orchestration
 ├── incremental.py               # Content-addressed output cache
 ├── refine.py                    # AI Refine standalone command
+├── inspect.py                   # Pre-flight document inspection
+├── doctor.py                    # Environment health check
+├── mcp_server.py                # MCP Server (6 Agent tools)
 ├── parsers/                     # Phase 1: document parsing
 │   ├── docling_parser.py        # Docling adapter (15+ formats)
 │   ├── media_parser.py          # Audio/video (subtitle + ASR)
@@ -296,9 +291,9 @@ src/docingest/
 ## Testing
 
 ```bash
-python tests/test_mixed.py
-python tests/test_config_override.py
-python test_incremental/run_tests.py
+python tests/unit/test_mixed.py
+python tests/unit/test_config_override.py
+python tests/incremental/run_tests.py
 ```
 
 ## Full Design
