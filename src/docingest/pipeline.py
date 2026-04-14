@@ -971,8 +971,10 @@ def _dedup_vision_for_chunking(markdown: str) -> str:
     sources/*.md keeps both versions (for grep/Agentic Search), but
     chunks.jsonl should not contain duplicate content. For each pagebreak
     section that has both Docling text and <!-- vision-enriched --> content:
-      - Keep ONLY the vision-enriched part (it's more complete/formatted)
-      - Discard the Docling text portion of that section
+      - If Vision content >= 70% of Docling length → keep only Vision
+        (it's the more complete/formatted version)
+      - If Vision content < 70% → keep BOTH (Vision missed something,
+        don't discard Docling's content)
 
     Sections WITHOUT vision-enriched stay untouched.
     Does NOT modify the source markdown file — only affects chunking input.
@@ -983,21 +985,37 @@ def _dedup_vision_for_chunking(markdown: str) -> str:
     deduped_sections = []
     for section in sections:
         if "<!-- vision-enriched -->" in section:
-            # Split at the vision marker — keep only the vision part
             parts = section.split("<!-- vision-enriched -->", 1)
-            # Preserve any frontmatter (first section may have ---...---)
             pre_vision = parts[0].strip()
             vision_content = parts[1].strip()
 
-            # Keep frontmatter block if present (starts with ---)
+            # Strip frontmatter from length calculation
+            docling_text = pre_vision
             if pre_vision.startswith("---\n") and "\n---" in pre_vision[4:]:
                 frontmatter_end = pre_vision.index("\n---", 4) + 4
                 frontmatter = pre_vision[:frontmatter_end]
-                deduped_sections.append(frontmatter + "\n\n" + vision_content)
+                docling_text = pre_vision[frontmatter_end:].strip()
             else:
-                deduped_sections.append(vision_content)
+                frontmatter = None
+
+            # Safety check: only dedup if Vision captured enough content
+            docling_len = len(docling_text)
+            vision_len = len(vision_content)
+            vision_sufficient = (
+                docling_len == 0
+                or vision_len >= docling_len * 0.7
+            )
+
+            if vision_sufficient:
+                # Vision is complete — use only Vision for chunking
+                if frontmatter:
+                    deduped_sections.append(frontmatter + "\n\n" + vision_content)
+                else:
+                    deduped_sections.append(vision_content)
+            else:
+                # Vision missed content — keep both to avoid info loss
+                deduped_sections.append(section)
         else:
-            # No vision — keep as-is
             deduped_sections.append(section)
 
     return pagebreak.join(deduped_sections)
