@@ -273,6 +273,20 @@ def inspect_cmd(
 
 
 # ---------------------------------------------------------------------------
+# Doctor subcommand
+# ---------------------------------------------------------------------------
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Check environment: packages, external tools, API keys."""
+    from .doctor import run_doctor, print_doctor
+
+    config = load_config()
+    results = run_doctor(config)
+    print_doctor(results)
+
+
+# ---------------------------------------------------------------------------
 # Refine subcommand
 # ---------------------------------------------------------------------------
 

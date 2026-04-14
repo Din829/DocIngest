@@ -10,12 +10,31 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 
 dependencies = [
+    # Core: document parsing
     "docling>=2.70",          # Document parsing (PDF/PPT/Excel/HTML/images)
+
+    # Core: AI/LLM
     "litellm>=1.80",          # Multi-provider LLM API (Vision, chunking assist)
+
+    # Core: CLI & config
     "typer>=0.12",            # CLI framework
     "pyyaml>=6.0",            # YAML config loading
-    "diskcache>=5.6",         # AI call result caching
     "rich>=13.0",             # Terminal output formatting
+    "python-dotenv>=1.0",     # .env file loading for API keys
+
+    # Core: caching & data
+    "diskcache>=5.6",         # AI call result caching
+    "openpyxl>=3.1",          # Excel reading (inspect + chunker)
+    "pillow>=10.0",           # Image processing (page screenshots)
+
+    # Hooks: format-specific enrichment
+    "python-pptx>=1.0",       # PPTX chart data direct-read
+    "beautifulsoup4>=4.12",   # DOCX OMML → LaTeX preprocessing
+    "defusedxml>=0.7",        # XML safety (OMML, EPUB)
+
+    # PDF fallback & inspection
+    "pymupdf>=1.24",          # Garbled text recovery + PDF page count (inspect)
+    "requests>=2.31",         # URL resolution (yt-dlp info download)
 ]
 
 [project.optional-dependencies]
@@ -32,10 +51,14 @@ nlp = [
 mcp = [
     "fastmcp>=2.0",           # MCP server framework
 ]
+audio = [
+    "dashscope",              # Qwen3-ASR (default audio transcription engine)
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+# Install everything: pip install -e ".[nlp,mcp,audio,ocr]"
 
 [project.scripts]
 docingest = "docingest.cli:app"

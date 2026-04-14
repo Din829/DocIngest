@@ -1,67 +1,35 @@
-# DocIngest - Pinned dependencies
-# Generated from working environment 2026-04-09
+# DocIngest dependencies
 #
-# Why pin versions: Docling's ML pipeline (transformers → torch → numpy)
-# is sensitive to binary compatibility. A numpy major version mismatch
-# (e.g. packages compiled with numpy 1.x running under numpy 2.x)
-# causes "dtype size changed" crashes at import time.
+# Preferred install method (uses pyproject.toml as single source of truth):
+#   pip install -e .              # Core dependencies
+#   pip install -e ".[nlp]"       # + Japanese keyword extraction (SudachiPy)
+#   pip install -e ".[mcp]"       # + MCP Server (FastMCP)
+#   pip install -e ".[audio]"     # + Audio transcription (DashScope Qwen3-ASR)
+#   pip install -e ".[nlp,mcp,audio]"  # All optional
 #
-# Install: pip install -r requirements.txt
+# This file is for environments that require requirements.txt (e.g. Docker).
+# It mirrors pyproject.toml — if you update deps, update pyproject.toml first.
 
-# === Core: document parsing engine ===
-docling>=2.32,<3
-docling-core>=2.31,<3
-docling-ibm-models>=3.4,<4
-docling-parse>=4.0,<5
+# === Core ===
+docling>=2.70
+litellm>=1.80
+typer>=0.12
+pyyaml>=6.0
+rich>=13.0
+python-dotenv>=1.0
+diskcache>=5.6
+openpyxl>=3.1
+pillow>=10.0
+python-pptx>=1.0
+beautifulsoup4>=4.12
+defusedxml>=0.7
+pymupdf>=1.24
+requests>=2.31
 
-# === Core: AI/LLM ===
-litellm>=1.80,<2
-
-# === Core: CLI & config ===
-typer>=0.12,<1
-pyyaml>=6.0,<7
-rich>=13.0,<15
-
-# === Core: caching ===
-diskcache>=5.6,<6
-
-# === Scientific stack (MUST be compatible with each other) ===
-# If you upgrade numpy, upgrade ALL of these together.
-numpy>=2.2,<3
-pandas>=2.3,<3
-scikit-learn>=1.7,<2
-scikit-image>=0.25,<1
-numexpr>=2.14
-bottleneck>=1.6
-
-# === ML / Vision pipeline ===
-transformers>=4.50,<5
-torch>=2.5,<3
-easyocr>=1.7,<2
-pillow>=10.0,<12
-openpyxl>=3.1,<4
-
-# === Document enrichment hooks ===
-# These are required by the hook system (hooks/) for PPTX chart extraction,
-# DOCX OMML→LaTeX, and XML safety. They may already be pulled in by
-# docling or other transitive deps, but we pin them here so a clean
-# `pip install -r requirements.txt` reliably brings them in.
-python-pptx>=1.0,<2      # PPTX chart data direct-read (hook #1)
-beautifulsoup4>=4.12,<5   # DOCX OMML→LaTeX preprocessing (hook #2)
-defusedxml>=0.7,<1        # XML safety for OMML and EPUB parsing
-
-# === Pydantic (Docling dependency) ===
-pydantic>=2.11,<3
-click>=8.1,<8.2
-
-# === Optional: PDF fallback ===
-# pymupdf>=1.24           # Uncomment if you need garbled-text recovery
-# pdf2image>=1.17         # Uncomment if you need PPT→PDF→image pipeline
-
-# === Optional: enhanced capabilities ===
-# magika>=1.0             # Content-based file type detection (ML, ~25MB model)
-                          # Enables format correction for weak/missing extensions
-                          # Install: pip install magika
-# pyexiftool>=0.5         # EXIF/XMP metadata extraction (requires exiftool on PATH)
-                          # Enables author/date/GPS in frontmatter
-                          # Install: pip install pyexiftool
+# === Optional (uncomment as needed) ===
+# sudachipy>=0.6            # Japanese keyword extraction
+# sudachidict_core>=20240409
+# fastmcp>=2.0              # MCP Server
+# dashscope                 # Audio transcription (Qwen3-ASR)
+# magika>=1.0               # Content-based file type detection
+# yt-dlp                    # YouTube/Bilibili URL support
