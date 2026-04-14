@@ -459,7 +459,7 @@ incremental:
 refine:
   output_dir: "readable"          # output subdirectory inside knowledge/
   model: "chunking_assist"        # reuse models.chunking_assist config
-  max_input_tokens: 8000          # skip files larger than this (with warning)
+  max_input_tokens: 50000         # skip files larger than this (with warning)
   max_output_tokens: 8000         # LLM response cap
   default_skill: "refine_default" # SKILL file name (without .SKILL.md)
   skills_dir: "skills"            # directory containing .SKILL.md files
