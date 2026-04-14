@@ -153,9 +153,11 @@ def refine_single(
         result["warning"] = "LLM returned empty response"
         return result
 
-    # Write output
+    # Write output — subdirectory per skill to avoid overwrite
     readable_dir_name = get_nested(config, "refine.output_dir", "readable")
-    readable_dir = output_dir / readable_dir_name
+    # Strip "refine_" prefix for cleaner directory names
+    skill_short = skill_name.removeprefix("refine_") if skill_name else "default"
+    readable_dir = output_dir / readable_dir_name / skill_short
     readable_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = readable_dir / source_path.name
@@ -165,7 +167,7 @@ def refine_single(
     result["tokens_out"] = BaseChunker.estimate_tokens(refined)
 
     logger.info(
-        f"Refined: {source_path.name} → {readable_dir_name}/{source_path.name} "
+        f"Refined: {source_path.name} → {readable_dir_name}/{skill_short}/{source_path.name} "
         f"(tokens: {tokens_in:,} → {result['tokens_out']:,})"
     )
 
