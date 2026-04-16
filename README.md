@@ -225,11 +225,11 @@ export DOCINGEST__parsing__audio__language=ja
 - **Per-page Vision AI** — AI decides per page: clean up text / describe charts / OCR scan. Parallel execution, cached by content hash.
 - **PPTX chart direct-read** — python-pptx extracts chart data (categories, series, values) as 100% accurate Markdown tables. Vision supplements with visual context.
 - **DOCX math equations** — OMML → LaTeX preprocessing before Docling parses. `$E=mc^{2}$` instead of garbled text.
-- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks (tables, code, lists). Docling+Vision dedup before chunking (prevents duplicate chunks).
+- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists). Small heading sections auto-merged to prevent fragments. Docling+Vision unified dedup applied to both sources and chunks.
 - **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction.
 - **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
-- **Vision triage** — optional per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss (`parsing.vision.triage.enabled`).
+- **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Includes garbled text detection (CJK mismap, mixed-script anomaly, HTML entity artifacts) to ensure damaged pages still get Vision enrichment. Default ON (`parsing.vision.triage.enabled`).
 - **Bounding boxes** — per-element PDF coordinates extracted from Docling for RAG source citation and highlighting.
 - **Hidden text detection** — flags invisible/background content via Docling ContentLayer analysis.
 - **Sensitive data sanitization** — opt-in PII masking (email, URL, credit card with Luhn validation, IPv4, JP phone). High-precision rules only, no name detection. Default OFF (`sanitize.enabled`).

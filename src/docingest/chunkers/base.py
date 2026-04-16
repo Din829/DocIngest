@@ -151,7 +151,20 @@ class BaseChunker(ABC):
         self._protect_code = protection.get("code_blocks", True)
         self._protect_lists = protection.get("lists", True)
         self._protect_quotes = protection.get("quotes", True)
-        self._allowed_overflow = protection.get("allowed_overflow", 2.0)
+
+        # allowed_overflow: supports both single number (legacy) and per-type dict.
+        overflow_raw = protection.get("allowed_overflow", 2.0)
+        if isinstance(overflow_raw, dict):
+            self._overflow_map = overflow_raw
+        else:
+            # Single number → uniform for all types
+            self._overflow_map = {"default": float(overflow_raw)}
+
+    def _get_overflow(self, block_type: str = "default") -> float:
+        """Get allowed overflow multiplier for a protected block type."""
+        return float(self._overflow_map.get(
+            block_type, self._overflow_map.get("default", 2.0)
+        ))
 
     @abstractmethod
     def chunk(

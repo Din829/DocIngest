@@ -760,6 +760,7 @@ def _should_skip_vision(
       4. No garbled text (Docling didn't fail on this page)
       5. Low replacement character ratio (no CID font issues)
       6. No complex tables (simple tables are fine, complex ones need Vision)
+      7. No mixed-script anomaly (CJK mismap garbling from OCR)
     """
     text = page_data.text
     stripped = text.strip()
@@ -778,7 +779,13 @@ def _should_skip_vision(
         return False
 
     # Garbled text → Docling failed, Vision can re-OCR
+    # glyph< = CID font mapping failure
+    # &lt; / &gt; in running text = HTML entity artifacts from OCR garbling
+    #   (e.g. 確&lt; from a garbled 確認). Legitimate HTML entities appear
+    #   inside code blocks or tags, not in running Japanese/Chinese text.
     if "glyph<" in text or "glyph&lt;" in text:
+        return False
+    if "&lt;" in stripped or "&gt;" in stripped:
         return False
 
     # High U+FFFD ratio → CID font extraction failure
@@ -795,8 +802,44 @@ def _should_skip_vision(
     if table_lines >= table_threshold:
         return False
 
+    # Mixed-script anomaly → CJK mismap garbling (e.g. する→寸, 査→查)
+    # Detects short ASCII fragments (1-3 chars) sandwiched between CJK chars,
+    # which is characteristic of OCR engines misreading embedded text images.
+    # Normal text (e.g. "PwC" in Japanese docs) has whitespace/punctuation
+    # around ASCII, not direct CJK adjacency.
+    if _has_mixed_script_anomaly(stripped, triage_cfg):
+        return False
+
     # All checks passed → pure text page, safe to skip
     return True
+
+
+# Pre-compiled pattern for mixed-script detection (module-level, compiled once)
+_MIXED_SCRIPT_RE = re.compile(
+    r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]"   # CJK / Hiragana / Katakana
+    r"[A-Za-z]{1,3}"                                 # short ASCII fragment
+    r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]"     # CJK / Hiragana / Katakana
+)
+
+
+def _has_mixed_script_anomaly(text: str, triage_cfg: dict[str, Any]) -> bool:
+    """
+    Detect CJK mismap garbling by counting mixed-script fragments.
+
+    When Docling's OCR engine misreads embedded text images in CJK documents,
+    it produces characteristic patterns: short ASCII fragments directly adjacent
+    to CJK characters (e.g. 問PW問, 儿PwC速, 活用I二寸).
+
+    Uses absolute fragment count rather than ratio — even one page with garbled
+    OCR typically produces 3+ fragments, while normal CJK text with inline
+    brand names (PwC, JICPA) uses spacing/punctuation around ASCII, producing
+    0-2 matches at most.
+    """
+    if not text:
+        return False
+    max_fragments = int(triage_cfg.get("max_mixed_script_fragments", 3))
+    fragment_count = len(_MIXED_SCRIPT_RE.findall(text))
+    return fragment_count > max_fragments
 
 
 def _enrich_with_vision(
@@ -961,24 +1004,33 @@ def _enrich_with_vision(
 
 
 # ---------------------------------------------------------------------------
-# Pre-chunking: deduplicate Docling + Vision overlap
+# Docling + Vision deduplication
 # ---------------------------------------------------------------------------
 
-def _dedup_vision_for_chunking(markdown: str) -> str:
+def _dedup_vision(markdown: str, config: dict[str, Any]) -> str:
     """
-    Remove Docling-Vision content overlap BEFORE chunking.
+    Remove Docling-Vision content overlap in a markdown string.
 
-    sources/*.md keeps both versions (for grep/Agentic Search), but
-    chunks.jsonl should not contain duplicate content. For each pagebreak
-    section that has both Docling text and <!-- vision-enriched --> content:
-      - If Vision content >= 70% of Docling length → keep only Vision
-        (it's the more complete/formatted version)
-      - If Vision content < 70% → keep BOTH (Vision missed something,
-        don't discard Docling's content)
+    Applied to BOTH sources/*.md and chunking input (unified logic).
+    Vision receives Docling text as prompt context, so its output is
+    typically a superset of Docling's content. Keeping both creates
+    redundancy that hurts grep (Agentic Search) and inflates tokens.
+
+    For each pagebreak section with both Docling text and
+    <!-- vision-enriched --> content:
+      - Vision content >= threshold × Docling length → keep only Vision
+      - Vision content < threshold → keep BOTH (Vision may have missed content)
 
     Sections WITHOUT vision-enriched stay untouched.
-    Does NOT modify the source markdown file — only affects chunking input.
+    Controlled by output.dedup.enabled and output.dedup.vision_ratio_threshold.
     """
+    if not get_nested(config, "output.dedup.enabled", True):
+        return markdown
+
+    threshold = float(get_nested(
+        config, "output.dedup.vision_ratio_threshold", 0.7
+    ))
+
     pagebreak = PAGEBREAK_MARKER
     sections = markdown.split(pagebreak)
 
@@ -1003,11 +1055,11 @@ def _dedup_vision_for_chunking(markdown: str) -> str:
             vision_len = len(vision_content)
             vision_sufficient = (
                 docling_len == 0
-                or vision_len >= docling_len * 0.7
+                or vision_len >= docling_len * threshold
             )
 
             if vision_sufficient:
-                # Vision is complete — use only Vision for chunking
+                # Vision is complete — keep only Vision version
                 if frontmatter:
                     deduped_sections.append(frontmatter + "\n\n" + vision_content)
                 else:
@@ -1096,22 +1148,33 @@ def _postprocess_chunks(
     for chunk in chunks:
         chunk.text = _clean_image_noise(chunk.text)
 
-    # Step 2: Merge fragments into adjacent chunks (respecting section boundaries)
-    merged: list = []
+    # Step 2: Merge fragments into adjacent chunks (bidirectional)
+    # First pass: try merging backward (fragment → previous chunk, same section)
+    after_backward: list = []
     for chunk in chunks:
-        if _is_fragment(chunk, min_tokens) and merged:
-            # Only merge if same section (sheet_name, title_path, or slide_index)
-            if _same_section(merged[-1], chunk):
-                merged[-1].text = merged[-1].text + "\n\n" + chunk.text
-            else:
-                merged.append(chunk)
-        else:
-            merged.append(chunk)
+        if _is_fragment(chunk, min_tokens) and after_backward:
+            if _same_section(after_backward[-1], chunk):
+                after_backward[-1].text = after_backward[-1].text + "\n\n" + chunk.text
+                continue
+        after_backward.append(chunk)
 
-    # If the first chunk is a fragment and there's a next one in same section, merge forward
-    if len(merged) > 1 and _is_fragment(merged[0], min_tokens) and _same_section(merged[0], merged[1]):
-        merged[1].text = merged[0].text + "\n\n" + merged[1].text
-        merged.pop(0)
+    # Second pass: merge remaining fragments forward (fragment → next chunk)
+    # This catches fragments whose previous chunk is a different section
+    # but whose next chunk is the same section (e.g. heading-only chunk
+    # that starts a new section, followed by the section's content).
+    merged: list = []
+    i = 0
+    while i < len(after_backward):
+        chunk = after_backward[i]
+        if _is_fragment(chunk, min_tokens) and i + 1 < len(after_backward):
+            next_chunk = after_backward[i + 1]
+            if _same_section(chunk, next_chunk):
+                next_chunk.text = chunk.text + "\n\n" + next_chunk.text
+                # Skip this fragment — its content is now in next_chunk
+                i += 1
+                continue
+        merged.append(chunk)
+        i += 1
 
     # Re-index + infer content tags from text
     for i, chunk in enumerate(merged):
@@ -1226,6 +1289,12 @@ def process_single_file(
     # Vision results are already settled before frontmatter is built.
     run_post_parse_hooks(file_path, parse_result, config, phase="pre_write")
 
+    # --- Phase 1.7: Docling + Vision dedup ---
+    # When Vision enrichment produced a version of each page, deduplicate
+    # so sources/*.md and chunks.jsonl both get clean, non-redundant content.
+    # Controlled by output.dedup.enabled (default: true).
+    parse_result.markdown = _dedup_vision(parse_result.markdown, config)
+
     # --- Phase 2: Write Markdown + assets ---
     output_path = write_markdown(
         parse_result=parse_result,
@@ -1276,9 +1345,9 @@ def process_single_file(
         except Exception:
             pass
 
-        # Pre-chunking: deduplicate Docling + Vision overlap so chunks
-        # don't contain the same content twice. source .md is untouched.
-        chunk_markdown = _dedup_vision_for_chunking(parse_result.markdown)
+        # Dedup already applied in Phase 1.7 (before write_markdown).
+        # parse_result.markdown is already deduplicated — use directly.
+        chunk_markdown = parse_result.markdown
 
         try:
             chunks = chunker.chunk(chunk_markdown, doc_metadata)

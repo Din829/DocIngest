@@ -48,9 +48,11 @@ class RecursiveChunker(BaseChunker):
         Split lines into segments, separating protected blocks from normal text.
 
         Each segment is either:
-          {"type": "protected", "text": "...", "lines": (start, end)}
+          {"type": "protected", "block_type": "table|list|...", "text": "...", "lines": (start, end)}
           {"type": "normal", "text": "..."}
         """
+        from .base import _TABLE_ROW_RE, _CODE_FENCE_RE, _LIST_ITEM_RE, _QUOTE_RE
+
         segments: list[dict] = []
         i = 0
         n = len(lines)
@@ -62,8 +64,21 @@ class RecursiveChunker(BaseChunker):
             if span is not None:
                 start, end = span
                 block_text = "\n".join(lines[start:end + 1])
+                # Detect block type from first line
+                first_line = lines[start]
+                if _CODE_FENCE_RE.match(first_line):
+                    block_type = "code_block"
+                elif _TABLE_ROW_RE.match(first_line):
+                    block_type = "table"
+                elif _LIST_ITEM_RE.match(first_line):
+                    block_type = "list"
+                elif _QUOTE_RE.match(first_line):
+                    block_type = "quote"
+                else:
+                    block_type = "default"
                 segments.append({
                     "type": "protected",
+                    "block_type": block_type,
                     "text": block_text,
                     "lines": (start, end),
                 })
@@ -130,17 +145,25 @@ class RecursiveChunker(BaseChunker):
         return "\n\n".join(tail_parts) if tail_parts else ""
 
     def _split_segments(self, segments: list[dict]) -> list[str]:
-        """Split segments into raw chunk texts (no overlap yet)."""
+        """Split segments into raw chunk texts (no overlap yet).
+
+        Respects min_tokens: avoids flushing tiny chunks by allowing
+        the accumulator to moderately exceed max_tokens (up to 1.5×)
+        rather than emitting a fragment below min_tokens.
+        """
         chunks: list[str] = []
         current_parts: list[str] = []
         current_tokens = 0
+        # Hard ceiling to prevent runaway accumulation when enforcing min_tokens
+        merge_ceiling = int(self._max_tokens * 1.5)
 
         for seg in segments:
             seg_tokens = self.estimate_tokens(seg["text"])
 
             if seg["type"] == "protected":
-                # Protected block: keep intact
-                max_allowed = int(self._max_tokens * self._allowed_overflow)
+                # Protected block: keep intact, use per-type overflow limit
+                block_type = seg.get("block_type", "default")
+                max_allowed = int(self._max_tokens * self._get_overflow(block_type))
 
                 if seg_tokens <= max_allowed:
                     # Fits within overflow limit — try to append to current chunk
@@ -176,8 +199,12 @@ class RecursiveChunker(BaseChunker):
                         current_tokens += para_tokens
                         continue
 
-                    # Paragraph doesn't fit — flush current chunk
-                    if current_parts:
+                    # Paragraph doesn't fit — but don't flush if current chunk
+                    # is too small (below min_tokens) and we haven't hit the ceiling
+                    if current_parts and (
+                        current_tokens >= self._min_tokens
+                        or current_tokens + para_tokens > merge_ceiling
+                    ):
                         chunks.append("\n\n".join(current_parts))
                         current_parts = []
                         current_tokens = 0
@@ -185,7 +212,7 @@ class RecursiveChunker(BaseChunker):
                     # Paragraph itself within limit
                     if para_tokens <= self._max_tokens:
                         current_parts.append(para)
-                        current_tokens = para_tokens
+                        current_tokens += para_tokens
                         continue
 
                     # Paragraph exceeds limit — split by sentences
@@ -196,10 +223,15 @@ class RecursiveChunker(BaseChunker):
                             current_parts.append(sc)
                             current_tokens += sc_tokens
                         else:
-                            if current_parts:
+                            if current_parts and (
+                                current_tokens >= self._min_tokens
+                                or current_tokens + sc_tokens > merge_ceiling
+                            ):
                                 chunks.append("\n\n".join(current_parts))
-                            current_parts = [sc]
-                            current_tokens = sc_tokens
+                                current_parts = []
+                                current_tokens = 0
+                            current_parts.append(sc)
+                            current_tokens += sc_tokens
 
         # Flush remaining
         if current_parts:

@@ -95,26 +95,84 @@ class HeadingChunker(BaseChunker):
 
         sections = merged_sections
 
-        # Process each section
+        # Process each section, with optional small-section merging.
+        # When merge_small_sections is enabled, adjacent sections that are
+        # individually below min_tokens get accumulated into a single chunk.
+        # This prevents tiny heading-only or short-paragraph chunks while
+        # preserving all title_path metadata.
         all_chunks: list[Chunk] = []
+        merge_enabled = self._chunking.get("heading", {}).get(
+            "merge_small_sections", True
+        )
+
+        # Accumulator for small section merging
+        accum_text = ""
+        accum_titles: list[str] = []
+        accum_tokens = 0
+
+        def _flush_accum():
+            nonlocal accum_text, accum_titles, accum_tokens
+            if accum_text.strip():
+                all_chunks.append(Chunk(text=accum_text.strip(), metadata={
+                    **metadata,
+                    "title_path": " | ".join(accum_titles),
+                }))
+            accum_text = ""
+            accum_titles = []
+            accum_tokens = 0
 
         for section in sections:
             section_text = section["text"]
             section_tokens = self.estimate_tokens(section_text)
 
-            if section_tokens <= self._max_tokens:
-                # Section fits → single chunk
-                all_chunks.append(Chunk(text=section_text, metadata={
-                    **metadata,
-                    "title_path": section["title_path"],
-                }))
-            else:
-                # Section too large → subdivide with recursive
+            if section_tokens > self._max_tokens:
+                # Large section → flush accumulator first, then subdivide
+                _flush_accum()
                 sub_chunks = self._recursive.chunk(section_text, {
                     **metadata,
                     "title_path": section["title_path"],
                 })
                 all_chunks.extend(sub_chunks)
+            elif merge_enabled and section_tokens < self._min_tokens:
+                # Small section → accumulate, don't emit yet
+                if accum_tokens + section_tokens > self._max_tokens:
+                    # Accumulated too much — flush before adding
+                    _flush_accum()
+                accum_text = (accum_text + "\n\n" + section_text).strip()
+                accum_titles.append(section["title_path"])
+                accum_tokens += section_tokens
+            else:
+                # Normal-sized section → flush accumulator, then emit
+                # If accumulator has content, merge it with this section
+                # (attaches orphan small sections to the next normal one)
+                if accum_text:
+                    section_text = accum_text + "\n\n" + section_text
+                    combined_titles = accum_titles + [section["title_path"]]
+                    combined_tokens = accum_tokens + section_tokens
+                    accum_text = ""
+                    accum_titles = []
+                    accum_tokens = 0
+
+                    if combined_tokens > self._max_tokens:
+                        # Merged content is too large → subdivide
+                        sub_chunks = self._recursive.chunk(section_text, {
+                            **metadata,
+                            "title_path": " | ".join(combined_titles),
+                        })
+                        all_chunks.extend(sub_chunks)
+                    else:
+                        all_chunks.append(Chunk(text=section_text, metadata={
+                            **metadata,
+                            "title_path": " | ".join(combined_titles),
+                        }))
+                else:
+                    all_chunks.append(Chunk(text=section_text, metadata={
+                        **metadata,
+                        "title_path": section["title_path"],
+                    }))
+
+        # Flush any remaining accumulator
+        _flush_accum()
 
         # Renumber chunk indices
         for i, c in enumerate(all_chunks):

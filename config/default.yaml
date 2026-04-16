@@ -76,11 +76,15 @@ parsing:
                               # Gemini charges per-image regardless of DPI,
                               # OpenAI/Claude charge by tile/pixel count.
     triage:
-      enabled: false            # false = all pages sent to Vision (safe default)
-                                # true  = skip pages that are purely text (saves API cost)
+      enabled: true             # true = skip pages that are purely text (saves API cost)
+                                # false = all pages sent to Vision (maximum quality, higher cost)
       min_text_length: 50       # Pages with less text than this → always send to Vision
       max_replacement_ratio: 0.05  # U+FFFD ratio above this → always send to Vision
       table_line_threshold: 10  # Markdown table rows above this → always send to Vision
+      max_mixed_script_fragments: 3  # Mixed-script anomaly count above this → send to Vision
+                                    # Detects CJK mismap garbling (e.g. する→寸, 査→查)
+                                    # Short ASCII fragments (1-3 chars) sandwiched between CJK
+                                    # Normal CJK docs rarely exceed 1-2 (e.g. "の PwC の" has spaces)
 
   # PDF-specific
   pdf:
@@ -255,6 +259,16 @@ output:
   index_file: "index.json"
   include_bounding_boxes: true  # Extract per-element coordinates from Docling
 
+  # Docling+Vision dedup: when Vision enrichment produces a version of a page,
+  # decide whether to keep both or only the better version in sources/*.md.
+  # Vision receives Docling text as input, so its output is typically a
+  # superset — keeping only Vision avoids duplication without info loss.
+  dedup:
+    enabled: true               # true = deduplicate (recommended)
+                                # false = keep both Docling + Vision (legacy behavior)
+    vision_ratio_threshold: 0.7 # Vision content >= this × Docling length → keep only Vision
+                                # Below threshold → keep both (Vision may have missed content)
+
   markdown:
     include_metadata_header: true  # YAML frontmatter in each file
     image_refs: "relative"         # relative | absolute | inline_base64
@@ -293,6 +307,8 @@ chunking:
   heading:
     levels: [1, 2, 3]
     fallback: "recursive"
+    merge_small_sections: true  # Merge adjacent sections below min_tokens into one chunk
+                                # false = every heading boundary is a hard chunk boundary (legacy)
 
   auto:
     min_headings: 3
@@ -322,7 +338,15 @@ chunking:
     code_blocks: true         # don't split ``` blocks
     lists: true               # keep lists together when possible
     quotes: true              # keep > blocks together
-    allowed_overflow: 2.0     # protected blocks may exceed max_tokens × 2.0
+    # How much protected blocks may exceed max_tokens.
+    # Single number = uniform for all types (legacy).
+    # Dict = per-type control (table, list, code_block, quote, default).
+    allowed_overflow:
+      table: 2.0              # tables are hard to split — allow more
+      code_block: 3.0         # code blocks should stay intact
+      list: 1.5               # lists can be split at item boundaries if too large
+      quote: 1.5
+      default: 1.5            # fallback for any unspecified type
 
   ai_assist:
     enabled: true
