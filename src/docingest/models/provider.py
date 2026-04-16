@@ -20,9 +20,22 @@ from typing import Any
 
 import litellm
 
+from .token_tracker import token_tracker
+
 
 # Suppress litellm's verbose logging by default
 litellm.suppress_debug_info = True
+
+
+def _record_usage(response, model_name: str) -> None:
+    """Extract usage from litellm response and record to tracker."""
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        token_tracker.record(
+            model=model_name,
+            prompt=getattr(usage, "prompt_tokens", 0) or 0,
+            completion=getattr(usage, "completion_tokens", 0) or 0,
+        )
 
 
 def _resolve_model_name(provider: str, model: str) -> str:
@@ -125,6 +138,7 @@ def describe_image(
                 messages=messages,
                 max_tokens=max_tokens,
             )
+            _record_usage(response, model_name)
             content = response.choices[0].message.content
             return content.strip() if content else ""
         except Exception as e:
@@ -184,6 +198,7 @@ def text_completion(
                 messages=messages,
                 max_tokens=max_tokens,
             )
+            _record_usage(response, model_name)
             content = response.choices[0].message.content
             return content.strip() if content else ""
         except Exception as e:

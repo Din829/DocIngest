@@ -21,6 +21,8 @@ try:
 except ImportError:
     _HAS_DISKCACHE = False
 
+from .token_tracker import token_tracker
+
 
 def _make_key(model_name: str, content_hash: str, extra: str = "") -> str:
     """Build a deterministic cache key."""
@@ -94,10 +96,12 @@ class AICache:
         if self._disk is not None:
             cached = self._disk.get(key)
             if cached is not None:
+                token_tracker.record_cache_hit(model_name)
                 return cached
 
         # Check memory cache
         if key in self._memory:
+            token_tracker.record_cache_hit(model_name)
             return self._memory[key]
 
         # Cache miss → call function

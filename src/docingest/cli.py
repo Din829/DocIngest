@@ -199,6 +199,22 @@ def _print_results(result) -> None:
         for err in result.errors:
             console.print(f"  [red]✗[/red] {err['file']}: {err['error']}")
 
+    # LLM API token usage summary
+    usage = getattr(result, "token_usage", None) or {}
+    if usage.get("total_tokens", 0) > 0 or usage.get("total_cache_hits", 0) > 0:
+        total = usage.get("total_tokens", 0)
+        prompt = usage.get("total_prompt_tokens", 0)
+        completion = usage.get("total_completion_tokens", 0)
+        calls = usage.get("total_calls", 0)
+        hits = usage.get("total_cache_hits", 0)
+        console.print(
+            f"\n[bold]LLM usage:[/bold] "
+            f"{total:,} tokens "
+            f"([dim]{prompt:,} in + {completion:,} out[/dim])"
+            f" — {calls} API call{'s' if calls != 1 else ''}"
+            + (f", {hits} cache hit{'s' if hits != 1 else ''}" if hits else "")
+        )
+
     console.print()
 
 

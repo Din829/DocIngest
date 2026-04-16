@@ -80,6 +80,10 @@ class PipelineResult:
     # Keys: total_files, files_with_issues, total_questions, total_unreadable,
     #       quality_score, files (only files with issues).
     quality: dict[str, Any] = field(default_factory=dict)
+    # LLM API token usage summary (populated at pipeline end).
+    # Keys: total_prompt_tokens, total_completion_tokens, total_tokens,
+    #       total_calls, total_cache_hits, by_model.
+    token_usage: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1721,4 +1725,10 @@ def run_pipeline(
             _pipeline_logger.warning(f"Quality report generation failed: {e}")
 
     pipeline_result.elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+    # Collect LLM API token usage
+    from .models.token_tracker import token_tracker
+    pipeline_result.token_usage = token_tracker.summary()
+    token_tracker.reset()
+
     return pipeline_result
