@@ -7,6 +7,12 @@
 # =============================================================================
 models:
   vision:
+    # Output token cap per Vision call. Set explicitly because litellm injects
+    # max_tokens=4096 by default for both Gemini and Claude when omitted
+    # (https://github.com/BerriAI/litellm/issues/8835), which would silently
+    # truncate dense pages. 32768 covers any realistic single-page output and
+    # is supported by all current Gemini/Claude/OpenAI Vision models.
+    max_response_tokens: 32768
     primary:
       provider: "google"
       model: "gemini-3-flash-preview"
@@ -94,6 +100,15 @@ parsing:
     hidden_text_detection:
       enabled: true           # Detect hidden/invisible elements via Docling ContentLayer
 
+    # Optional per-format Vision override. Any field listed here overrides the
+    # global models.vision.* / parsing.vision.* setting for THIS format only.
+    # Supported keys: model, max_response_tokens, image_dpi.
+    # Unset fields fall through to the global config.
+    vision:
+      # max_response_tokens: 32768
+      # image_dpi: 200
+      # model: { provider: "google", model: "gemini-3-pro-preview" }
+
   # PPT-specific
   # Docling extracts text from PPT but image generation depends on the backend
   # pipeline. When page images are missing, render via LibreOffice → PDF →
@@ -114,6 +129,12 @@ parsing:
     # to the existing Vision-only path.
     extract_chart_data: true
 
+    # Optional per-format Vision override. See parsing.pdf.vision for usage.
+    vision:
+      # max_response_tokens: 8192     # PPT 文字大、内容稀，可省 tokens
+      # image_dpi: 150                # 截图低分辨率即可
+      # model: { provider: ..., model: ... }
+
   # Word-specific
   # Docling extracts text + table structure from DOCX, but does NOT render page
   # images, so embedded diagrams, screenshots, and figures are lost. Rendering
@@ -133,6 +154,12 @@ parsing:
     # with zero equations incur zero cost (the hook returns None and the
     # original file is parsed directly).
     omml_to_latex: true
+
+    # Optional per-format Vision override. See parsing.pdf.vision for usage.
+    vision:
+      # max_response_tokens: 32768
+      # image_dpi: 200
+      # model: { provider: ..., model: ... }
 
   # ZIP archive expansion
   # Users often hand DocIngest a .zip full of mixed documents. When this
@@ -248,6 +275,12 @@ parsing:
       ensure_page_images: true    # LibreOffice → PDF → page screenshots when Docling has none
       max_page_images: 10         # cap page screenshots sent to Vision (excess → text-only, with warning)
       max_image_pixels: 4000000   # single image pixel cap (≈2000x2000). Larger images are scaled down.
+
+    # Optional per-format Vision override. See parsing.pdf.vision for usage.
+    vision:
+      # max_response_tokens: 32768
+      # image_dpi: 200
+      # model: { provider: ..., model: ... }
 
 # =============================================================================
 # Phase 2: Output Structure

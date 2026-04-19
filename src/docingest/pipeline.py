@@ -934,6 +934,8 @@ def _enrich_with_vision(
     described = 0
     failed = 0
 
+    doc_format = parse_result.metadata.get("format")
+
     def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
         try:
             # page_data.page_no is 1-based and matches the hook's
@@ -945,6 +947,7 @@ def _enrich_with_vision(
                 config=config,
                 cache=cache,
                 structured_data=struct_data,
+                doc_format=doc_format,
             )
         except Exception as e:
             logger.warning(f"Vision failed for page {page_data.page_no}: {e}")

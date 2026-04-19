@@ -73,7 +73,7 @@ def describe_image(
     image_path: Path | str,
     prompt: str = "Describe this image in detail. If it's a chart or graph, extract all data points and trends.",
     model_config: dict[str, Any] | None = None,
-    max_tokens: int = 4096,
+    max_tokens: int = 32768,
 ) -> str:
     """
     Send an image to a Vision model and get a text description.

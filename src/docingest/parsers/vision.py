@@ -166,11 +166,34 @@ Trust the structured data block — focus your effort on everything the block \
 cannot see."""
 
 
+def resolve_vision_config(
+    config: dict[str, Any],
+    doc_format: str | None,
+) -> dict[str, Any]:
+    """
+    Merge global models.vision with parsing.<format>.vision override.
+
+    Shallow merge for scalar fields (model, max_response_tokens, image_dpi).
+    Subtree fields like triage do NOT participate — adjust those globally.
+    Unset override fields fall through to the global config.
+    """
+    base = dict(get_nested(config, "models.vision", {}) or {})
+    if doc_format:
+        override = get_nested(
+            config, f"parsing.{doc_format.lower()}.vision", {}
+        ) or {}
+        for key in ("model", "max_response_tokens", "image_dpi"):
+            if key in override and override[key] is not None:
+                base[key] = override[key]
+    return base
+
+
 def describe_page(
     image_path: str | Path,
     page_text: str,
     model_config: dict[str, Any],
     structured_data: str | None = None,
+    max_tokens: int = 32768,
 ) -> str:
     """
     Send a page image + extracted text to Vision AI.
@@ -188,6 +211,8 @@ def describe_page(
             treat it as authoritative and focus on visual elements the
             block cannot capture. When None, the prompt renders "(none)"
             and Vision behaves as it did before this feature.
+        max_tokens: Output cap forwarded to litellm. Set explicitly to
+            bypass litellm's silent 4096 default for Gemini/Claude.
     """
     image_path = Path(image_path)
     if not image_path.exists():
@@ -198,7 +223,7 @@ def describe_page(
         structured_data=structured_data if structured_data and structured_data.strip() else "(none)",
     )
 
-    return describe_image(image_path, prompt, model_config)
+    return describe_image(image_path, prompt, model_config, max_tokens=max_tokens)
 
 
 def _structured_data_cache_tag(structured_data: str | None) -> str:
@@ -219,6 +244,7 @@ def describe_page_cached(
     config: dict[str, Any],
     cache: AICache | None = None,
     structured_data: str | None = None,
+    doc_format: str | None = None,
 ) -> str:
     """
     Per-page Vision with caching.
@@ -227,9 +253,13 @@ def describe_page_cached(
     structured_data changes (hook extracted new/different content), the
     tag changes → cache miss → Vision re-runs. When structured_data is
     None or unchanged, cache behaviour is identical to before.
+
+    doc_format (e.g. "pdf", "pptx") routes to parsing.<format>.vision
+    overrides via resolve_vision_config. None → global config only.
     """
     image_path = Path(image_path)
-    vision_model_config = get_nested(config, "models.vision", {})
+    vision_model_config = resolve_vision_config(config, doc_format)
+    max_tokens = int(vision_model_config.get("max_response_tokens", 32768))
 
     primary = vision_model_config.get("primary", {})
     model_name = f"{primary.get('provider', 'openai')}/{primary.get('model', 'gpt-4o-mini')}"
@@ -240,9 +270,13 @@ def describe_page_cached(
             model_name=model_name,
             content_hash=img_hash,
             call_fn=lambda: describe_page(
-                image_path, page_text, vision_model_config, structured_data
+                image_path, page_text, vision_model_config, structured_data,
+                max_tokens=max_tokens,
             ),
             extra_key=f"page_vision|{_structured_data_cache_tag(structured_data)}",
         )
     else:
-        return describe_page(image_path, page_text, vision_model_config, structured_data)
+        return describe_page(
+            image_path, page_text, vision_model_config, structured_data,
+            max_tokens=max_tokens,
+        )

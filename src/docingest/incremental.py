@@ -144,6 +144,11 @@ _RELEVANT_CONFIG_PATHS = [
     "models.vision.primary.model",
     "models.vision.fallback.provider",
     "models.vision.fallback.model",
+    "models.vision.max_response_tokens",   # output cap affects content
+    "parsing.pdf.vision",                  # per-format Vision overrides:
+    "parsing.pptx.vision",                 # entire subtree, since model/dpi/
+    "parsing.docx.vision",                 # max_tokens any change → re-run
+    "parsing.xlsx.vision",
     "output.markdown.include_metadata_header",
     "metadata.exiftool.enabled",           # hook #3: exiftool gating
     "metadata.exiftool.fields",            # hook #3: whitelist changes
