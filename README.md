@@ -172,6 +172,7 @@ chunking:
 
 models:
   vision:
+    max_response_tokens: 32768  # Output cap; set explicitly to bypass litellm's 4096 default
     primary: { provider: "google", model: "gemini-3-flash-preview" }
   audio_transcription:
     primary: { provider: "dashscope", model: "qwen3-asr-flash" }
@@ -185,6 +186,11 @@ parsing:
   pdf:
     hidden_text_detection:
       enabled: true             # Detect invisible/background content
+    vision:                     # Optional per-format Vision override (model / max_response_tokens / image_dpi).
+      image_dpi: 220            # Unset fields fall through to global models.vision.* / parsing.vision.*.
+  pptx:
+    vision:
+      max_response_tokens: 8192 # PPT pages are content-light — cap output to save cost.
   audio:
     prefer_subtitles: true
     language: "auto"
@@ -237,6 +243,7 @@ export DOCINGEST__parsing__audio__language=ja
 - **AI Refine** — standalone `refine` command for human-readable output with Mermaid flowcharts.
 - **Knowledge Map** — auto-generated search guide + keyword reverse index. Optional SudachiPy integration for high-precision Japanese keyword extraction (language-routed: Japanese → SudachiPy, Chinese/Korean/English → regex).
 - **Multi-provider** — Gemini / OpenAI / Anthropic / DashScope with automatic fallback.
+- **Per-format Vision overrides** — `parsing.<pdf|pptx|docx|xlsx>.vision` shallow-merges over the global Vision config to tune `model` / `max_response_tokens` / `image_dpi` per format. Raise DPI for dense PDFs, cap output for content-light PPTs, swap models for scans — without affecting other formats. Unset fields fall through to global.
 - **Cross-platform binary finder** — auto-discovers LibreOffice, ffmpeg, yt-dlp, exiftool on Windows/macOS/Linux standard paths.
 - **Config-driven** — all thresholds, strategies, models in YAML. No hardcoding.
 
