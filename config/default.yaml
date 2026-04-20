@@ -628,6 +628,12 @@ knowledge_map:
   enabled: true
   ai_summary: true              # true: AI generates summary + search guide (1 API call)
                                 # false: Stage 1 only (zero cost, structure + keywords only)
+  # Inject a short two-phase search-protocol block into knowledge_search.SKILL.md
+  # (RAG → Agentic Search, synonym expansion, "Grep miss ≠ not written" guard).
+  # Language follows the knowledge base's dominant language (ja / zh / en;
+  # others fall back to en). The wording is hard-coded — this switch only
+  # turns the block on/off. Turn off if you have your own Agent guidance.
+  search_protocol: true
   output_file: "knowledge_map.yaml"
   keywords:
     # --- SudachiPy backend (used when `pip install sudachipy sudachidict_core`) ---
@@ -650,6 +656,14 @@ knowledge_map:
       - "slide"                   # Docling internal group name
     max_per_file: 15              # Max keywords per file in knowledge_map
     max_index: 50                 # Max entries in keyword_index reverse map
+    # Discrimination filter (TF-IDF document-frequency cut-off): words that
+    # appear in more than this fraction of files are treated as stop words
+    # and dropped from keyword_index. Words in "too many files" have no
+    # cross-file signal regardless of language or domain ("場合" / "事項" in
+    # legal docs, "introduction" / "conclusion" in papers).
+    # 1.0 disables the filter; the filter is also skipped for very small
+    # corpora (< 3 files) where document frequency is not statistical.
+    max_doc_frequency_ratio: 0.7
 # =============================================================================
 # Sensitive Data Sanitization (PII masking)
 # =============================================================================

@@ -35,6 +35,69 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Search-protocol templates (inserted into SKILL.md)
+# ---------------------------------------------------------------------------
+# Short, tool-agnostic guidance to stabilise Agent behaviour when it consumes
+# this knowledge base. Intentionally prescriptive about the two-phase flow
+# (RAG for coordinates → Agentic for precision) and the "事実 ≠ 結論" rule,
+# because both recover accuracy that we've seen Agents lose when left to
+# their own search heuristics. Kept to ~6 lines per language so it costs
+# almost nothing in the Agent's context but still delivers the key rules.
+# Disable via knowledge_map.search_protocol = false.
+
+_SEARCH_PROTOCOL_TEMPLATES: dict[str, str] = {
+    "ja": (
+        "## 検索方針\n\n"
+        "**Phase 1 (RAG 利用時)**: `chunks.jsonl` で横断検索し、候補ファイル / "
+        "`title_path` / 位置を取得する。キーワードは同義語も必ず含める"
+        "（例: 耐震等級 → 耐震性能 / 住宅性能 / 性能評価）。\n\n"
+        "**Phase 2 (Agentic Search)**: Phase 1 の結果、または RAG が無い場合は直接、"
+        "`sources/*.md` を Grep → Read で精査する。独立した列挙項目なら Grep + "
+        "前後行で十分、条項・金額・日付など正確性が要る内容は Read で段落全体を確認する。\n\n"
+        "**Grep 無ヒット ≠ 記載なし** — 同義語を網羅したか自己確認してから結論する。\n"
+    ),
+    "zh": (
+        "## 检索策略\n\n"
+        "**Phase 1（有 RAG 时）**：用 `chunks.jsonl` 做横断检索，"
+        "拿到候选文件 / `title_path` / 位置信息。关键词必须包含同义词"
+        "（例：耐震等级 → 耐震性能 / 住宅性能 / 性能評價）。\n\n"
+        "**Phase 2（Agentic Search）**：以 Phase 1 的结果为起点，"
+        "无 RAG 时直接开始，用 Grep → Read 精查 `sources/*.md`。"
+        "独立列举项用 Grep + 上下文行足够；条款、金额、日期等需要精度的内容，"
+        "用 Read 读完整段落。\n\n"
+        "**Grep 零命中 ≠ 未记载** — 确认已穷举同义词后再下结论。\n"
+    ),
+    "en": (
+        "## Search Protocol\n\n"
+        "**Phase 1 (with RAG)**: Query `chunks.jsonl` for candidate files, "
+        "`title_path`, and position. Always expand the query with synonyms "
+        "(e.g. \"seismic grade\" → seismic rating / housing performance / "
+        "performance evaluation).\n\n"
+        "**Phase 2 (Agentic Search)**: Starting from Phase 1 results (or "
+        "directly, if no RAG), search `sources/*.md` with Grep → Read. "
+        "Grep with surrounding context is enough for independent list items; "
+        "use Read to see the full paragraph for clauses, amounts, dates, or "
+        "anything precision-critical.\n\n"
+        "**Grep miss ≠ not written** — confirm you have exhausted synonyms "
+        "before concluding.\n"
+    ),
+}
+
+
+def _pick_protocol_template(stats: dict[str, Any]) -> str:
+    """
+    Pick a protocol template by the knowledge base's dominant language.
+    Falls back to English for any language we don't have a template for.
+    """
+    langs = stats.get("languages") or []
+    if langs:
+        first = str(langs[0]).lower()
+        if first in _SEARCH_PROTOCOL_TEMPLATES:
+            return _SEARCH_PROTOCOL_TEMPLATES[first]
+    return _SEARCH_PROTOCOL_TEMPLATES["en"]
+
+
+# ---------------------------------------------------------------------------
 # Stage 1: Automatic extraction (zero cost)
 # ---------------------------------------------------------------------------
 
@@ -126,6 +189,23 @@ def build_stage1(
         for kw in kw_counter:
             keyword_to_files[kw].append(path)
 
+    # Discrimination filter (TF-IDF document-frequency cut-off): words that
+    # appear in too many files carry no signal for cross-file search. A
+    # keyword appearing in >70% of the corpus behaves like a stop word
+    # regardless of what it means — "場合" / "事項" / "ruling" in legal docs,
+    # "introduction" / "conclusion" in papers. The threshold is fully
+    # language-agnostic because it relies on document distribution, not
+    # word lists. Tune via knowledge_map.keywords.max_doc_frequency_ratio;
+    # skipped when the corpus is too small (< 3 files) to be statistical.
+    total_file_count = len(files_info)
+    max_df_ratio = float(kw_cfg.get("max_doc_frequency_ratio", 0.7))
+    if total_file_count >= 3 and 0.0 < max_df_ratio < 1.0:
+        max_files = max(1, int(total_file_count * max_df_ratio))
+        keyword_to_files = {
+            kw: files for kw, files in keyword_to_files.items()
+            if len(files) <= max_files
+        }
+
     # Sort by number of files (most cross-file keywords first), then alphabetically
     sorted_keywords = sorted(
         keyword_to_files.items(),
@@ -214,16 +294,30 @@ def enrich_with_ai(
     """
     from ..models.provider import text_completion
 
-    # Build compact input for AI
+    # Build compact input for AI. Limits chosen empirically: sections and
+    # keywords give the LLM enough signal to ground its suggestions in
+    # real document structure (rather than inventing plausible-but-absent
+    # content), while still fitting well under the chunking_assist budget.
+    #
+    # Sections window is adaptive: take at least 8 headings, but for files
+    # with many headings allow up to half of them (capped at 20). This means
+    # small files don't waste tokens while large files — which otherwise
+    # end up under-represented if we chop at 8 — get proportionally more
+    # evidence. The cap prevents a single huge file from dominating the
+    # prompt; 20 is also the per-file sections cap used when this
+    # knowledge_map was built (see file_info["sections"] earlier).
+    def _sections_window(items: list[str]) -> int:
+        return min(20, max(8, len(items) // 2))
+
     files_summary = []
     for f in knowledge_map.get("files", []):
         entry = f"{f['original']} ({f['format']}, {f.get('language','?')}): "
         if f.get("sections"):
-            entry += "sections=[" + ", ".join(f["sections"][:5]) + "]"
+            entry += "sections=[" + ", ".join(f["sections"][:_sections_window(f["sections"])]) + "]"
         if f.get("sheets"):
-            entry += "sheets=[" + ", ".join(f["sheets"][:5]) + "]"
+            entry += "sheets=[" + ", ".join(f["sheets"][:_sections_window(f["sheets"])]) + "]"
         if f.get("keywords"):
-            entry += " keywords=[" + ", ".join(f["keywords"][:8]) + "]"
+            entry += " keywords=[" + ", ".join(f["keywords"][:12]) + "]"
         files_summary.append(entry)
 
     top_keywords = list(knowledge_map.get("keyword_index", {}).keys())[:20]
@@ -237,6 +331,22 @@ generate TWO things in the SAME language as the documents (detect from filenames
    - strategy: recommended search approach
    - target_files: which files to search
    - examples: 1-2 example queries
+
+Grounding requirement (important):
+- Ground every query_type, strategy, and example in the sections /
+  sheets / keywords listed below. Do NOT invent topics that do not
+  appear in any section or keyword (e.g. don't add a query about
+  "pet rules" if no file mentions pets).
+- If you're uncertain whether a topic is covered, omit it rather
+  than guessing. An incomplete but accurate guide is more useful
+  than an exhaustive but fabricated one.
+
+Coverage suggestion (soft):
+- When the sections / keywords reasonably support it, try to ensure
+  every file is referenced in at least one search_guide entry. A file
+  that never appears anywhere is effectively invisible to users. But
+  prefer omission over forcing: do NOT create a fake entry just to
+  include a file if its content doesn't fit any genuine query_type.
 
 Files in this knowledge base:
 {chr(10).join(files_summary)}
@@ -354,13 +464,23 @@ def write_knowledge_map(
 def write_skill_md(
     knowledge_map: dict[str, Any],
     output_dir: Path,
+    config: dict[str, Any] | None = None,
 ) -> Path:
     """
     Render knowledge map as a .SKILL.md file for Agent consumption.
 
     This is the same data as knowledge_map.yaml but formatted as natural
     language Markdown that an Agent can read directly as instructions.
+
+    When enabled (knowledge_map.search_protocol = true, default), a short
+    two-phase search-protocol block is inserted between the Summary and
+    File-listing sections. The block is hard-coded (RAG → Agentic Search
+    flow with synonym expansion and "Grep miss ≠ not written" guard) — not
+    user-tunable text, just an on/off switch in config. If a project needs
+    different wording they can disable the block and add their own.
     """
+    cfg = config or {}
+
     lines: list[str] = []
 
     lines.append("# 知識ベース検索")
@@ -372,6 +492,12 @@ def write_skill_md(
         lines.append("## 概要")
         lines.append("")
         lines.append(summary.strip())
+        lines.append("")
+
+    # Search-protocol block (language-routed)
+    if get_nested(cfg, "knowledge_map.search_protocol", True):
+        protocol = _pick_protocol_template(knowledge_map.get("stats", {}))
+        lines.append(protocol.rstrip())
         lines.append("")
 
     # File listing as table
@@ -492,7 +618,7 @@ def generate_knowledge_map(
     logger.info(f"Knowledge map written to {output_path}")
 
     # Write SKILL.md (Agent-readable version)
-    skill_path = write_skill_md(knowledge_map, output_dir)
+    skill_path = write_skill_md(knowledge_map, output_dir, config)
     logger.info(f"Skill file written to {skill_path}")
 
     return output_path
