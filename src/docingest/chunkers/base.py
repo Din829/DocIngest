@@ -160,10 +160,42 @@ class BaseChunker(ABC):
             # Single number → uniform for all types
             self._overflow_map = {"default": float(overflow_raw)}
 
+        # on_overflow: what to do when a protected block EXCEEDS the allowed
+        # overflow budget. Per-block-type so each format (table/code/list/
+        # quote) can pick the right trade-off. Legacy configs without this
+        # key get "bypass" everywhere, preserving pre-2026 behaviour.
+        on_overflow_raw = protection.get("on_overflow", {})
+        if isinstance(on_overflow_raw, str):
+            # Single string → uniform
+            self._on_overflow_map = {"default": on_overflow_raw}
+        elif isinstance(on_overflow_raw, dict):
+            self._on_overflow_map = on_overflow_raw
+        else:
+            self._on_overflow_map = {"default": "bypass"}
+
+        # table_split parameters — only consulted when on_overflow == row_split.
+        # Kept as BaseChunker attrs so any future chunker subclass inherits
+        # the same knobs.
+        table_split = protection.get("table_split", {}) or {}
+        self._table_keep_header = bool(table_split.get("keep_header_in_every_chunk", True))
+        self._table_max_rows = table_split.get("max_rows_per_chunk", None)
+        if self._table_max_rows is not None:
+            self._table_max_rows = int(self._table_max_rows)
+
     def _get_overflow(self, block_type: str = "default") -> float:
         """Get allowed overflow multiplier for a protected block type."""
         return float(self._overflow_map.get(
             block_type, self._overflow_map.get("default", 2.0)
+        ))
+
+    def _get_overflow_strategy(self, block_type: str = "default") -> str:
+        """
+        Get the on_overflow strategy (bypass | row_split | warn_and_bypass)
+        for a protected block type. Falls back to 'default' key, then to
+        'bypass' for maximum backwards compatibility.
+        """
+        return str(self._on_overflow_map.get(
+            block_type, self._on_overflow_map.get("default", "bypass")
         ))
 
     @abstractmethod

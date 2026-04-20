@@ -170,9 +170,36 @@ chunking:
   strategy: "heading"
   max_tokens: 1024
 
+  # Heading merge behaviour — all three policies are independently tunable
+  # so different document types (legal contracts, tech reports, tutorials)
+  # can use different trade-offs without code changes.
+  heading:
+    prelude_policy: "attach_to_first"     # attach_to_first | standalone | drop
+    orphan_heading_policy: "merge_forward" # merge_forward | keep
+    title_path_strategy: "deepest"         # deepest | first | join_all
+
+  protection:
+    # What to do when a protected block (table/code/list/quote) exceeds
+    # its allowed_overflow × max_tokens budget. Per-block-type control.
+    on_overflow:
+      table: "row_split"      # split giant tables at data-row boundaries,
+                              # repeat header in every sub-chunk
+      code_block: "bypass"    # don't split code — breaks syntax
+      list: "bypass"
+      default: "bypass"
+    table_split:
+      keep_header_in_every_chunk: true
+      max_rows_per_chunk: null  # null = only token budget applies
+
 models:
+  defaults:
+    max_response_tokens: 32768  # Global fallback — every LLM task inherits this
+                                # (vision / chunking_assist / contextual_summary / ...)
+                                # unless it sets its own max_response_tokens.
+    retry_on_truncation: true   # Retry once when finish_reason=="length"
+    retry_max_tokens: 65536
   vision:
-    max_response_tokens: 32768  # Output cap; set explicitly to bypass litellm's 4096 default
+    max_response_tokens: 32768  # Per-task override (optional — inherits defaults if unset)
     primary: { provider: "google", model: "gemini-3-flash-preview" }
   audio_transcription:
     primary: { provider: "dashscope", model: "qwen3-asr-flash" }
@@ -231,11 +258,11 @@ export DOCINGEST__parsing__audio__language=ja
 - **Per-page Vision AI** — AI decides per page: clean up text / describe charts / OCR scan. Parallel execution, cached by content hash.
 - **PPTX chart direct-read** — python-pptx extracts chart data (categories, series, values) as 100% accurate Markdown tables. Vision supplements with visual context.
 - **DOCX math equations** — OMML → LaTeX preprocessing before Docling parses. `$E=mc^{2}$` instead of garbled text.
-- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists). Small heading sections auto-merged to prevent fragments. Docling+Vision unified dedup applied to both sources and chunks.
+- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists) and per-type `on_overflow` strategy — oversized Markdown tables are split at data-row boundaries with the header repeated in every sub-chunk (2026 industry standard, handles Docling's merged-cell expansion). Single-pass heading merge (prelude + orphan-heading + small-section policies) produces zero-fragment chunks with the deepest-available title_path. Adjacent byte-identical chunks auto-deduplicated. All behaviour is config-driven — every knob in `chunking.heading.*` and `chunking.protection.*`.
 - **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction.
 - **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
-- **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Includes garbled text detection (CJK mismap, mixed-script anomaly, HTML entity artifacts) to ensure damaged pages still get Vision enrichment. Default ON (`parsing.vision.triage.enabled`).
+- **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Eight-layer defence for damaged pages: `glyph<` / `&lt;` CID markers, U+FFFD ratio, complex-table density, CJK mixed-script anomaly, **language-script consistency** (new) — catches CMap failures that produce CLEAN but WRONG Unicode (e.g. Bengali/Thai/Tibetan chars on a Japanese-declared document; the other checks miss this because the output is legal Unicode). Whitelist per language (ja/zh/en/ko by default), add a language = edit `parsing.vision.triage.language_script_check.expected_scripts` — no code change. Default ON (`parsing.vision.triage.enabled`).
 - **Bounding boxes** — per-element PDF coordinates extracted from Docling for RAG source citation and highlighting.
 - **Hidden text detection** — flags invisible/background content via Docling ContentLayer analysis.
 - **Sensitive data sanitization** — opt-in PII masking (email, URL, credit card with Luhn validation, IPv4, JP phone). High-precision rules only, no name detection. Default OFF (`sanitize.enabled`).

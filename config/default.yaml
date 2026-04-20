@@ -6,12 +6,21 @@
 # AI Models (multi-provider with fallback)
 # =============================================================================
 models:
+  # Fallback defaults for every LLM task (vision / chunking_assist / refine / ...).
+  # Any task that does not explicitly set max_response_tokens inherits this.
+  # Set explicitly because litellm injects max_tokens=4096 by default for both
+  # Gemini and Claude when omitted (https://github.com/BerriAI/litellm/issues/8835).
+  defaults:
+    max_response_tokens: 32768
+    # Retry once when the LLM stops with finish_reason="length" (response cut
+    # off by the token limit). Retry doubles the budget up to retry_max_tokens.
+    retry_on_truncation: true
+    retry_max_tokens: 65536
+
   vision:
-    # Output token cap per Vision call. Set explicitly because litellm injects
-    # max_tokens=4096 by default for both Gemini and Claude when omitted
-    # (https://github.com/BerriAI/litellm/issues/8835), which would silently
-    # truncate dense pages. 32768 covers any realistic single-page output and
-    # is supported by all current Gemini/Claude/OpenAI Vision models.
+    # Per-task override; falls through to models.defaults.max_response_tokens
+    # when unset. Kept explicit here because dense PDF pages routinely need
+    # the full 32K budget.
     max_response_tokens: 32768
     primary:
       provider: "google"
@@ -56,6 +65,18 @@ models:
 parsing:
   engine: "docling"           # docling | docling_with_fallback
 
+  # Generic Markdown post-processing — applied to all non-xlsx formats
+  # (PDF / DOCX / PPTX / HTML / plain Markdown). The xlsx path has its own
+  # richer denoising under parsing.xlsx.denoising.
+  markdown:
+    # Collapse merged-cell duplication inside Markdown table rows.
+    # Docling expands a single cell that spans N columns into N identical
+    # cells, turning one piece of content into N× the tokens. The collapse
+    # is safety-gated inside the implementation: only applied when it
+    # removes ≥50% of cells in a row (strong signal of merge noise, not a
+    # legitimate data table with coincidental duplicates).
+    dedup_table_rows: true
+
   # OCR settings (auto-triggered for scanned documents)
   ocr:
     engine: "auto"            # auto | easyocr | tesseract | rapidocr
@@ -91,6 +112,28 @@ parsing:
                                     # Detects CJK mismap garbling (e.g. する→寸, 査→查)
                                     # Short ASCII fragments (1-3 chars) sandwiched between CJK
                                     # Normal CJK docs rarely exceed 1-2 (e.g. "の PwC の" has spaces)
+
+      # Language-script consistency check — the strongest signal for CMap
+      # failures that produce CLEAN but WRONG Unicode (e.g. Docling yielding
+      # Bengali/Thai/Tibetan characters on a Japanese-declared document).
+      # The other garble checks miss this case: legal Unicode, no glyph<,
+      # no U+FFFD, no CJK mismap sandwich — just the wrong script entirely.
+      #
+      # For each configured language, list the Unicode scripts that are
+      # legitimately allowed. Anything outside the whitelist counts toward
+      # the unexpected ratio. "Common" (digits, punctuation, whitespace,
+      # CJK punctuation, fullwidth forms) is always allowed automatically.
+      #
+      # Add a new language = add a line here. No code changes needed.
+      language_script_check:
+        enabled: true
+        max_unexpected_script_ratio: 0.05   # >5% unexpected characters → send to Vision
+        min_text_length_for_check: 50       # skip very short pages (random noise risk)
+        expected_scripts:
+          ja: [Latin, Han, Hiragana, Katakana]
+          zh: [Latin, Han, Hiragana, Katakana]   # Chinese docs sometimes embed kana
+          en: [Latin]
+          ko: [Latin, Hangul, Han]
 
   # PDF-specific
   pdf:
@@ -335,6 +378,17 @@ chunking:
 
   max_tokens: 512
   min_tokens: 100
+  # Token overlap between consecutive chunks produced by RecursiveChunker.
+  # NOTE — overlap applies ONLY inside RecursiveChunker (i.e. when a heading
+  # section exceeds max_tokens and recursive is invoked to sub-divide it).
+  # HeadingChunker's section boundaries, SlideChunker's slide boundaries,
+  # SheetChunker's table boundaries, and TimestampChunker's time segments
+  # are treated as hard semantic breaks — they do NOT receive overlap.
+  # TableSplitter achieves the same goal differently (header repetition).
+  # Keep the default at 50 (conservative, matches LangChain / Chonkie
+  # defaults). 2026 benchmarks (Vecta, SPLADE+Mistral-8B on NQ) report
+  # overlap contributes <1% recall for recursive strategies — most users
+  # can safely set this to 0 to shrink chunks.jsonl by ~10%.
   overlap_tokens: 50
 
   heading:
@@ -342,6 +396,27 @@ chunking:
     fallback: "recursive"
     merge_small_sections: true  # Merge adjacent sections below min_tokens into one chunk
                                 # false = every heading boundary is a hard chunk boundary (legacy)
+
+    # How to handle content that appears BEFORE the first heading in a
+    # document (e.g. page-header stray text Docling extracts from PDFs).
+    #   attach_to_first — glue it to the first real section (default, avoids
+    #                     tiny orphan chunks like "西暦" at chunk[0])
+    #   standalone      — emit as its own chunk with empty title_path
+    #   drop            — discard silently (useful for aggressive denoising)
+    prelude_policy: "attach_to_first"
+
+    # How to handle a heading line with no body (e.g. "## Chapter 2" with the
+    # next line being another heading or empty).
+    #   merge_forward — attach the heading to the NEXT section that has body
+    #                   content, preserving its deepest title_path (default)
+    #   keep          — emit the lone heading as its own chunk (legacy)
+    orphan_heading_policy: "merge_forward"
+
+    # Which title_path to keep when multiple sections merge into one chunk.
+    #   deepest   — the most-granular path (most " > " segments) wins (default)
+    #   first     — the first non-empty title_path
+    #   join_all  — all paths joined by " | " (legacy behaviour)
+    title_path_strategy: "deepest"
 
   auto:
     min_headings: 3
@@ -380,6 +455,31 @@ chunking:
       list: 1.5               # lists can be split at item boundaries if too large
       quote: 1.5
       default: 1.5            # fallback for any unspecified type
+
+    # What to do when a protected block EXCEEDS its allowed_overflow budget.
+    # Per-block-type so different content kinds get the right trade-off.
+    #   bypass          — emit the oversized block as a single chunk (legacy).
+    #                     OK for code (splitting mid-function breaks syntax).
+    #   row_split       — tables only: split at data-row boundaries, repeat
+    #                     header in every sub-chunk (2026 industry standard,
+    #                     see Chonkie TableChunker / Ragie table chunking).
+    #                     Fixes Docling's merged-cell expansion producing
+    #                     multi-kilo-token tables.
+    #   warn_and_bypass — same as bypass + logs a warning so oversized blocks
+    #                     stay discoverable for tuning.
+    on_overflow:
+      table: "row_split"
+      code_block: "bypass"
+      list: "bypass"
+      quote: "bypass"
+      default: "bypass"
+
+    # Parameters for row_split (consulted only when on_overflow = row_split).
+    table_split:
+      keep_header_in_every_chunk: true   # every sub-chunk is self-describing
+      max_rows_per_chunk: null           # null = only token budget applies;
+                                         # set an integer to cap row count
+                                         # (useful for DB-dump-style tables)
 
   ai_assist:
     enabled: true

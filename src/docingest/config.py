@@ -214,7 +214,35 @@ def load_config(
     if cli_overrides:
         config = deep_merge(config, cli_overrides)
 
+    _inject_model_defaults(config)
     return config
+
+
+def _inject_model_defaults(config: dict) -> None:
+    """
+    Inject `models.defaults` into every sibling task dict as `_defaults`.
+
+    After this, any `models.<task>` dict (vision, chunking_assist, ...) can be
+    passed to an LLM helper and resolve_max_tokens() will fall through to
+    models.defaults.max_response_tokens when the task has no explicit override.
+    This means future tasks inherit the global cap with zero new code —
+    the only place a token cap is defined is config/default.yaml.
+
+    Safe to call multiple times (idempotent). Does nothing if models.defaults
+    is missing (respects user configs that strip it out).
+    """
+    models = config.get("models")
+    if not isinstance(models, dict):
+        return
+    defaults = models.get("defaults")
+    if not isinstance(defaults, dict):
+        return
+    for task_name, task_cfg in models.items():
+        if task_name == "defaults" or not isinstance(task_cfg, dict):
+            continue
+        # Overwrite rather than merge — _defaults must reflect the current
+        # resolved global defaults, not a stale copy from a previous load.
+        task_cfg["_defaults"] = defaults
 
 
 # ---------------------------------------------------------------------------

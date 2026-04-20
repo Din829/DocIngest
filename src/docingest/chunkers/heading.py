@@ -3,17 +3,23 @@ Heading-based chunker — splits by Markdown headings, then recursive within sec
 
 Strategy:
   1. Split document at heading boundaries (configurable levels: H1, H2, H3)
-  2. Each section becomes a candidate chunk
-  3. If section > max_tokens → subdivide with recursive chunker
-  4. If section < min_tokens → keep as-is (headings are semantic boundaries)
+  2. Each section is classified as prelude / heading_only / normal
+  3. Single-pass merge loop combines small / orphan sections into the next
+     normal section (forward-merge), giving a stable title_path and never
+     leaving 3-token "西暦" fragments at the head of the file.
+  4. Sections larger than max_tokens fall through to RecursiveChunker.
 
-Key rules (from DESIGN.md):
-  - Overlap applies WITHIN sections (recursive), NOT between sections
-  - Section boundaries are hard (headings = semantic breaks)
-  - Short sections are preserved (don't merge across headings)
+Earlier revisions had TWO independent merge passes (pending_prefix +
+small-section accumulator). They interacted poorly — producing duplicate
+chunks and swallowing the deepest title_path. This revision folds both
+into a single accumulator with explicit policies (config-driven):
 
-This is the "single biggest improvement" for structured documents
-per Firecrawl 2026 and PreMai 2026 guides.
+  prelude_policy        attach_to_first | standalone | drop
+  orphan_heading_policy merge_forward   | keep
+  title_path_strategy   deepest         | first | join_all
+
+So the same code handles Japanese legal docs, English tech reports,
+and whatever the next project throws at it — you only change config.
 """
 
 from __future__ import annotations
@@ -35,152 +41,242 @@ class HeadingChunker(BaseChunker):
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
 
-        heading_cfg = self._chunking.get("heading", {})
+        heading_cfg = self._chunking.get("heading", {}) or {}
         self._levels = set(heading_cfg.get("levels", [1, 2, 3]))
         self._fallback_strategy = heading_cfg.get("fallback", "recursive")
+        self._merge_small = bool(heading_cfg.get("merge_small_sections", True))
+        self._prelude_policy = heading_cfg.get("prelude_policy", "attach_to_first")
+        self._orphan_policy = heading_cfg.get("orphan_heading_policy", "merge_forward")
+        self._title_strategy = heading_cfg.get("title_path_strategy", "deepest")
 
         # Recursive chunker for subdividing large sections
         self._recursive = RecursiveChunker(config)
 
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
     def chunk(self, markdown: str, metadata: dict[str, Any]) -> list[Chunk]:
-        """Split by headings, then recursive within sections."""
         if not markdown.strip():
             return []
 
-        # Split into sections by heading
         sections = self._split_by_headings(markdown)
-
         if not sections:
-            # No headings found → fall back to recursive
             return self._recursive.chunk(markdown, metadata)
 
-        # Pre-process: merge heading-only sections into the next section
-        # (e.g., "## Title" with no body should attach to the content that follows)
-        merged_sections: list[dict] = []
-        pending_prefix = ""
-        pending_title = ""
-        for section in sections:
-            section_text = section["text"]
-            # Check if section has meaningful content beyond the heading line itself
-            lines = section_text.strip().split("\n")
-            non_heading_lines = [l for l in lines if not _HEADING_RE.match(l) and l.strip()]
-            # A section "has content" if any line is real text (not just HTML comments)
-            has_content = any(
-                l.strip() and not l.strip().startswith("<!--") for l in non_heading_lines
-            )
-            if not has_content and not merged_sections:
-                # First section with no content — accumulate as prefix
-                pending_prefix = (pending_prefix + "\n\n" + section_text).strip()
-                pending_title = section["title_path"]
-            elif not has_content and merged_sections:
-                # No content — accumulate to prepend to next section
-                pending_prefix = (pending_prefix + "\n\n" + section_text).strip()
-                pending_title = section["title_path"]
-            else:
-                if pending_prefix:
-                    section_text = pending_prefix + "\n\n" + section_text
-                    pending_prefix = ""
-                merged_sections.append({
-                    "text": section_text,
-                    "title_path": pending_title or section["title_path"],
-                })
-                pending_title = ""
+        # Classify, then run a single-pass merge.
+        classified = [self._classify(s) for s in sections]
+        all_chunks = self._merge_and_emit(classified, metadata)
 
-        # Flush any remaining pending prefix into last section
-        if pending_prefix:
-            if merged_sections:
-                merged_sections[-1]["text"] += "\n\n" + pending_prefix
-            else:
-                merged_sections.append({"text": pending_prefix, "title_path": pending_title})
-
-        sections = merged_sections
-
-        # Process each section, with optional small-section merging.
-        # When merge_small_sections is enabled, adjacent sections that are
-        # individually below min_tokens get accumulated into a single chunk.
-        # This prevents tiny heading-only or short-paragraph chunks while
-        # preserving all title_path metadata.
-        all_chunks: list[Chunk] = []
-        merge_enabled = self._chunking.get("heading", {}).get(
-            "merge_small_sections", True
-        )
-
-        # Accumulator for small section merging
-        accum_text = ""
-        accum_titles: list[str] = []
-        accum_tokens = 0
-
-        def _flush_accum():
-            nonlocal accum_text, accum_titles, accum_tokens
-            if accum_text.strip():
-                all_chunks.append(Chunk(text=accum_text.strip(), metadata={
-                    **metadata,
-                    "title_path": " | ".join(accum_titles),
-                }))
-            accum_text = ""
-            accum_titles = []
-            accum_tokens = 0
-
-        for section in sections:
-            section_text = section["text"]
-            section_tokens = self.estimate_tokens(section_text)
-
-            if section_tokens > self._max_tokens:
-                # Large section → flush accumulator first, then subdivide
-                _flush_accum()
-                sub_chunks = self._recursive.chunk(section_text, {
-                    **metadata,
-                    "title_path": section["title_path"],
-                })
-                all_chunks.extend(sub_chunks)
-            elif merge_enabled and section_tokens < self._min_tokens:
-                # Small section → accumulate, don't emit yet
-                if accum_tokens + section_tokens > self._max_tokens:
-                    # Accumulated too much — flush before adding
-                    _flush_accum()
-                accum_text = (accum_text + "\n\n" + section_text).strip()
-                accum_titles.append(section["title_path"])
-                accum_tokens += section_tokens
-            else:
-                # Normal-sized section → flush accumulator, then emit
-                # If accumulator has content, merge it with this section
-                # (attaches orphan small sections to the next normal one)
-                if accum_text:
-                    section_text = accum_text + "\n\n" + section_text
-                    combined_titles = accum_titles + [section["title_path"]]
-                    combined_tokens = accum_tokens + section_tokens
-                    accum_text = ""
-                    accum_titles = []
-                    accum_tokens = 0
-
-                    if combined_tokens > self._max_tokens:
-                        # Merged content is too large → subdivide
-                        sub_chunks = self._recursive.chunk(section_text, {
-                            **metadata,
-                            "title_path": " | ".join(combined_titles),
-                        })
-                        all_chunks.extend(sub_chunks)
-                    else:
-                        all_chunks.append(Chunk(text=section_text, metadata={
-                            **metadata,
-                            "title_path": " | ".join(combined_titles),
-                        }))
-                else:
-                    all_chunks.append(Chunk(text=section_text, metadata={
-                        **metadata,
-                        "title_path": section["title_path"],
-                    }))
-
-        # Flush any remaining accumulator
-        _flush_accum()
-
-        # Renumber chunk indices
+        # Renumber after all merging is done.
         for i, c in enumerate(all_chunks):
             c.metadata["chunk_index"] = i
             c.metadata["total_chunks"] = len(all_chunks)
             c.metadata["tokens"] = self.estimate_tokens(c.text)
 
         return all_chunks
+
+    # ------------------------------------------------------------------
+    # Section classification
+    # ------------------------------------------------------------------
+
+    def _classify(self, section: dict[str, Any]) -> dict[str, Any]:
+        """
+        Tag a section with:
+          kind: "prelude" | "heading_only" | "normal"
+          tokens: int
+        plus carry through text and title_path.
+
+        prelude      — no heading line anywhere in the section (text
+                       that appeared before the first #/##/### in the doc)
+        heading_only — starts with a heading and has no meaningful body
+                       (ignore blank lines, HTML comments)
+        normal       — everything else
+        """
+        text = section["text"]
+        title_path = section.get("title_path", "")
+        lines = text.strip().split("\n") if text.strip() else []
+
+        has_heading = any(_HEADING_RE.match(ln) for ln in lines)
+        # Lines that count as "real body content"
+        body_lines = [
+            ln for ln in lines
+            if ln.strip()
+            and not _HEADING_RE.match(ln)
+            and not ln.strip().startswith("<!--")
+        ]
+
+        if not has_heading and not title_path:
+            kind = "prelude"
+        elif has_heading and not body_lines:
+            kind = "heading_only"
+        else:
+            kind = "normal"
+
+        return {
+            "text": text,
+            "title_path": title_path,
+            "kind": kind,
+            "tokens": self.estimate_tokens(text),
+        }
+
+    # ------------------------------------------------------------------
+    # Merge + emit
+    # ------------------------------------------------------------------
+
+    def _merge_and_emit(
+        self,
+        sections: list[dict[str, Any]],
+        metadata: dict[str, Any],
+    ) -> list[Chunk]:
+        """
+        Walk sections and emit Chunks. Uses one accumulator that holds
+        pending prelude / heading_only / small sections until the next
+        normal-sized section arrives — then flushes them together.
+        """
+        out: list[Chunk] = []
+        pending: list[dict[str, Any]] = []
+
+        for section in sections:
+            kind = section["kind"]
+
+            # Prelude handling (config-driven)
+            if kind == "prelude":
+                if self._prelude_policy == "drop":
+                    continue
+                if self._prelude_policy == "standalone":
+                    out.append(self._to_chunk(section, metadata))
+                    continue
+                # attach_to_first (default) → queue for next normal section
+                pending.append(section)
+                continue
+
+            # Orphan heading (heading with no body)
+            if kind == "heading_only":
+                if self._orphan_policy == "keep":
+                    out.append(self._to_chunk(section, metadata))
+                    continue
+                # merge_forward (default)
+                pending.append(section)
+                continue
+
+            # Normal section — combine with anything pending
+            combined_text, combined_title = self._combine(pending + [section])
+            combined_tokens = self.estimate_tokens(combined_text)
+            pending = []
+
+            # Too big → hand to recursive chunker, title_path propagates
+            if combined_tokens > self._max_tokens:
+                sub_chunks = self._recursive.chunk(
+                    combined_text,
+                    {**metadata, "title_path": combined_title},
+                )
+                out.extend(sub_chunks)
+                continue
+
+            # Small — hold for merging with next section. Works for the
+            # first section too (out may be empty): the accumulator will
+            # simply keep growing until a normal-sized section arrives or
+            # the loop ends (tail-flush merges into the last output chunk).
+            if self._merge_small and combined_tokens < self._min_tokens:
+                pending.append({
+                    "text": combined_text,
+                    "title_path": combined_title,
+                    "kind": "normal",
+                    "tokens": combined_tokens,
+                })
+                continue
+
+            out.append(Chunk(
+                text=combined_text,
+                metadata={**metadata, "title_path": combined_title},
+            ))
+
+        # Flush any leftover pending. Three cases:
+        #   1. output exists + pending is small enough to glue on → forward-
+        #      merge into the last chunk (avoids trailing fragments).
+        #   2. output exists + pending is big enough to warrant its own chunk
+        #      (or its own sub-chunks via recursive) → emit separately.
+        #   3. output is empty (document had no normal section ever — e.g.
+        #      wall-of-text with no headings, or all sections were tiny) →
+        #      run the combined text through the recursive chunker so it
+        #      still gets size-limited.
+        if pending:
+            text, title = self._combine(pending)
+            combined_tokens = self.estimate_tokens(text)
+            base_meta = {**metadata, "title_path": title}
+            if not out:
+                if combined_tokens > self._max_tokens:
+                    out.extend(self._recursive.chunk(text, base_meta))
+                else:
+                    out.append(Chunk(text=text, metadata=base_meta))
+            elif combined_tokens <= self._max_tokens - self._min_tokens:
+                # Small tail — safe to glue onto the last chunk without
+                # pushing it far past max_tokens.
+                last = out[-1]
+                last.text = last.text + "\n\n" + text
+                last.metadata["title_path"] = self._pick_title([
+                    last.metadata.get("title_path", ""),
+                    title,
+                ])
+            elif combined_tokens > self._max_tokens:
+                out.extend(self._recursive.chunk(text, base_meta))
+            else:
+                out.append(Chunk(text=text, metadata=base_meta))
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _combine(
+        self,
+        sections: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        """Stitch sections together; choose the best title_path per config."""
+        text = "\n\n".join(s["text"] for s in sections if s["text"].strip())
+        title = self._pick_title([s["title_path"] for s in sections])
+        return text, title
+
+    def _pick_title(self, titles: list[str]) -> str:
+        """
+        Pick a title_path according to title_path_strategy:
+          deepest   — the one with the most " > " segments (ties: last wins)
+          first     — the first non-empty
+          join_all  — all non-empty joined by " | " (legacy behaviour)
+        """
+        non_empty = [t for t in titles if t]
+        if not non_empty:
+            return ""
+        strategy = self._title_strategy
+        if strategy == "first":
+            return non_empty[0]
+        if strategy == "join_all":
+            # Deduplicate while preserving order
+            seen = set()
+            ordered = []
+            for t in non_empty:
+                if t not in seen:
+                    seen.add(t)
+                    ordered.append(t)
+            return " | ".join(ordered)
+        # default: deepest (most granular title path wins)
+        return max(non_empty, key=lambda t: (t.count(" > "), len(t)))
+
+    def _to_chunk(
+        self,
+        section: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> Chunk:
+        return Chunk(
+            text=section["text"],
+            metadata={**metadata, "title_path": section["title_path"]},
+        )
+
+    # ------------------------------------------------------------------
+    # Heading splitter (unchanged from previous revision)
+    # ------------------------------------------------------------------
 
     def _split_by_headings(self, markdown: str) -> list[dict]:
         """
@@ -191,16 +287,15 @@ class HeadingChunker(BaseChunker):
         lines = markdown.split("\n")
         sections: list[dict] = []
         current_lines: list[str] = []
-        title_stack: list[tuple[int, str]] = []  # (level, title)
+        title_stack: list[tuple[int, str]] = []
         current_title_path = ""
 
         for line in lines:
             match = _HEADING_RE.match(line)
             if match:
-                level = len(match.group(1))  # Number of # signs
+                level = len(match.group(1))
                 title = match.group(2).strip()
 
-                # Only split on configured heading levels
                 if level in self._levels:
                     # Flush previous section
                     if current_lines:
@@ -213,17 +308,14 @@ class HeadingChunker(BaseChunker):
                         current_lines = []
 
                     # Update title stack
-                    # Pop titles at same or deeper level
                     while title_stack and title_stack[-1][0] >= level:
                         title_stack.pop()
                     title_stack.append((level, title))
 
-                    # Build title path: "Chapter > Section > Subsection"
                     current_title_path = " > ".join(t for _, t in title_stack)
 
             current_lines.append(line)
 
-        # Flush last section
         if current_lines:
             text = "\n".join(current_lines).strip()
             if text:

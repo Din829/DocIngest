@@ -217,12 +217,24 @@ def _detect_language(text: str, sample_size: int = 2000) -> str:
     Detect dominant language from character distribution.
 
     Checks a sample of characters — no external dependencies, no AI calls.
-    Returns ISO 639-1 code: "ja", "zh", "ko", "en", or "mixed".
+    Returns ISO 639-1 code: "ja", "zh", "ko", "en", "mixed", or "unknown".
+
+    Denominator note: `significant_chars` counts EVERY non-whitespace code
+    point in the sample, not just CJK/kana/hangul/Latin. An earlier revision
+    divided by the sum of the four buckets, which made garbled PDFs
+    (Bengali/Thai/Tibetan Unicode from CMap failure, plus a handful of
+    Latin chars) misdetect as "en" because the few Latin chars dominated
+    an artificially small denominator. Counting all significant chars
+    means garble correctly falls through to "unknown" / "mixed".
     """
     sample = text[:sample_size]
     cjk = ja_specific = ko_specific = latin = 0
+    significant_chars = 0
 
     for ch in sample:
+        if ch.isspace():
+            continue
+        significant_chars += 1
         cp = ord(ch)
         if 0x3040 <= cp <= 0x30FF or 0x31F0 <= cp <= 0x31FF:
             ja_specific += 1  # Hiragana + Katakana
@@ -232,25 +244,28 @@ def _detect_language(text: str, sample_size: int = 2000) -> str:
             cjk += 1  # CJK Unified (shared by ja/zh)
         elif 0x0041 <= cp <= 0x007A:
             latin += 1
+        # Everything else (Bengali / Thai / Tibetan / Cyrillic / ...) gets
+        # counted into significant_chars but into no bucket, so garbled text
+        # drives EVERY bucket ratio toward zero → falls through to unknown.
 
-    total = ja_specific + ko_specific + cjk + latin
-    if total == 0:
+    if significant_chars == 0:
         return "unknown"
 
     # Japanese: has hiragana/katakana
-    if ja_specific > total * 0.05:
+    if ja_specific > significant_chars * 0.05:
         return "ja"
     # Korean: has hangul
-    if ko_specific > total * 0.05:
+    if ko_specific > significant_chars * 0.05:
         return "ko"
     # Chinese: CJK ideographs but no kana/hangul
-    if cjk > total * 0.1:
+    if cjk > significant_chars * 0.1:
         return "zh"
     # Latin-dominant
-    if latin > total * 0.5:
+    if latin > significant_chars * 0.5:
         return "en"
-
-    return "mixed"
+    # None of the buckets dominate — could be mixed multilingual content or
+    # garbled Unicode. Neither is safe to label; "unknown" is the honest answer.
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +429,24 @@ def _extract_metadata_kv(lines: list[str], max_rows: int) -> dict[str, str]:
         if len(cells) == 2:
             kv[cells[0]] = cells[1]
     return kv
+
+
+def _denoise_markdown_table_rows(markdown: str) -> str:
+    """
+    Apply row-level merged-cell dedup to every Markdown table line.
+
+    Lightweight companion to _clean_excel_markdown: it reuses the same
+    _dedup_table_row routine (run-length collapse with a ≥50% safety gate)
+    but skips the Excel-specific metadata extraction / empty-cell stripping.
+    Appropriate for PDF / DOCX / PPTX / HTML where Docling's Markdown still
+    has the merged-cell artefact but the rest of the markdown should stay
+    untouched.
+
+    Safe on non-table input — non-`|` lines pass through unchanged.
+    """
+    if not markdown or "|" not in markdown:
+        return markdown
+    return "\n".join(_dedup_table_row(line) for line in markdown.split("\n"))
 
 
 def _clean_excel_markdown(
@@ -749,6 +782,7 @@ def _should_skip_vision(
     page_data,
     structured_per_page: dict,
     triage_cfg: dict[str, Any],
+    doc_language: str | None = None,
 ) -> bool:
     """
     Conservative triage: decide if a page can safely skip Vision enrichment.
@@ -765,6 +799,9 @@ def _should_skip_vision(
       5. Low replacement character ratio (no CID font issues)
       6. No complex tables (simple tables are fine, complex ones need Vision)
       7. No mixed-script anomaly (CJK mismap garbling from OCR)
+      8. Text scripts match the document's declared language (catches CMap
+         failures that produce "clean" but wrong Unicode — e.g. Bengali /
+         Thai / Tibetan characters in a document declared as Japanese).
     """
     text = page_data.text
     stripped = text.strip()
@@ -814,6 +851,13 @@ def _should_skip_vision(
     if _has_mixed_script_anomaly(stripped, triage_cfg):
         return False
 
+    # Language-script consistency — catches PDFs whose font CMap produced
+    # clean but *wrong* Unicode (Bengali / Thai / Tibetan chars on a page
+    # declared as Japanese). The other garble checks miss this case because
+    # the output is legal Unicode, no glyph< markers, no U+FFFD, no CJK.
+    if _has_unexpected_scripts(stripped, triage_cfg, doc_language):
+        return False
+
     # All checks passed → pure text page, safe to skip
     return True
 
@@ -844,6 +888,70 @@ def _has_mixed_script_anomaly(text: str, triage_cfg: dict[str, Any]) -> bool:
     max_fragments = int(triage_cfg.get("max_mixed_script_fragments", 3))
     fragment_count = len(_MIXED_SCRIPT_RE.findall(text))
     return fragment_count > max_fragments
+
+
+def _has_unexpected_scripts(
+    text: str,
+    triage_cfg: dict[str, Any],
+    doc_language: str | None,
+) -> bool:
+    """
+    Detect text whose Unicode scripts don't match the document's declared
+    language — the only signal strong enough to catch CMap failures that
+    produce valid but semantically-wrong characters.
+
+    Behaviour:
+      * feature disabled in config → False
+      * text shorter than min_text_length_for_check → False (too noisy)
+      * doc_language known and in expected_scripts → enforce that whitelist
+      * doc_language unknown or not configured → enforce a generic
+        "common scripts only" whitelist (Latin, Han, Hiragana, Katakana,
+        Hangul). This catches garbled CMap output even when language
+        detection itself failed (e.g. Bengali/Thai chars on a page whose
+        declared language is "unknown" because detection was thrown off
+        by the garble).
+
+    The generic-whitelist branch is intentionally permissive — it accepts
+    every language we have explicit support for today, so it cannot
+    mis-flag a legitimate Japanese / Chinese / Korean / English document
+    that failed language detection. It only flags content that is in
+    NONE of those major scripts.
+    """
+    lsc_cfg = triage_cfg.get("language_script_check")
+    if not isinstance(lsc_cfg, dict) or not lsc_cfg.get("enabled", False):
+        return False
+
+    min_len = int(lsc_cfg.get("min_text_length_for_check", 50))
+    if len(text) < min_len:
+        return False
+
+    expected_map = lsc_cfg.get("expected_scripts") or {}
+    if not isinstance(expected_map, dict):
+        return False
+
+    expected_list = expected_map.get(doc_language) if doc_language else None
+    if not expected_list:
+        # Unknown / unconfigured language — fall back to the union of all
+        # configured language whitelists. If the detected text uses only
+        # scripts that ANY supported language would accept, we don't flag;
+        # exotic scripts (Bengali / Thai / Tibetan from CMap failure)
+        # still trigger even when language detection failed upstream.
+        union_scripts: set[str] = set()
+        for scripts in expected_map.values():
+            if isinstance(scripts, list):
+                union_scripts.update(scripts)
+        if not union_scripts:
+            return False
+        expected_list = list(union_scripts)
+
+    max_ratio = float(lsc_cfg.get("max_unexpected_script_ratio", 0.05))
+
+    # Import here to avoid circular-ish module load at startup; the import
+    # is cheap (stdlib only) and only fires when the check runs.
+    from .utils.script_detector import unexpected_script_ratio
+
+    ratio, _ = unexpected_script_ratio(text, set(expected_list))
+    return ratio > max_ratio
 
 
 def _enrich_with_vision(
@@ -888,6 +996,11 @@ def _enrich_with_vision(
     triage_cfg = get_nested(config, "parsing.vision.triage", {})
     triage_enabled = triage_cfg.get("enabled", False)
 
+    # Document-level language (already detected earlier in the pipeline or
+    # declared via parsing.language_detection). Feeds the language-script
+    # consistency check — None means "language unknown, skip that check".
+    doc_language = parse_result.metadata.get("language") if parse_result.metadata else None
+
     # Global Vision page cap — prevents runaway API cost on huge documents.
     # null = no limit (use with caution on large documents).
     max_vision_raw = get_nested(config, "parsing.vision.max_pages", 50)
@@ -901,7 +1014,9 @@ def _enrich_with_vision(
         if not page_data.image_path:
             no_image += 1
             continue
-        if triage_enabled and _should_skip_vision(page_data, structured_per_page, triage_cfg):
+        if triage_enabled and _should_skip_vision(
+            page_data, structured_per_page, triage_cfg, doc_language
+        ):
             triage_skipped += 1
             continue
         if max_vision_pages is not None and len(vision_tasks) >= max_vision_pages:
@@ -1266,6 +1381,23 @@ def process_single_file(
             parse_result.markdown, config,
         )
 
+    # --- Phase 1.2.5: Generic Markdown table-row denoising (all other formats) ---
+    # Docling expands merged table cells by repeating the same value across
+    # every column a merge spans. A single PDF cell spanning 10 columns becomes
+    # `| foo | foo | foo | foo | foo | foo | foo | foo | foo | foo |` — 10×
+    # the token cost with zero extra information. The xlsx path above already
+    # handles this; this block applies the same row-level dedup to PDF / DOCX
+    # / PPTX / HTML where Docling's Markdown output has the same artefact.
+    #
+    # Gated by its own config key (parsing.markdown.dedup_table_rows, default
+    # true) so any user who genuinely wants Docling's raw output can disable
+    # it without touching the xlsx path.
+    elif (
+        parse_result.markdown
+        and get_nested(config, "parsing.markdown.dedup_table_rows", True)
+    ):
+        parse_result.markdown = _denoise_markdown_table_rows(parse_result.markdown)
+
     # --- Phase 1.3: Ensure page images for Vision (formats without native page rendering) ---
     # All three Office formats route through the same LibreOffice → PDF → screenshots
     # backend. Each has its own config section so limits can be tuned per format.
@@ -1282,13 +1414,18 @@ def process_single_file(
     # Vision so the prompt can reference already-extracted data.
     run_post_parse_hooks(file_path, parse_result, config, phase="post_parse")
 
+    # Detect language BEFORE Vision so the triage step can use it (the
+    # language-script consistency check in Vision triage needs to know the
+    # declared language to whitelist expected scripts). For a document whose
+    # first page is garbled but the rest is clean Japanese, the full-document
+    # detection still correctly yields "ja" — exactly the signal the
+    # per-page script check needs.
+    if "language" not in parse_result.metadata:
+        parse_result.metadata["language"] = _detect_language(parse_result.markdown)
+
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):
         _enrich_with_vision(parse_result, config)
-
-    # Detect language early (so frontmatter and chunks both have it)
-    if "language" not in parse_result.metadata:
-        parse_result.metadata["language"] = _detect_language(parse_result.markdown)
 
     # --- Phase 1.6: Pre-write hooks (post-Vision, pre-frontmatter) ---
     # Hooks that enrich metadata without touching Vision (e.g. exiftool

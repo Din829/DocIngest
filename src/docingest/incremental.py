@@ -105,11 +105,15 @@ def compute_cache_key(file_path: Path, sample_size: int = 8192) -> str:
 # Changing output.dir or performance.parallel_files does NOT invalidate cache.
 _RELEVANT_CONFIG_PATHS = [
     "parsing.engine",
+    "parsing.markdown.dedup_table_rows",   # generic table-row dedup toggle
     "parsing.ocr.engine",
     "parsing.ocr.languages",
     "parsing.ocr.force",
     "parsing.vision.enabled",
     "parsing.vision.image_dpi",
+    "parsing.vision.triage",            # triage thresholds affect which pages
+                                        # get Vision enrichment → cached output
+                                        # changes when any triage knob changes
     "parsing.docx.vision_page_images",
     "parsing.docx.max_page_images",
     "parsing.docx.max_image_pixels",
@@ -140,11 +144,13 @@ _RELEVANT_CONFIG_PATHS = [
     "chunking.auto",
     "chunking.protection",
     "chunking.enrichment.path_injection",
+    "models.defaults.max_response_tokens",  # global fallback cap — changing it
+                                            # may enlarge any task's output
     "models.vision.primary.provider",
     "models.vision.primary.model",
     "models.vision.fallback.provider",
     "models.vision.fallback.model",
-    "models.vision.max_response_tokens",   # output cap affects content
+    "models.vision.max_response_tokens",   # per-task override, affects content
     "parsing.pdf.vision",                  # per-format Vision overrides:
     "parsing.pptx.vision",                 # entire subtree, since model/dpi/
     "parsing.docx.vision",                 # max_tokens any change → re-run

@@ -136,7 +136,7 @@ def refine_single(
     max_output = get_nested(config, "refine.max_output_tokens", 8000)
 
     try:
-        refined = text_completion(
+        refined, finish_reason = text_completion(
             prompt=content,
             system_prompt=system_prompt,
             model_config=model_config,
@@ -152,6 +152,21 @@ def refine_single(
         result["skipped"] = True
         result["warning"] = "LLM returned empty response"
         return result
+
+    # Surface truncation so users know the rewritten text is incomplete.
+    # Refine output is a standalone Markdown file (not consumed by other
+    # tools), so we warn + append a marker rather than retry — preserves
+    # what the LLM did produce while making the state obvious.
+    if finish_reason == "length":
+        result["warning"] = (
+            f"Refine output was truncated (finish_reason=length); "
+            f"increase refine.max_output_tokens (current={max_output:,})."
+        )
+        logger.warning(
+            f"Refine truncated for {source_path.name}: "
+            f"max_output_tokens={max_output:,} was not enough."
+        )
+        refined = refined.rstrip() + "\n\n<!-- refine-truncated: output hit max_output_tokens -->\n"
 
     # Write output — subdirectory per skill to avoid overwrite
     readable_dir_name = get_nested(config, "refine.output_dir", "readable")

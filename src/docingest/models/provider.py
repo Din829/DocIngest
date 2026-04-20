@@ -27,6 +27,49 @@ from .token_tracker import token_tracker
 litellm.suppress_debug_info = True
 
 
+# Hard fallback used only when neither model_config nor an explicit caller
+# argument specifies max_response_tokens. Every real caller should have
+# models.defaults.max_response_tokens populated from config/default.yaml;
+# this constant guards against misconfigured tests / callers only.
+_HARD_FALLBACK_MAX_TOKENS = 32768
+
+
+def resolve_max_tokens(
+    model_config: dict[str, Any] | None,
+    explicit: int | None = None,
+) -> int:
+    """
+    Resolve the max_response_tokens to use for an LLM call.
+
+    Priority (first non-None wins):
+      1. explicit caller argument
+      2. model_config["max_response_tokens"]   (per-task override)
+      3. model_config["_defaults"]["max_response_tokens"]  (global default
+         injected by load_config so every task inherits models.defaults)
+      4. _HARD_FALLBACK_MAX_TOKENS              (safety net)
+
+    Keeping this as the single source of truth means future tasks add no new
+    hardcoded numbers — just omit max_tokens and they inherit automatically.
+    """
+    if explicit is not None:
+        return int(explicit)
+    if model_config:
+        if model_config.get("max_response_tokens") is not None:
+            return int(model_config["max_response_tokens"])
+        defaults = model_config.get("_defaults") or {}
+        if defaults.get("max_response_tokens") is not None:
+            return int(defaults["max_response_tokens"])
+    return _HARD_FALLBACK_MAX_TOKENS
+
+
+def _extract_finish_reason(response) -> str:
+    """Best-effort extraction of finish_reason from a litellm response."""
+    try:
+        return str(response.choices[0].finish_reason or "")
+    except (AttributeError, IndexError):
+        return ""
+
+
 def _record_usage(response, model_name: str) -> None:
     """Extract usage from litellm response and record to tracker."""
     usage = getattr(response, "usage", None)
@@ -73,7 +116,7 @@ def describe_image(
     image_path: Path | str,
     prompt: str = "Describe this image in detail. If it's a chart or graph, extract all data points and trends.",
     model_config: dict[str, Any] | None = None,
-    max_tokens: int = 32768,
+    max_tokens: int | None = None,
 ) -> str:
     """
     Send an image to a Vision model and get a text description.
@@ -123,6 +166,7 @@ def describe_image(
     }]
 
     # Try primary, then fallback
+    effective_max_tokens = resolve_max_tokens(model_config, max_tokens)
     models_to_try = _build_model_chain(model_config)
     last_error = None
 
@@ -136,7 +180,7 @@ def describe_image(
             response = litellm.completion(
                 model=model_name,
                 messages=messages,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content
@@ -159,21 +203,28 @@ def text_completion(
     prompt: str,
     system_prompt: str = "",
     model_config: dict[str, Any] | None = None,
-    max_tokens: int = 500,
-) -> str:
+    max_tokens: int | None = None,
+) -> tuple[str, str]:
     """
     Send a text prompt to an LLM and get a response.
 
-    Used for: AI-assisted chunking, contextual summary, etc.
+    Used for: AI-assisted chunking, knowledge_map summary/guide, refine, etc.
 
     Args:
         prompt: The user prompt.
         system_prompt: Optional system instruction.
         model_config: Model config dict with 'primary' and optional 'fallback'.
-        max_tokens: Maximum response length.
+            May also carry 'max_response_tokens' (per-task override) and a
+            '_defaults' subdict for inherited global defaults.
+        max_tokens: Explicit cap; when None (default), resolve_max_tokens()
+            derives from model_config or global defaults.
 
     Returns:
-        Model response text.
+        (content, finish_reason) — finish_reason is the litellm-reported
+        stop reason ("stop" | "length" | "content_filter" | ""). Callers
+        MUST check for "length" before trusting the content: an LLM that
+        stops on "length" has been cut off and may have emitted a syntactically
+        incomplete response (e.g. unterminated YAML list).
 
     Raises:
         RuntimeError: If both primary and fallback fail.
@@ -183,6 +234,7 @@ def text_completion(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
+    effective_max_tokens = resolve_max_tokens(model_config, max_tokens)
     models_to_try = _build_model_chain(model_config)
     last_error = None
 
@@ -196,11 +248,12 @@ def text_completion(
             response = litellm.completion(
                 model=model_name,
                 messages=messages,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content
-            return content.strip() if content else ""
+            finish_reason = _extract_finish_reason(response)
+            return (content.strip() if content else ""), finish_reason
         except Exception as e:
             last_error = e
             continue

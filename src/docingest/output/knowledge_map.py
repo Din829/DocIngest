@@ -161,6 +161,40 @@ def build_stage1(
 # Stage 2: AI summary (one call, reads only structure)
 # ---------------------------------------------------------------------------
 
+# Required fields for every search_guide entry. A missing field is almost
+# always a symptom of LLM truncation — dropping the incomplete entry is
+# safer than writing a half-filled record downstream tools will parse wrong.
+_SEARCH_GUIDE_REQUIRED = frozenset({"query_type", "strategy", "target_files", "examples"})
+
+
+def _validate_search_guide(raw: Any) -> tuple[list[dict[str, Any]], int]:
+    """
+    Filter a search_guide list to well-formed entries only.
+
+    Returns (valid_entries, dropped_count). An entry is kept only when it
+    is a dict containing every field in _SEARCH_GUIDE_REQUIRED with a
+    non-empty value. This protects downstream readers from the
+    truncation-artifact case where the last entry of an LLM-generated list
+    ends mid-field.
+    """
+    if not isinstance(raw, list):
+        return [], 0
+    valid: list[dict[str, Any]] = []
+    dropped = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            dropped += 1
+            continue
+        if not _SEARCH_GUIDE_REQUIRED.issubset(entry.keys()):
+            dropped += 1
+            continue
+        if any(entry[k] in (None, "", [], {}) for k in _SEARCH_GUIDE_REQUIRED):
+            dropped += 1
+            continue
+        valid.append(entry)
+    return valid, dropped
+
+
 def enrich_with_ai(
     knowledge_map: dict[str, Any],
     config: dict[str, Any],
@@ -169,6 +203,14 @@ def enrich_with_ai(
     Add AI-generated summary and search guide to the knowledge map.
 
     Sends ONLY structure info to AI (~3K tokens), not chunk content.
+
+    Three layers of protection against LLM output issues:
+      L1 (config) — token budget inherited from models.defaults, no hardcode.
+      L2 (retry)  — when finish_reason is "length", retry once with a larger
+                    budget (models.defaults.retry_max_tokens) if the config
+                    opts in via retry_on_truncation.
+      L3 (schema) — drop search_guide entries missing required fields, so a
+                    truncated tail never pollutes downstream consumers.
     """
     from ..models.provider import text_completion
 
@@ -214,23 +256,67 @@ search_guide:
 """
 
     model_config = get_nested(config, "models.chunking_assist", {})
+    defaults = get_nested(config, "models.defaults", {}) or {}
+    retry_on_truncation = bool(defaults.get("retry_on_truncation", True))
 
     try:
-        response = text_completion(
+        response, finish_reason = text_completion(
             prompt=prompt,
             model_config=model_config,
-            max_tokens=2000,
+            # max_tokens=None → resolve_max_tokens() uses models.chunking_assist
+            # or models.defaults.max_response_tokens from config.
         )
 
-        # Parse AI response as YAML
-        ai_data = yaml.safe_load(response)
-        if isinstance(ai_data, dict):
-            if "summary" in ai_data:
-                knowledge_map["summary"] = ai_data["summary"]
-            if "search_guide" in ai_data:
-                knowledge_map["search_guide"] = ai_data["search_guide"]
-        else:
-            logger.warning("AI response was not valid YAML dict, skipping")
+        # L2: retry once with a bigger budget if the LLM was cut off.
+        # retry_max_tokens is independent from the default budget so retries
+        # can reach well beyond the normal cap without affecting steady-state
+        # cost. Pass-through keeps config-driven — no magic numbers here.
+        if finish_reason == "length" and retry_on_truncation:
+            retry_budget = defaults.get("retry_max_tokens")
+            logger.warning(
+                "AI summary truncated (finish_reason=length). "
+                f"Retrying with max_tokens={retry_budget}."
+            )
+            response, finish_reason = text_completion(
+                prompt=prompt,
+                model_config=model_config,
+                max_tokens=retry_budget,
+            )
+            if finish_reason == "length":
+                logger.warning(
+                    "AI summary still truncated after retry. "
+                    "Incomplete search_guide entries will be dropped."
+                )
+
+        # Parse AI response as YAML — tolerate truncated tail by
+        # catching YAMLError and falling back to Stage 1 data.
+        try:
+            ai_data = yaml.safe_load(response)
+        except yaml.YAMLError as e:
+            logger.warning(
+                f"AI response was not parseable YAML ({e}). "
+                "Stage 1 data preserved."
+            )
+            return knowledge_map
+
+        if not isinstance(ai_data, dict):
+            logger.warning("AI response was not a YAML dict, skipping.")
+            return knowledge_map
+
+        if "summary" in ai_data and ai_data["summary"]:
+            knowledge_map["summary"] = ai_data["summary"]
+
+        # L3: schema-filter search_guide so incomplete entries never reach
+        # the output file.
+        if "search_guide" in ai_data:
+            valid_guide, dropped = _validate_search_guide(ai_data["search_guide"])
+            if dropped:
+                logger.warning(
+                    f"Dropped {dropped} incomplete search_guide entr"
+                    f"{'y' if dropped == 1 else 'ies'} (missing required fields)."
+                )
+            if valid_guide:
+                knowledge_map["search_guide"] = valid_guide
 
     except Exception as e:
         logger.warning(f"AI summary generation failed: {e}. Stage 1 data preserved.")
