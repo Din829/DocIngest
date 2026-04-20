@@ -115,6 +115,15 @@ class IndexBuilder:
         if metadata.get("has_images"):
             entry["has_images"] = True
 
+        # Per-element PDF coordinates (Docling bounding boxes). Stored per
+        # file here rather than duplicated into every chunk's metadata —
+        # the data is inherently per-file (keyed by page number), and
+        # copying it into hundreds of chunks inflated chunks.jsonl ~3x.
+        # RAG applications that highlight original PDF content should
+        # look this up from index.json by matching chunk.metadata.source.
+        if metadata.get("element_boxes"):
+            entry["element_boxes"] = metadata["element_boxes"]
+
         self.files.append(entry)
         self.total_chunks += chunks_count
         self.total_tokens += tokens_est

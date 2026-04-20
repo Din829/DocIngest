@@ -10,7 +10,7 @@ Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → pa
 |---|---|
 | `sources/*.md` | Clean Markdown with frontmatter (Agentic Search, grep/glob) |
 | `chunks.jsonl` | Chunked text with metadata (RAG vector search) |
-| `index.json` | File directory (Agent file discovery) |
+| `index.json` | File directory (Agent file discovery) + per-file PDF bounding boxes |
 | `knowledge_map.yaml` + `knowledge_search.SKILL.md` | Auto-generated search guide |
 | `quality_report.json` | Vision accuracy health check (`[?]` + `[unreadable]` scan) |
 | `readable/*.md` | Human-readable version (optional, via `refine`) |
@@ -263,7 +263,7 @@ export DOCINGEST__parsing__audio__language=ja
 - **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
 - **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Eight-layer defence for damaged pages: `glyph<` / `&lt;` CID markers, U+FFFD ratio, complex-table density, CJK mixed-script anomaly, **language-script consistency** (new) — catches CMap failures that produce CLEAN but WRONG Unicode (e.g. Bengali/Thai/Tibetan chars on a Japanese-declared document; the other checks miss this because the output is legal Unicode). Whitelist per language (ja/zh/en/ko by default), add a language = edit `parsing.vision.triage.language_script_check.expected_scripts` — no code change. Default ON (`parsing.vision.triage.enabled`).
-- **Bounding boxes** — per-element PDF coordinates extracted from Docling for RAG source citation and highlighting.
+- **Bounding boxes** — per-element PDF coordinates extracted from Docling for RAG source citation and highlighting. Exposed per file in `index.json` (`files[].element_boxes[<page_no>] = [{label, bbox, text_preview}, ...]`); RAG apps look them up by matching `chunk.metadata.source` → index entry. Toggle via `output.include_bounding_boxes`.
 - **Hidden text detection** — flags invisible/background content via Docling ContentLayer analysis.
 - **Sensitive data sanitization** — opt-in PII masking (email, URL, credit card with Luhn validation, IPv4, JP phone). High-precision rules only, no name detection. Default OFF (`sanitize.enabled`).
 - **Incremental cache** — content-addressed, per-file, crash-safe. 100 docs + 1 new → only 1 re-runs.

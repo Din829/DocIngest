@@ -63,6 +63,11 @@ class FileResult:
     tokens_estimated: int = 0
     parse_time_ms: int = 0
     chunk_time_ms: int = 0
+    # Per-element PDF coordinates from Docling — page_no -> list of
+    # {label, bbox, text_preview}. Piped through FileResult so it reaches
+    # index_builder without going through the sources/*.md frontmatter
+    # (which only holds small scalars). None when Docling didn't emit any.
+    element_boxes: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1467,12 +1472,24 @@ def process_single_file(
     if chunker and get_nested(config, "chunking.enabled", True):
         t1 = time.monotonic()
 
-        # Build document metadata for chunker
+        # Build document metadata for chunker.
+        # element_boxes is a per-file structure (page → bbox list) that used
+        # to end up copied into every chunk via **parse_result.metadata.
+        # Result: a 186 KB bbox dict was duplicated into all 300+ chunks of
+        # a 9-PDF corpus, making chunks.jsonl ~3x larger than needed. It is
+        # now written once per file to index.json instead (see
+        # index_builder.py), and excluded from chunk metadata here. The
+        # public "per-element coordinates for RAG citation" guarantee is
+        # preserved — only the *location* of the data changed.
+        parse_meta_for_chunks = {
+            k: v for k, v in parse_result.metadata.items()
+            if k != "element_boxes"
+        }
         doc_metadata = {
             "source": result.output_path,
             "original_file": str(file_path.name),
             "format": result.format,
-            **parse_result.metadata,
+            **parse_meta_for_chunks,
         }
 
         # Enrich metadata: language detection (if not already set)
@@ -1521,6 +1538,13 @@ def process_single_file(
 
         result.chunks_count = len(chunks)
         result.chunk_time_ms = int((time.monotonic() - t1) * 1000)
+
+    # Carry per-file bounding boxes through to index_builder. Lives on
+    # FileResult (not in the .md frontmatter which only holds scalars)
+    # so index.json can expose them per-file without re-parsing Docling.
+    eb = parse_result.metadata.get("element_boxes")
+    if eb:
+        result.element_boxes = eb
 
     return result, chunks
 
@@ -1601,6 +1625,12 @@ def _make_index_parse_result(
         "title": Path(file_result.original_file).stem,
     }
     metadata.update(_parse_frontmatter(markdown))
+
+    # element_boxes is not a scalar and was never written to the .md
+    # frontmatter, so pipe it through FileResult directly. IndexBuilder
+    # picks it up and writes a per-file entry into index.json.
+    if file_result.element_boxes:
+        metadata["element_boxes"] = file_result.element_boxes
 
     return ParseResult(
         markdown=markdown,

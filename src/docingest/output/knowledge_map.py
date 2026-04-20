@@ -119,6 +119,18 @@ def build_stage1(
     # Docling internal group names that carry no semantic meaning
     _noise_re = re.compile(r"^(group|slide-\d+|list)$", re.IGNORECASE)
 
+    # Pre-index chunks by source path. Before this the per-file loop did
+    # `[c for c in chunks if c.metadata.source == path]` inside the loop,
+    # giving an O(F × C) scan (100 files × 10k chunks = 1M comparisons).
+    # Building the index once up front reduces that to O(F + C). Chunks
+    # whose source does not appear in index_data["files"] remain absent
+    # from the output — same behaviour as the previous scan.
+    chunks_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for c in chunks:
+        src = c.get("metadata", {}).get("source") or ""
+        if src:
+            chunks_by_source[src].append(c)
+
     # --- File-level info ---
     files_info: list[dict[str, Any]] = []
     all_keywords_by_file: dict[str, Counter] = defaultdict(Counter)
@@ -134,7 +146,7 @@ def build_stage1(
         ]
 
         # Collect sheet names and title_paths from chunks
-        file_chunks = [c for c in chunks if c.get("metadata", {}).get("source") == path]
+        file_chunks = chunks_by_source.get(path, [])
         sheet_names = sorted(set(
             c["metadata"]["sheet_name"]
             for c in file_chunks
