@@ -54,10 +54,14 @@ def main(
         help="Input files or directories to process.",
         exists=True,
     ),
-    output: Path = typer.Option(
-        "./knowledge",
+    output: Optional[Path] = typer.Option(
+        None,
         "-o", "--output",
-        help="Output directory.",
+        help=(
+            "Output directory. When omitted and a SINGLE input is given, "
+            "auto-derives to ./knowledge/<input_name>/ so each run lands in "
+            "its own folder. Multi-input / URL runs fall back to ./knowledge/."
+        ),
     ),
     config_file: Optional[Path] = typer.Option(
         None,
@@ -86,6 +90,21 @@ def main(
     ),
 ) -> None:
     """Process documents for RAG and Agentic Search."""
+
+    # Resolve output directory.
+    # When the user explicitly passed -o, honour it verbatim — no surprises
+    # for existing scripts. When it's omitted, try to auto-derive a
+    # per-run subfolder so two consecutive runs don't mingle their outputs
+    # in the same ./knowledge/ root (the footgun we hit in practice). Only
+    # activates for a *single* local input — mixed / URL runs are
+    # intentionally left at the default root because there's no clean name
+    # to derive. Same input rerun → same folder, so incremental cache
+    # still works.
+    if output is None:
+        if len(inputs) == 1 and inputs[0].exists():
+            output = Path("./knowledge") / inputs[0].stem
+        else:
+            output = Path("./knowledge")
 
     # Build CLI overrides
     cli_overrides: dict = {}
