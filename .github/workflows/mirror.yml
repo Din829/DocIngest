@@ -1,0 +1,40 @@
+name: Mirror to ai-assets-spark-hub
+
+# Pushes every branch / tag change in Din829/DocIngest across to
+# ai-assets-spark-hub/DocIngest, keeping the two repositories in sync.
+# Requires a repository secret MIRROR_TOKEN — a PAT (classic `repo` scope
+# or a fine-grained token with Contents: write on the mirror repo).
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  # Allow kicking off manually from the Actions tab if the mirror drifts
+  # for any reason (token rotation, conflict, etc.).
+  workflow_dispatch:
+
+concurrency:
+  # Serialize mirror pushes so two rapid commits don't race each other.
+  group: mirror-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          # --mirror needs every ref; shallow clone would drop tags/branches.
+          fetch-depth: 0
+
+      - name: Push --mirror to ai-assets-spark-hub/DocIngest
+        env:
+          MIRROR_TOKEN: ${{ secrets.MIRROR_TOKEN }}
+        run: |
+          if [ -z "$MIRROR_TOKEN" ]; then
+            echo "::error::MIRROR_TOKEN secret is not set. Add a PAT with push access to the mirror repo."
+            exit 1
+          fi
+          git remote add mirror "https://x-access-token:${MIRROR_TOKEN}@github.com/ai-assets-spark-hub/DocIngest.git"
+          git push mirror --mirror
