@@ -1,7 +1,7 @@
 """
 Slide chunker — 1 slide = 1 chunk (PPT best practice).
 
-Boundary detection priority (from DESIGN.md):
+Boundary detection priority (see ARCHITECTURE.md §5.6):
   1. Docling slide separator markers (if present)
   2. Horizontal rule "---" pattern
   3. "# Slide N" / "## スライド N" heading pattern

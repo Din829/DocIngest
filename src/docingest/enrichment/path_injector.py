@@ -1,7 +1,7 @@
 """
 Path injector — prepends source path + title path to each chunk.
 
-This is the "must-do, zero-cost" enrichment from DESIGN.md.
+This is the "must-do, zero-cost" enrichment (see ARCHITECTURE.md §5.6 Chunking).
 Makes every chunk self-contained: even without surrounding context,
 a reader knows where this chunk came from.
 

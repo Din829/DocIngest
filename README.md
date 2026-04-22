@@ -78,11 +78,13 @@ docingest run ./docs/ archive.zip "https://youtube.com/..." -o ./knowledge/
 
 Options:
 ```
--o, --output PATH    Output directory (default: ./knowledge)
+-o, --output PATH    Output directory (default: ./knowledge/<input-name>/ for single input, ./knowledge/ for mixed)
 -c, --config PATH    Project config YAML
---strategy TEXT      auto | heading | recursive  (chunking strategy)
+--strategy TEXT      Override chunking strategy: auto | heading | recursive
+                     (auto picks slide/sheet/timestamp/whole by file format)
 --no-chunks          Only output Markdown, skip chunks.jsonl
---parallel INTEGER   Parallel file workers
+--parallel INTEGER   Worker count for Vision API calls and ASR segmentation
+                     (file-level parallelism is not yet implemented)
 --force              Ignore cache, full rebuild
 ```
 
@@ -130,30 +132,99 @@ print(f"{result.successful}/{result.total_files} files, {result.total_chunks} ch
 
 ### MCP Server (for AI Agents)
 
-Exposes DocIngest as 6 MCP tools: inspect, run, refine, search_knowledge, list_knowledge, read_source.
+Thin MCP wrapper — exposes DocIngest as tools for AI Agents (Claude / GPT / etc.).
+`mcp_server.py` is a transport layer only; every tool is a ~10-line wrapper around the corresponding DocIngest Python API.
 
+**Install:**
 ```bash
 pip install -e ".[mcp]"
-python -m docingest.mcp_server              # stdio (Claude Desktop / Claude Code)
-python -m docingest.mcp_server --transport sse   # SSE (web clients)
 ```
 
-**Claude Desktop** — add to `claude_desktop_config.json` (Settings > Developer > Edit Config):
+**Run:**
+```bash
+python -m docingest.mcp_server                    # stdio (Claude Desktop, Claude Code, VS Code Copilot)
+python -m docingest.mcp_server --transport sse    # SSE (web clients)
+```
+
+**Available tools** (every tool accepts optional `config_overrides` for dynamic behavior):
+
+| Tool | Purpose | Backed by |
+|---|---|---|
+| `inspect` | Pre-flight check (size, pages, cost estimate) | `inspect_files()` |
+| `run` | Process documents → knowledge base | `run_pipeline()` |
+| `refine` | AI-powered Markdown cleanup | `refine_files()` |
+| `search_knowledge` | Keyword search on processed knowledge base | grep on `sources/*.md` |
+| `list_knowledge` | List knowledge base contents (files, stats) | reads `index.json` |
+| `read_source` | Read full content of a source Markdown file | reads `sources/*.md` |
+
+**Client configuration:**
+
+*Claude Desktop* — edit `claude_desktop_config.json` (Settings > Developer > Edit Config), restart Claude fully (quit, not just close window):
 ```json
-{ "mcpServers": { "docingest": { "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+{
+  "mcpServers": {
+    "docingest": {
+      "command": "python",
+      "args": ["-m", "docingest.mcp_server"],
+      "cwd": "/path/to/DocIngest"
+    }
+  }
+}
 ```
 
-**Claude Code** — add to `.mcp.json` at project root (shared) or `~/.claude.json` (personal):
+*Claude Code* — add to `.mcp.json` at project root (shared via git) or `~/.claude.json` (personal, all projects):
 ```json
-{ "mcpServers": { "docingest": { "type": "stdio", "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+{
+  "mcpServers": {
+    "docingest": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "docingest.mcp_server"]
+    }
+  }
+}
 ```
 
-**VS Code (Copilot)** — add to `.vscode/mcp.json` (note: key is `servers`, not `mcpServers`):
+*VS Code (Copilot)* — add to `.vscode/mcp.json` (key is `servers`, **not** `mcpServers`):
 ```json
-{ "servers": { "docingest": { "type": "stdio", "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+{
+  "servers": {
+    "docingest": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["-m", "docingest.mcp_server"]
+    }
+  }
+}
+```
+MCP tools appear in Copilot Agent mode (Ctrl+Alt+I).
+
+**Typical Agent workflow:**
+```
+1. inspect(["./new_docs/"])                      → size / pages / cost estimate
+2. run(["./new_docs/"])                          → incremental processing
+3. list_knowledge("./knowledge")                 → browse contents
+4. search_knowledge("契約", "./knowledge")        → find by keyword
+5. read_source("contract.md")                    → read full file
+6. refine(["./knowledge/sources/contract.md"])   → optional AI cleanup
 ```
 
-See [MCP_README.md](MCP_README.md) for full tool descriptions, examples, and modification guide.
+**Config overrides from Agent** — override any config path per call without touching files:
+
+```python
+run(["docs/"], config_overrides={
+    "parsing": {"vision": {"max_pages": 200, "triage": {"enabled": True}}},
+    "chunking": {"strategy": "heading", "max_tokens": 1024},
+    "sanitize": {"enabled": True},
+})
+```
+
+**Adding a new tool** — open `src/docingest/mcp_server.py`, add a `@mcp.tool` function; FastMCP auto-generates the schema from type hints + docstring. See ARCHITECTURE.md §3.2 for the code map.
+
+**Troubleshooting:**
+- "Module not found" → `pip install -e ".[mcp]"`
+- API key errors → set `GEMINI_API_KEY` / `DASHSCOPE_API_KEY` in `.env` or environment
+- Large files hang → run `inspect` first and use `config_overrides` to raise `max_pages`
 
 ## Configuration
 
@@ -249,6 +320,37 @@ export DOCINGEST__models__vision__primary__model=gemini-3-pro-preview
 export DOCINGEST__parsing__audio__language=ja
 ```
 
+## Pipeline at a Glance
+
+```
+input files / dirs / URLs / ZIPs
+      │
+      ▼
+discover_files  (ZIP expansion, yt-dlp for URLs)
+      │
+      ▼
+partition by incremental cache  (skip unchanged files)
+      │
+      ▼
+for each new file:
+      ├─ pre_parse hook        DOCX OMML → LaTeX
+      ├─ Docling / Media / Text
+      ├─ garbled fallback      glyph< → pymupdf
+      ├─ Excel denoise         merged cells, sparse rows
+      ├─ LibreOffice pages     xlsx/docx/pptx → PDF → screenshots
+      ├─ post_parse hook       PPTX chart direct-read
+      ├─ Vision enrichment     per-page, 8-layer triage, parallel
+      ├─ pre_write hook        exiftool / sanitize
+      ├─ Vision dedup          keep the better of Docling / Vision
+      ├─ write sources/*.md    + assets/
+      └─ chunk + path-inject   auto / heading / slide / sheet / timestamp
+      │
+      ▼
+index.json + chunks.jsonl + knowledge_map.yaml + quality_report.json
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rationale, and how to add new formats / hooks / chunkers.
+
 ## Key Features
 
 - **20+ formats** via Docling (PDF, DOCX, PPTX, XLSX, HTML, images, Markdown, ...)
@@ -276,51 +378,7 @@ export DOCINGEST__parsing__audio__language=ja
 
 ## Project Layout
 
-```
-config/default.yaml              # Default configuration
-skills/                          # SKILL templates (refine prompts)
-src/docingest/
-├── cli.py                       # CLI: run + inspect + refine + doctor
-├── config.py                    # YAML + env var loader
-├── pipeline.py                  # Main pipeline orchestration
-├── incremental.py               # Content-addressed output cache
-├── refine.py                    # AI Refine standalone command
-├── inspect.py                   # Pre-flight document inspection
-├── doctor.py                    # Environment health check
-├── mcp_server.py                # MCP Server (6 Agent tools)
-├── parsers/                     # Phase 1: document parsing
-│   ├── docling_parser.py        # Docling adapter (15+ formats)
-│   ├── media_parser.py          # Audio/video (subtitle + ASR)
-│   ├── text_parser.py           # Plain text fallback
-│   └── vision.py                # Per-page Vision AI
-├── chunkers/                    # Phase 3: smart chunking
-│   ├── recursive.py / heading.py / slide.py / sheet.py
-│   └── timestamp.py             # Audio transcript chunking
-├── hooks/                       # Format-specific enrichment
-│   ├── pptx_chart.py            # Chart data direct-read
-│   ├── docx_omml.py             # OMML → LaTeX
-│   ├── file_metadata.py         # Docling origin + exiftool
-│   ├── sanitize.py              # PII masking (email/URL/CC/IP/phone)
-│   └── _docx_math/              # OMML conversion (ported from MarkItDown)
-├── models/                      # LLM provider abstraction
-│   ├── provider.py              # Vision + text completion (litellm)
-│   ├── audio_provider.py        # ASR (DashScope / litellm)
-│   └── cache.py                 # AI call cache (diskcache)
-├── utils/                       # Cross-cutting utilities
-│   ├── binary_finder.py         # External tool discovery (3-platform)
-│   ├── zip_expander.py          # ZIP expansion + bomb protection
-│   ├── url_resolver.py          # yt-dlp URL download
-│   └── format_detector.py       # magika content detection
-├── enrichment/
-│   └── path_injector.py         # Chunk source path injection
-└── output/
-    ├── markdown_writer.py       # Markdown + frontmatter output
-    ├── chunks_writer.py         # chunks.jsonl output
-    ├── index_builder.py         # index.json generation
-    ├── knowledge_map.py         # Knowledge map + SKILL.md
-    ├── keyword_extractor.py     # SudachiPy / regex keyword extraction
-    └── quality_report.py        # Vision uncertainty scan
-```
+See [ARCHITECTURE.md §3.1](ARCHITECTURE.md) for the full annotated directory tree and §3.2 for a "I want to look at X → find it at Y" quick-navigation table.
 
 ## Testing
 
@@ -330,6 +388,7 @@ python tests/unit/test_config_override.py
 python tests/incremental/run_tests.py
 ```
 
-## Full Design
+## Documentation
 
-See [DESIGN.md](DESIGN.md) for architecture details and [MARKITDOWN_BORROW.md](MARKITDOWN_BORROW.md) for the MarkItDown reference analysis.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt
+- **[MARKITDOWN_BORROW.md](MARKITDOWN_BORROW.md)** — Historical log of features borrowed from MarkItDown (archived)

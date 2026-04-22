@@ -6,7 +6,7 @@ JSONL format is chosen for:
   - Appendable: easy to add chunks incrementally
   - Compatible with most RAG/embedding pipelines
 
-Each line follows the schema defined in DESIGN.md §6.10.
+Each line follows the chunk schema documented in ARCHITECTURE.md (see §5.6 Chunking).
 """
 
 from __future__ import annotations
