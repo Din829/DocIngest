@@ -136,6 +136,10 @@ def refine_single(
     max_output = get_nested(config, "refine.max_output_tokens", 8000)
 
     try:
+        # text_completion handles one-shot retry on finish_reason=="length"
+        # when models.defaults.retry_on_truncation is true (default). If
+        # finish_reason is still "length" after that, the retry budget
+        # (models.defaults.retry_max_tokens) was also exhausted.
         refined, finish_reason = text_completion(
             prompt=content,
             system_prompt=system_prompt,
@@ -153,17 +157,18 @@ def refine_single(
         result["warning"] = "LLM returned empty response"
         return result
 
-    # Surface truncation so users know the rewritten text is incomplete.
-    # Refine output is a standalone Markdown file (not consumed by other
-    # tools), so we warn + append a marker rather than retry — preserves
-    # what the LLM did produce while making the state obvious.
+    # Surface truncation when it survives the retry layer so users know
+    # the rewritten text is still incomplete. We warn + append a marker
+    # rather than failing — preserves what the LLM did produce while
+    # making the truncation state obvious in the output file itself.
     if finish_reason == "length":
         result["warning"] = (
-            f"Refine output was truncated (finish_reason=length); "
-            f"increase refine.max_output_tokens (current={max_output:,})."
+            f"Refine output was still truncated after retry; "
+            f"increase refine.max_output_tokens (current={max_output:,}) "
+            f"or models.defaults.retry_max_tokens."
         )
         logger.warning(
-            f"Refine truncated for {source_path.name}: "
+            f"Refine truncated for {source_path.name} even after retry: "
             f"max_output_tokens={max_output:,} was not enough."
         )
         refined = refined.rstrip() + "\n\n<!-- refine-truncated: output hit max_output_tokens -->\n"

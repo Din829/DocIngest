@@ -68,6 +68,17 @@ class FileResult:
     # index_builder without going through the sources/*.md frontmatter
     # (which only holds small scalars). None when Docling didn't emit any.
     element_boxes: dict[str, Any] | None = None
+    # Lifecycle status for this run — consumed by run_log to render a
+    # human-readable timeline. One of: "added" (new file, first time seen),
+    # "updated" (cache existed but invalidated), "cached" (hit, reused),
+    # "forced" (full rebuild via --force), "failed" (parse/chunk error).
+    # Empty string means the pipeline did not tag it (legacy / unit-test
+    # callers that bypass run_pipeline stay unaffected).
+    status: str = ""
+    # When status == "updated", why the cache was invalidated
+    # (e.g. "config changed", "source markdown missing"). Free-form string
+    # surfaced from incremental.is_cache_valid for diagnostic logging.
+    cache_reason: str = ""
 
 
 @dataclass
@@ -89,6 +100,12 @@ class PipelineResult:
     # Keys: total_prompt_tokens, total_completion_tokens, total_tokens,
     #       total_calls, total_cache_hits, by_model.
     token_usage: dict[str, Any] = field(default_factory=dict)
+    # Phase 0 safety check result (populated when safety.enabled and mode
+    # != "off"). Keys: mode, violations (list of {file, reasons}), summary
+    # ({total_files, total_pages, total_est_cost_usd}), acknowledged (bool),
+    # aborted (bool — only true when strict mode refused to run).
+    # Empty dict when safety is off or no violations occurred.
+    safety: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1643,6 +1660,8 @@ def run_pipeline(
     config: dict[str, Any],
     parser: BaseParser,
     chunker: BaseChunker | None = None,
+    *,
+    acknowledge_large: bool = False,
 ) -> PipelineResult:
     """
     Run the full DocIngest pipeline.
@@ -1652,9 +1671,18 @@ def run_pipeline(
         config: Merged configuration dict.
         parser: Parser instance.
         chunker: Chunker instance (None if chunking disabled).
+        acknowledge_large: When safety.mode == "strict" and the pre-run
+            budget check flags violations, set True to proceed anyway.
+            Ignored when safety is off or in warn mode. Callers (CLI's
+            --yes, MCP's acknowledge_large argument, or Python API users)
+            expose this flag; the default False preserves strict mode's
+            refuse-to-run behaviour.
 
     Returns:
-        PipelineResult with details of all processed files.
+        PipelineResult with details of all processed files. When safety
+        strict mode aborts the run, result.safety.aborted is True and
+        result.total_files reflects the discovered count while
+        result.successful and result.files stay empty.
     """
     t_start = time.monotonic()
 
@@ -1669,6 +1697,59 @@ def run_pipeline(
     if not files:
         pipeline_result.elapsed_ms = int((time.monotonic() - t_start) * 1000)
         return pipeline_result
+
+    # --- Phase 0: Safety budget check ---
+    # Runs BEFORE any parser / LLM call so over-budget files are surfaced
+    # before cost is incurred. Three modes:
+    #   off    — skipped entirely (legacy behaviour for this codepath).
+    #   warn   — log violations, continue.
+    #   strict — refuse unless acknowledge_large=True.
+    # Any failure inside the safety module is swallowed (see safety.py's
+    # try/except wrappers) so a Phase 0 bug can never block the pipeline.
+    safety_mode = str(get_nested(config, "safety.mode", "warn") or "warn").lower()
+    safety_enabled = get_nested(config, "safety.enabled", True)
+    if safety_enabled and safety_mode != "off":
+        try:
+            from .safety import check_budget, format_violations
+            violations, summary = check_budget(files, config)
+            # Keep the exposed safety dict light — don't pack per-file
+            # `infos` (which can be large) into PipelineResult. Callers
+            # that need per-file details can call inspect_files directly.
+            pipeline_result.safety = {
+                "mode": safety_mode,
+                "violations": violations,
+                "summary": {
+                    "total_files": summary["total_files"],
+                    "total_pages": summary["total_pages"],
+                    "total_est_cost_usd": summary["total_est_cost_usd"],
+                },
+                "acknowledged": bool(acknowledge_large),
+                "aborted": False,
+            }
+            if violations:
+                rendered = format_violations(violations)
+                if safety_mode == "strict" and not acknowledge_large:
+                    pipeline_result.safety["aborted"] = True
+                    _pipeline_logger.warning(
+                        f"Safety check (strict): run aborted — "
+                        f"{len(violations)} violation(s).\n{rendered}\n"
+                        f"Pass acknowledge_large=True (Python / MCP) or "
+                        f"--yes (CLI) to proceed."
+                    )
+                    pipeline_result.elapsed_ms = int(
+                        (time.monotonic() - t_start) * 1000
+                    )
+                    return pipeline_result
+                # warn, or strict + acknowledged → log and continue.
+                _pipeline_logger.warning(
+                    f"Safety check: {len(violations)} violation(s), mode="
+                    f"{safety_mode}"
+                    f"{' (acknowledged)' if acknowledge_large else ''} "
+                    f"— proceeding.\n{rendered}"
+                )
+        except Exception as e:
+            # Phase 0 is advisory; a bug here must not kill the pipeline.
+            _pipeline_logger.warning(f"Safety check failed, skipping: {e}")
 
     # Track used output filenames (for dedup across files)
     existing_names: set[str] = set()
@@ -1697,9 +1778,12 @@ def run_pipeline(
             f"Incremental: loaded {len(old_chunks_by_id)} existing chunks from {old_chunks_file.name}"
         )
 
-    # Partition files: cached vs. to_process
+    # Partition files: cached vs. to_process.
+    # to_process carries the prior meta (or None) and a cache-miss reason so
+    # run_log can distinguish "added" (no prior meta) from "updated" (meta
+    # existed but invalidated) and surface WHY the invalidation happened.
     cached_files: list[tuple[Path, dict[str, Any], str]] = []  # (path, meta, cache_key)
-    to_process: list[Path] = []
+    to_process: list[tuple[Path, dict[str, Any] | None, str]] = []  # (path, prior_meta, reason)
 
     if incremental_enabled and not force_rebuild:
         for file_path in files:
@@ -1707,12 +1791,12 @@ def run_pipeline(
                 cache_key = compute_cache_key(file_path)
             except (FileNotFoundError, PermissionError, OSError) as e:
                 _pipeline_logger.warning(f"Cannot hash {file_path.name}: {e}")
-                to_process.append(file_path)
+                to_process.append((file_path, None, "hash failed"))
                 continue
 
             meta = load_cached_meta(cache_dir, cache_key)
             if meta is None:
-                to_process.append(file_path)
+                to_process.append((file_path, None, ""))
                 continue
 
             valid, reason = is_cache_valid(meta, config_hash, output_dir, old_chunks_by_id)
@@ -1722,14 +1806,16 @@ def run_pipeline(
                 _pipeline_logger.debug(
                     f"Cache miss for {file_path.name}: {reason}"
                 )
-                to_process.append(file_path)
+                to_process.append((file_path, meta, reason))
 
         _pipeline_logger.info(
             f"Incremental: {len(cached_files)} cached, {len(to_process)} to process "
             f"(out of {len(files)} total)"
         )
     else:
-        to_process = list(files)
+        # Full-rebuild paths (incremental disabled, or --force). prior_meta
+        # stays None — run_log uses force_rebuild directly to tag "forced".
+        to_process = [(f, None, "") for f in files]
         if force_rebuild:
             _pipeline_logger.info("Incremental: --force flag set, full rebuild")
 
@@ -1745,6 +1831,7 @@ def run_pipeline(
             tokens_estimated=meta.get("index_entry", {}).get("tokens_estimated", 0),
             parse_time_ms=0,
             chunk_time_ms=0,
+            status="cached",
         )
         pipeline_result.files.append(file_result)
         pipeline_result.successful += 1
@@ -1775,7 +1862,7 @@ def run_pipeline(
                 _pipeline_logger.warning(f"Could not update meta for {file_path.name}: {e}")
 
     # --- Process uncached files: full pipeline ---
-    for file_path in to_process:
+    for file_path, prior_meta, cache_reason in to_process:
         file_result, file_chunks = process_single_file(
             file_path=file_path,
             parser=parser,
@@ -1784,6 +1871,20 @@ def run_pipeline(
             output_dir=output_dir,
             existing_names=existing_names,
         )
+
+        # Tag lifecycle status for run_log. Order matters:
+        #   failure wins → forced wins over added/updated (it's a full
+        #   rebuild regardless of prior state) → prior_meta distinguishes
+        #   "added" (first time) from "updated" (cache invalidated).
+        if not file_result.success:
+            file_result.status = "failed"
+        elif force_rebuild:
+            file_result.status = "forced"
+        elif prior_meta is None:
+            file_result.status = "added"
+        else:
+            file_result.status = "updated"
+            file_result.cache_reason = cache_reason
 
         pipeline_result.files.append(file_result)
 
@@ -1895,6 +1996,24 @@ def run_pipeline(
             _pipeline_logger.warning(f"Quality report generation failed: {e}")
 
     pipeline_result.elapsed_ms = int((time.monotonic() - t_start) * 1000)
+
+    # Run log: append-only timeline across runs. Independent of errors.json
+    # and quality_report.json (single-run snapshots overwritten each run) —
+    # log.md accumulates one section per run so users can see what changed
+    # and when. Writes after elapsed_ms is set so the timeline reflects the
+    # final state. Never raises — a log write failure leaves the pipeline
+    # result intact.
+    if get_nested(config, "run_log.enabled", True):
+        try:
+            from .output.run_log import append_run_entry
+            append_run_entry(
+                pipeline_result=pipeline_result,
+                output_dir=output_dir,
+                log_filename=get_nested(config, "run_log.output_file", "log.md"),
+                force_rebuild=force_rebuild,
+            )
+        except Exception as e:
+            _pipeline_logger.warning(f"Run log append failed: {e}")
 
     # Collect LLM API token usage
     from .models.token_tracker import token_tracker

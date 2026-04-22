@@ -496,8 +496,12 @@ chunking:
 # Performance
 # =============================================================================
 performance:
-  parallel_files: 4           # file-level parallelism
-  # Vision parallelism is set in parsing.vision.parallel_calls
+  parallel_files: 4           # Worker count shared by Vision per-page calls
+                              # and ASR per-segment transcription.
+                              # NOTE: file-level parallelism is not yet
+                              # implemented — the pipeline processes files
+                              # sequentially; this key only controls the
+                              # inner ThreadPoolExecutor pools.
 
 # =============================================================================
 # Error Handling
@@ -591,6 +595,102 @@ metadata:
 quality_report:
   enabled: true                       # scan after pipeline completes
   output_file: "quality_report.json"  # full report path (relative to output.dir)
+
+# =============================================================================
+# Run log (append-only pipeline timeline)
+# =============================================================================
+# Unlike errors.json / quality_report.json (per-run snapshots overwritten on
+# each run), log.md is the knowledge base's TIMELINE across runs — one section
+# appended per `docingest run` invocation, recording what was added, updated,
+# or failed, and when.
+#
+# The log is grep-friendly: every section header starts with
+# "## [<ISO timestamp>] run ...", so e.g.
+#   grep "^## \[" log.md | tail -5
+# yields the last five runs regardless of body length.
+#
+# Cached files stay silent in the body (only counted in the summary) so a
+# 100-file knowledge base with 1 new file produces 1 body line, not 100.
+# No-change runs still write a header so "did the pipeline run on <date>?"
+# is answerable from the log alone.
+#
+# Toggling enabled does NOT invalidate the content cache — run_log is
+# metadata about runs, not about file contents.
+run_log:
+  enabled: true           # master toggle
+  output_file: "log.md"   # relative to output.dir
+
+# =============================================================================
+# Safety — pre-run budget check (Phase 0)
+# =============================================================================
+# Runs BEFORE any parsing / LLM call. Flags files and per-run totals that
+# exceed configured thresholds and surfaces a structured violation report.
+#
+# Why not just file size (MB)?
+#   Disk size is a poor proxy for cost. A 100 MB PPTX with 20 slides is
+#   cheaper than a 5 MB PDF with 200 dense pages. Real cost drivers are:
+#     pages          → Vision API calls (PDF pages, PPTX slides)
+#     chars_est      → output markdown / token bulk (sampled for PDF)
+#     rows           → xlsx processing time
+#     duration_sec   → ASR cost (audio / video)
+#     est_cost_usd   → rough dollar estimate based on Vision model price
+#     size_mb        → last-resort guard for formats we can't introspect
+#
+# Modes:
+#   off    — skip Phase 0 entirely (legacy behaviour).
+#   warn   — (default) log violations but run anyway.
+#   strict — refuse to run; caller must raise a threshold or pass
+#            --yes (CLI) / acknowledge_large=true (Python API / MCP).
+#
+# MCP agents receive safety.violations in the run result, so they can
+# inspect them and retry with acknowledge_large=true. This mirrors MCP's
+# own elicitation/create pattern (confirm-on-expensive).
+#
+# Defaults below are tuned for small projects (the "对半" baseline —
+# roughly half of the industry-standard defaults like Anthropic's
+# 100-page vision cutoff). Raise them freely for larger workloads.
+safety:
+  enabled: true
+  mode: "warn"                  # off | warn | strict
+
+  # Per-file thresholds. A single file exceeding ANY of these is flagged.
+  # Set a field to null to disable that specific dimension.
+  per_file:
+    max_pages: 50               # PDF pages / PPTX slides / DOCX est-pages
+    max_chars_est: 250000       # Estimated text length (sampled for PDF)
+    max_rows: 20000             # xlsx / csv total rows
+    max_duration_sec: 900       # 15 min — audio / video
+    max_size_mb: 25             # Disk-size fallback
+    max_est_cost_usd: 1.0       # Dollar budget per file
+
+  # Per-run thresholds — protect against "many small files adding up".
+  per_run:
+    max_total_pages: 200
+    max_total_files: 50
+    max_total_est_cost_usd: 5.0
+
+  # Text-length estimation tuning for PDF.
+  # PyMuPDF's get_text() is fast but full scan of a 1000-page PDF still
+  # costs ~10 s. Sampling N pages and extrapolating keeps inspect <100 ms.
+  # Set enabled: false to force exact counts (slower, more precise).
+  sampling:
+    enabled: true
+    pdf_sample_pages: 3
+
+  # Rough per-call Vision price table in USD. Used to compute est_cost_usd.
+  # Not a live feed — update after provider pricing changes. Unknown
+  # models fall back to "_default". Prefix match works too, so
+  # "gemini-3-flash-preview" hits the "gemini-3-flash" entry.
+  vision_price_per_call:
+    gemini-3-flash-preview: 0.0002
+    gemini-3-flash: 0.0002
+    gemini-3-pro-preview: 0.002
+    gemini-3-pro: 0.002
+    gpt-5.4-mini: 0.005
+    gpt-4o: 0.008
+    gpt-4o-mini: 0.002
+    claude-sonnet: 0.006
+    _default: 0.005
 
 # =============================================================================
 # Incremental processing (content-addressed pipeline output cache)

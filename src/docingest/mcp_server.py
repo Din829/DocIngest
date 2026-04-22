@@ -115,6 +115,7 @@ def run(
     no_chunks: bool = False,
     strategy: str | None = None,
     force: bool = False,
+    acknowledge_large: bool = False,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
@@ -132,11 +133,24 @@ def run(
         no_chunks: If true, only output Markdown, skip chunks.jsonl.
         strategy: Override chunking strategy (auto/heading/recursive/slide/sheet).
         force: Ignore cache, re-process all files.
+        acknowledge_large: When safety.mode is "strict" and the pre-run
+            budget check flags one or more files, set True to proceed
+            anyway. Recommended workflow: call `inspect` first, review
+            pages/est_cost_usd, then call `run` with acknowledge_large=True
+            if the estimate looks acceptable. Ignored in warn/off modes.
         config_overrides: Optional config overrides dict.
 
     Returns:
-        Processing summary: total_files, successful, failed, total_chunks,
-        total_tokens, elapsed_ms, errors, quality report.
+        Processing summary. Keys:
+          total_files, successful, failed, total_chunks, total_tokens,
+          elapsed_ms, errors, quality.
+        Additional keys populated by Phase 0 safety:
+          safety — structured report (mode, violations, summary, ...);
+                   present when safety ran and produced data.
+          status — "aborted_by_safety" when strict mode refused the run;
+                   absent otherwise. Agents should inspect safety.violations
+                   and retry with acknowledge_large=True if the estimated
+                   cost is acceptable.
     """
     from .parsers import create_parser
     from .chunkers import create_chunker
@@ -163,9 +177,10 @@ def run(
         config,
         parser,
         chunker,
+        acknowledge_large=acknowledge_large,
     )
 
-    return {
+    out: dict[str, Any] = {
         "total_files": result.total_files,
         "successful": result.successful,
         "failed": result.failed,
@@ -175,6 +190,15 @@ def run(
         "errors": result.errors,
         "quality": result.quality,
     }
+    # Surface Phase 0 safety report so agents can inspect violations and
+    # decide whether to retry with acknowledge_large=True. Only included
+    # when Phase 0 produced a non-empty dict (keeps typical successful
+    # responses compact).
+    if getattr(result, "safety", None):
+        out["safety"] = result.safety
+        if result.safety.get("aborted"):
+            out["status"] = "aborted_by_safety"
+    return out
 
 
 # ---------------------------------------------------------------------------

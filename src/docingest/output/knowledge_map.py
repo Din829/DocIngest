@@ -378,10 +378,12 @@ search_guide:
 """
 
     model_config = get_nested(config, "models.chunking_assist", {})
-    defaults = get_nested(config, "models.defaults", {}) or {}
-    retry_on_truncation = bool(defaults.get("retry_on_truncation", True))
 
     try:
+        # L1 (budget) + L2 (retry on truncation) are handled inside
+        # text_completion — it reads models.defaults.retry_on_truncation from
+        # the _defaults subdict injected by load_config. We only need to
+        # surface the post-retry state here for L3 schema filtering.
         response, finish_reason = text_completion(
             prompt=prompt,
             model_config=model_config,
@@ -389,26 +391,11 @@ search_guide:
             # or models.defaults.max_response_tokens from config.
         )
 
-        # L2: retry once with a bigger budget if the LLM was cut off.
-        # retry_max_tokens is independent from the default budget so retries
-        # can reach well beyond the normal cap without affecting steady-state
-        # cost. Pass-through keeps config-driven — no magic numbers here.
-        if finish_reason == "length" and retry_on_truncation:
-            retry_budget = defaults.get("retry_max_tokens")
+        if finish_reason == "length":
             logger.warning(
-                "AI summary truncated (finish_reason=length). "
-                f"Retrying with max_tokens={retry_budget}."
+                "AI summary still truncated after retry. "
+                "Incomplete search_guide entries will be dropped."
             )
-            response, finish_reason = text_completion(
-                prompt=prompt,
-                model_config=model_config,
-                max_tokens=retry_budget,
-            )
-            if finish_reason == "length":
-                logger.warning(
-                    "AI summary still truncated after retry. "
-                    "Incomplete search_guide entries will be dropped."
-                )
 
         # Parse AI response as YAML — tolerate truncated tail by
         # catching YAMLError and falling back to Stage 1 data.

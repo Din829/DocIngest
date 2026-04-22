@@ -111,6 +111,8 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.ocr.force",
     "parsing.vision.enabled",
     "parsing.vision.image_dpi",
+    "parsing.vision.max_pages",         # global cap on Vision pages per file —
+                                        # raising it changes which pages get enriched
     "parsing.vision.triage",            # triage thresholds affect which pages
                                         # get Vision enrichment → cached output
                                         # changes when any triage knob changes
@@ -156,6 +158,13 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.docx.vision",                 # max_tokens any change → re-run
     "parsing.xlsx.vision",
     "output.markdown.include_metadata_header",
+    "output.dedup.enabled",                # Vision/Docling dedup toggle —
+                                           # disabling it keeps both versions in sources/*.md
+    "output.dedup.vision_ratio_threshold", # dedup threshold — alters sources/*.md content
+    "sanitize.enabled",                    # PII sanitize hook master toggle —
+                                           # flipping it rewrites markdown before write
+    "sanitize.rules",                      # custom PII rule set — changes
+                                           # what gets masked in markdown
     "metadata.exiftool.enabled",           # hook #3: exiftool gating
     "metadata.exiftool.fields",            # hook #3: whitelist changes
     "parsing.audio.prefer_subtitles",      # #5: subtitle vs ASR path

@@ -204,6 +204,7 @@ def text_completion(
     system_prompt: str = "",
     model_config: dict[str, Any] | None = None,
     max_tokens: int | None = None,
+    retry_on_truncation: bool | None = None,
 ) -> tuple[str, str]:
     """
     Send a text prompt to an LLM and get a response.
@@ -218,13 +219,24 @@ def text_completion(
             '_defaults' subdict for inherited global defaults.
         max_tokens: Explicit cap; when None (default), resolve_max_tokens()
             derives from model_config or global defaults.
+        retry_on_truncation: When the first call stops with finish_reason="length"
+            (response cut off by token budget), retry once with a larger budget
+            (models.defaults.retry_max_tokens, falling back to 2 × the original
+            cap if unset).
+              True  → always retry on truncation.
+              False → never retry; return the truncated response as-is.
+              None (default) → read models.defaults.retry_on_truncation injected
+                               into model_config["_defaults"] by load_config.
+                               Preserves pre-existing per-task opt-in behaviour.
 
     Returns:
         (content, finish_reason) — finish_reason is the litellm-reported
         stop reason ("stop" | "length" | "content_filter" | ""). Callers
         MUST check for "length" before trusting the content: an LLM that
         stops on "length" has been cut off and may have emitted a syntactically
-        incomplete response (e.g. unterminated YAML list).
+        incomplete response (e.g. unterminated YAML list). Even with retry
+        enabled, finish_reason can still be "length" when the retry budget
+        was also exhausted.
 
     Raises:
         RuntimeError: If both primary and fallback fail.
@@ -253,7 +265,41 @@ def text_completion(
             _record_usage(response, model_name)
             content = response.choices[0].message.content
             finish_reason = _extract_finish_reason(response)
-            return (content.strip() if content else ""), finish_reason
+            result_text = content.strip() if content else ""
+
+            # Truncation retry layer — centralised so every text-completion
+            # consumer (knowledge_map, refine, future callers) inherits the
+            # same behaviour. Only kicks in when the provider call itself
+            # succeeded but the LLM stopped on the length boundary.
+            if finish_reason == "length":
+                should_retry = retry_on_truncation
+                if should_retry is None:
+                    defaults = (model_config or {}).get("_defaults") or {}
+                    should_retry = bool(defaults.get("retry_on_truncation", False))
+
+                if should_retry:
+                    defaults = (model_config or {}).get("_defaults") or {}
+                    retry_budget = defaults.get("retry_max_tokens")
+                    if not retry_budget:
+                        # Safety fallback when retry_max_tokens is missing:
+                        # double the effective budget. Keeps retries bounded
+                        # but avoids giving up at the same limit that just failed.
+                        retry_budget = effective_max_tokens * 2
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f"text_completion truncated (finish_reason=length); "
+                        f"retrying once with max_tokens={retry_budget}."
+                    )
+                    # Recurse with retry disabled to guarantee at most one retry.
+                    return text_completion(
+                        prompt=prompt,
+                        system_prompt=system_prompt,
+                        model_config=model_config,
+                        max_tokens=retry_budget,
+                        retry_on_truncation=False,
+                    )
+
+            return result_text, finish_reason
         except Exception as e:
             last_error = e
             continue

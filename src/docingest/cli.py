@@ -58,9 +58,10 @@ def main(
         None,
         "-o", "--output",
         help=(
-            "Output directory. When omitted and a SINGLE input is given, "
-            "auto-derives to ./knowledge/<input_name>/ so each run lands in "
-            "its own folder. Multi-input / URL runs fall back to ./knowledge/."
+            "Output directory. Optional for SINGLE-input runs "
+            "(auto-derives to ./knowledge/<input_name>/). REQUIRED for "
+            "multi-input runs — each knowledge base gets its own root "
+            "so runs do not silently pollute ./knowledge/."
         ),
     ),
     config_file: Optional[Path] = typer.Option(
@@ -88,23 +89,48 @@ def main(
         "--force",
         help="Ignore incremental cache and re-process all files.",
     ),
+    yes: bool = typer.Option(
+        False,
+        "-y", "--yes", "--acknowledge-large",
+        help=(
+            "Proceed even when safety (strict mode) would abort the run due "
+            "to oversized files or over-budget per-run totals. Use after "
+            "reviewing the estimate; in warn mode (default) this flag is "
+            "a no-op."
+        ),
+    ),
 ) -> None:
     """Process documents for RAG and Agentic Search."""
 
     # Resolve output directory.
-    # When the user explicitly passed -o, honour it verbatim — no surprises
-    # for existing scripts. When it's omitted, try to auto-derive a
-    # per-run subfolder so two consecutive runs don't mingle their outputs
-    # in the same ./knowledge/ root (the footgun we hit in practice). Only
-    # activates for a *single* local input — mixed / URL runs are
-    # intentionally left at the default root because there's no clean name
-    # to derive. Same input rerun → same folder, so incremental cache
-    # still works.
+    # Policy:
+    #   - explicit -o  → honour verbatim (user owns the decision).
+    #   - single input → auto-derive ./knowledge/<stem>/ so repeated runs
+    #                    hit the same folder and the incremental cache
+    #                    keeps working.
+    #   - multi input  → REFUSE to auto-derive. Writing to ./knowledge/
+    #                    root would silently merge unrelated runs into
+    #                    one knowledge base, and auto-naming from N
+    #                    filenames is ambiguous (which stem wins? how is
+    #                    order surfaced? what about url/mixed inputs?).
+    #                    Requiring -o forces the user to name the
+    #                    knowledge base themselves.
+    # typer's exists=True on Argument already guarantees every input is
+    # an existing local path when we reach this point, so no extra
+    # existence check is needed.
     if output is None:
-        if len(inputs) == 1 and inputs[0].exists():
+        if len(inputs) == 1:
             output = Path("./knowledge") / inputs[0].stem
         else:
-            output = Path("./knowledge")
+            console.print(
+                "[red]Error:[/red] multiple inputs require an explicit "
+                "[bold]-o / --output[/bold] flag so each knowledge base "
+                "gets its own root.\n"
+                "  Example:\n"
+                "    [bold]docingest run a.pdf b.pdf -o "
+                "./knowledge/my-project/[/bold]"
+            )
+            raise typer.Exit(1)
 
     # Build CLI overrides
     cli_overrides: dict = {}
@@ -150,10 +176,17 @@ def main(
         config=config,
         parser=parser,
         chunker=chunker,
+        acknowledge_large=yes,
     )
 
     # Show results
     _print_results(result)
+
+    # Safety strict-mode abort → exit 2, distinct from generic failure (1).
+    # Using a separate code lets scripts/CI distinguish "budget exceeded,
+    # re-run with --yes" from "something actually broke".
+    if result.safety.get("aborted"):
+        raise typer.Exit(2)
 
     if result.failed > 0:
         raise typer.Exit(1)
@@ -173,6 +206,31 @@ def _print_results(result) -> None:
     table.add_row("Elapsed", f"{result.elapsed_ms}ms")
 
     console.print(table)
+
+    # Safety summary (if Phase 0 ran and found violations). Printed early
+    # so users see the abort reason before the rest of the diagnostics.
+    safety = getattr(result, "safety", None) or {}
+    if safety.get("violations"):
+        n = len(safety["violations"])
+        mode = safety.get("mode", "warn")
+        aborted = safety.get("aborted", False)
+        color = "red" if aborted else "yellow"
+        status = "ABORTED — nothing was processed" if aborted else "proceeding"
+        console.print(
+            f"\n[{color}]Safety:[/{color}] {n} violation(s), mode={mode} — {status}"
+        )
+        try:
+            from docingest.safety import format_violations
+            console.print(format_violations(safety["violations"]))
+        except Exception:
+            # Rendering failure must not hide the rest of the output.
+            pass
+        if aborted:
+            console.print(
+                "[yellow]→ Re-run with [bold]--yes[/bold] to proceed, "
+                "or raise a threshold in [bold]safety.per_file[/bold] / "
+                "[bold]safety.per_run[/bold] config.[/yellow]"
+            )
 
     # Quality summary (if quality_report was generated)
     quality = getattr(result, "quality", None) or {}
