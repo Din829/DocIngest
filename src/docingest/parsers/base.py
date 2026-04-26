@@ -51,6 +51,16 @@ class ParseResult:
     # Error message if success is False
     error: str = ""
 
+    # Ordered record of transformations applied during processing —
+    # parser → hooks → vision → chunker. Each entry is a small dict with
+    # at least {"step": <kind>, "name": <identifier>} plus step-specific
+    # extras. The pipeline appends to this list as each Phase runs; the
+    # chunker then attaches it to every produced chunk's metadata.lineage
+    # so downstream consumers can answer "how did this chunk come to be?".
+    # Only SUCCESSFUL transformations are recorded — failed hooks / fallback
+    # paths stay out so this is a positive provenance trail, not a debug log.
+    transformations: list[dict[str, Any]] = field(default_factory=list)
+
 
 class BaseParser(ABC):
     """

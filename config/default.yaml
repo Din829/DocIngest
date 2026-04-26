@@ -16,6 +16,12 @@ models:
     # off by the token limit). Retry doubles the budget up to retry_max_tokens.
     retry_on_truncation: true
     retry_max_tokens: 65536
+    # Network-level retry count passed to litellm (rate limits, 5xx, TCP
+    # resets). Orthogonal to retry_on_truncation above — both can fire for
+    # the same call. Set to 0 to disable; litellm's own default is 0, but
+    # production workloads benefit from at least 2 retries with exponential
+    # backoff to survive transient Gemini/OpenAI hiccups.
+    max_retries: 2
 
   vision:
     # Per-task override; falls through to models.defaults.max_response_tokens

@@ -33,6 +33,14 @@ litellm.suppress_debug_info = True
 # this constant guards against misconfigured tests / callers only.
 _HARD_FALLBACK_MAX_TOKENS = 32768
 
+# Hard fallback for network-level retry count when config is missing.
+# litellm itself defaults to 0 (no retries), which is too brittle for
+# production — a single rate-limit blip or TCP reset drops a page of
+# Vision output. Using 2 matches litellm's DEFAULT_MAX_RETRIES constant,
+# i.e. the behaviour you'd get if you invoked litellm directly without
+# passing num_retries.
+_HARD_FALLBACK_MAX_RETRIES = 2
+
 
 def resolve_max_tokens(
     model_config: dict[str, Any] | None,
@@ -60,6 +68,36 @@ def resolve_max_tokens(
         if defaults.get("max_response_tokens") is not None:
             return int(defaults["max_response_tokens"])
     return _HARD_FALLBACK_MAX_TOKENS
+
+
+def resolve_max_retries(model_config: dict[str, Any] | None) -> int:
+    """
+    Resolve the number of network-level retries litellm should attempt.
+
+    Priority (first non-None wins):
+      1. model_config["max_retries"]                   (per-task override)
+      2. model_config["_defaults"]["max_retries"]      (global default
+         injected by load_config so every task inherits models.defaults)
+      3. _HARD_FALLBACK_MAX_RETRIES                    (safety net: 2)
+
+    This controls litellm's built-in retry loop for TRANSIENT errors:
+    rate limits, 5xx responses, connection resets, timeouts. It is NOT
+    related to text_completion's `retry_on_truncation` layer, which sits
+    on top and handles finish_reason=="length" at the application level.
+    The two retry mechanisms are orthogonal — both can fire for the same
+    call (network retry first, then if the server eventually replies but
+    the response is truncated, the truncation retry kicks in).
+
+    Mirrors the shape of resolve_max_tokens so both resolver helpers stay
+    visually adjacent in the codebase and obvious to readers.
+    """
+    if model_config:
+        if model_config.get("max_retries") is not None:
+            return int(model_config["max_retries"])
+        defaults = model_config.get("_defaults") or {}
+        if defaults.get("max_retries") is not None:
+            return int(defaults["max_retries"])
+    return _HARD_FALLBACK_MAX_RETRIES
 
 
 def _extract_finish_reason(response) -> str:
@@ -99,12 +137,54 @@ def _resolve_model_name(provider: str, model: str) -> str:
     return model
 
 
+# Provider → canonical env var name. Used when a caller passes a plaintext
+# api_key without also specifying api_key_env (the common case when a
+# downstream library injects credentials via the Provider class instead of
+# editing .env). Kept in sync with the providers DocIngest's config supports;
+# unknown providers fall through and require an explicit api_key_env.
+_PROVIDER_TO_ENV_KEY = {
+    "google": "GEMINI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "vertex": "GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "claude": "ANTHROPIC_API_KEY",
+    "dashscope": "DASHSCOPE_API_KEY",
+}
+
+
 def _set_api_key(model_config: dict[str, Any]) -> None:
-    """Set the API key from environment variable if specified in config."""
+    """
+    Resolve the API key for this model entry.
+
+    Priority (first match wins):
+      1. Plaintext `api_key` in model_config — written to the appropriate
+         env var so litellm can pick it up. Lets downstream callers inject
+         credentials via the Provider class without touching .env.
+      2. `api_key_env` pointing at an already-set env var — classic path,
+         untouched for backwards compatibility.
+
+    litellm reads standard env vars (GEMINI_API_KEY, OPENAI_API_KEY, etc.)
+    so we only need to ensure the right env var holds the right value
+    before litellm.completion() runs.
+    """
+    explicit = model_config.get("api_key")
     env_key = model_config.get("api_key_env")
+
+    if explicit:
+        # Target env var: prefer api_key_env when present, otherwise infer
+        # from the provider name. If neither resolves, we silently skip —
+        # the subsequent litellm call will surface a clear auth error.
+        target = env_key
+        if not target:
+            provider = str(model_config.get("provider", "")).lower()
+            target = _PROVIDER_TO_ENV_KEY.get(provider)
+        if target:
+            os.environ[target] = explicit
+        return
+
     if env_key and os.environ.get(env_key):
-        # litellm reads standard env vars (GEMINI_API_KEY, OPENAI_API_KEY, etc.)
-        # Just verify it's set — litellm will pick it up automatically.
+        # env var already populated — litellm will pick it up automatically.
         pass
 
 
@@ -167,6 +247,10 @@ def describe_image(
 
     # Try primary, then fallback
     effective_max_tokens = resolve_max_tokens(model_config, max_tokens)
+    # Network-level retry (rate limits, 5xx, connection resets). Per-task
+    # override under the same model_config lets Vision / ASR / text
+    # completion each tune their own retry budget independently.
+    effective_num_retries = resolve_max_retries(model_config)
     models_to_try = _build_model_chain(model_config)
     last_error = None
 
@@ -181,6 +265,7 @@ def describe_image(
                 model=model_name,
                 messages=messages,
                 max_tokens=effective_max_tokens,
+                num_retries=effective_num_retries,
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content
@@ -247,6 +332,11 @@ def text_completion(
     messages.append({"role": "user", "content": prompt})
 
     effective_max_tokens = resolve_max_tokens(model_config, max_tokens)
+    # Network-level retry; independent of the truncation retry below. When
+    # text_completion recurses (for a truncation retry), the recursion passes
+    # the same model_config, so num_retries is naturally honoured in both
+    # the initial and retry calls.
+    effective_num_retries = resolve_max_retries(model_config)
     models_to_try = _build_model_chain(model_config)
     last_error = None
 
@@ -261,6 +351,7 @@ def text_completion(
                 model=model_name,
                 messages=messages,
                 max_tokens=effective_max_tokens,
+                num_retries=effective_num_retries,
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content

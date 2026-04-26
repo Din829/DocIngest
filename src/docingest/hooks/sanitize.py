@@ -158,9 +158,15 @@ def sanitize_hook(
 
     Only runs when sanitize.enabled is true (default: false).
     Rules come from config (sanitize.rules) or built-in defaults.
+
+    Raises HookNoOp when the feature is off OR no patterns matched —
+    both cases leave markdown unchanged, so the hook did not contribute
+    to the provenance trail and should not appear in lineage.
     """
+    from . import HookNoOp
+
     if not get_nested(config, "sanitize.enabled", False):
-        return
+        raise HookNoOp
 
     # Load rules: config overrides defaults entirely if provided
     config_rules = get_nested(config, "sanitize.rules", None)
@@ -171,6 +177,10 @@ def sanitize_hook(
 
     sanitized, count = _apply_rules(parse_result.markdown, rules)
 
-    if count > 0:
-        parse_result.markdown = sanitized
-        logger.info(f"Sanitized {count} sensitive pattern(s) in {file_path.name}")
+    if count == 0:
+        # Feature enabled but no sensitive content found — markdown
+        # wasn't modified, so no lineage entry either.
+        raise HookNoOp
+
+    parse_result.markdown = sanitized
+    logger.info(f"Sanitized {count} sensitive pattern(s) in {file_path.name}")

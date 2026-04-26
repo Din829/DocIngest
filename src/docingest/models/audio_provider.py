@@ -72,7 +72,32 @@ class TranscriptionResult:
 
 
 def _set_api_key(model_entry: dict[str, Any]) -> str | None:
-    """Resolve the API key for a model entry. Returns the key or None."""
+    """
+    Resolve the API key for a model entry. Returns the key or None.
+
+    Priority (first non-empty wins):
+      1. Plaintext `api_key` in the entry — lets downstream callers inject
+         credentials via the Provider class (providers.py) without touching
+         .env. Returned directly AND written to the matching env var so
+         litellm-based fallback transcription (Whisper) also picks it up.
+      2. `api_key_env` pointing at an existing env var — classic path,
+         untouched for backwards compatibility.
+    """
+    explicit = model_entry.get("api_key")
+    if explicit:
+        # Mirror provider.py's behaviour: populate the matching env var so
+        # _transcribe_litellm paths that rely on litellm's env-var auth
+        # also see the key. The DashScope path uses the returned value
+        # directly via dashscope.api_key = api_key.
+        env_key = model_entry.get("api_key_env")
+        if not env_key:
+            from .provider import _PROVIDER_TO_ENV_KEY
+            provider = str(model_entry.get("provider", "")).lower()
+            env_key = _PROVIDER_TO_ENV_KEY.get(provider)
+        if env_key:
+            os.environ[env_key] = explicit
+        return explicit
+
     env_key = model_entry.get("api_key_env")
     if env_key:
         return os.environ.get(env_key)
@@ -179,9 +204,16 @@ def _transcribe_litellm(
     model: str,
     api_key: str | None = None,
     language: str | None = None,
+    num_retries: int = 2,
 ) -> TranscriptionResult:
     """
     Transcribe via litellm.transcription() (OpenAI-compatible providers).
+
+    num_retries is threaded through to litellm for network-level retry on
+    transient failures. Whether litellm.transcription honours the kwarg
+    depends on the installed version (it travels via **kwargs like other
+    litellm callables), so this is best-effort rather than guaranteed.
+    Passing the kwarg is always safe — unrecognised kwargs are ignored.
     """
     import litellm
     from .provider import _resolve_model_name
@@ -195,6 +227,7 @@ def _transcribe_litellm(
                 model=model_str,
                 file=f,
                 language=language,
+                num_retries=num_retries,
             )
 
         # litellm returns an OpenAI-compatible TranscriptionResponse
@@ -241,9 +274,13 @@ def transcribe_audio(
     Raises:
         RuntimeError if all providers fail.
     """
-    from .provider import _build_model_chain
+    from .provider import _build_model_chain, resolve_max_retries
 
     models_to_try = _build_model_chain(model_config)
+    # Network-level retries for the litellm path. The DashScope path uses its
+    # own SDK, which manages retries internally — we pass num_retries only to
+    # _transcribe_litellm, not _transcribe_dashscope.
+    num_retries = resolve_max_retries(model_config)
     last_error: Exception | None = None
 
     for model_entry in models_to_try:
@@ -271,6 +308,7 @@ def transcribe_audio(
                     audio_path, provider, model,
                     api_key=api_key,
                     language=language,
+                    num_retries=num_retries,
                 )
         except Exception as e:
             logger.warning(f"ASR failed with {provider}/{model}: {e}")

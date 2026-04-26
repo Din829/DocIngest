@@ -49,7 +49,25 @@ PreParseHook = Callable[[Path, dict[str, Any]], "BytesIO | None"]
 # Post-parse hook: given a file path, the in-memory ParseResult, and config,
 # mutate parse_result in place (metadata, markdown, pages — whatever the hook
 # is meant to enrich). Return nothing.
+#
+# A hook that detects up-front it has no work to do (disabled by config,
+# missing binary, wrong document shape) SHOULD raise HookNoOp instead of
+# quietly returning — the runner treats HookNoOp as "skip silently, do NOT
+# record in the lineage transformations trail". Regular None-return means
+# "I actually ran", which IS recorded.
 PostParseHook = Callable[[Path, ParseResult, dict[str, Any]], None]
+
+
+class HookNoOp(Exception):
+    """
+    Raised by a hook that decided it had no work to do.
+
+    Distinct from a real failure: HookNoOp travels up silently (no
+    warning log, no traceback) and keeps the hook out of the lineage
+    transformations list. Use it from hooks whose behaviour is gated
+    on config flags or external tool availability — so the provenance
+    trail only records enrichments that actually changed anything.
+    """
 
 
 PostParsePhase = Literal["post_parse", "pre_write"]
@@ -93,16 +111,24 @@ def _register_post(
 def run_pre_parse_hooks(
     file_path: Path,
     config: dict[str, Any],
-) -> BytesIO | None:
+) -> tuple[BytesIO | None, str | None]:
     """
     Run pre-parse hooks for the given file's format.
 
     Hooks run in registration order. The first hook that returns a non-None
-    stream wins — subsequent hooks are skipped. Returns None if no hook
-    produced a replacement stream (original file will be used).
+    stream wins — subsequent hooks are skipped.
 
     Hooks must never raise: exceptions are caught and logged as warnings,
     and the pipeline falls through to the original file.
+
+    Returns:
+        (stream, hook_name).
+          * stream    — BytesIO produced by the winning hook, or None if
+                        no hook returned a stream.
+          * hook_name — name of the winning hook (for lineage tracking),
+                        or None when no hook produced a stream.
+        Callers that don't care about lineage can simply unpack the first
+        element and ignore the second.
     """
     ext = file_path.suffix.lstrip(".").lower()
     hooks = _PRE_PARSE_HOOKS.get(ext, []) + _PRE_PARSE_HOOKS.get("*", [])
@@ -113,12 +139,12 @@ def run_pre_parse_hooks(
                 logger.debug(
                     f"Pre-parse hook {hook.__name__} produced stream for {file_path.name}"
                 )
-                return result
+                return result, hook.__name__
         except Exception as e:
             logger.warning(
                 f"Pre-parse hook {hook.__name__} failed for {file_path.name}: {e}"
             )
-    return None
+    return None, None
 
 
 def run_post_parse_hooks(
@@ -133,6 +159,11 @@ def run_post_parse_hooks(
     All matching hooks run (no short-circuit). Hooks mutate parse_result
     in place. Exceptions are caught and logged so one bad hook can't
     break the pipeline.
+
+    Each successfully-executed hook appends one entry to
+    parse_result.transformations so downstream chunks carry a provenance
+    trail of which enrichments ran. Failed hooks are NOT recorded —
+    transformations is a positive trail, not a debug log.
     """
     ext = file_path.suffix.lstrip(".").lower()
     hooks = (
@@ -142,11 +173,22 @@ def run_post_parse_hooks(
     for hook in hooks:
         try:
             hook(file_path, parse_result, config)
+        except HookNoOp:
+            # Hook decided it had no work to do — skip silently, no
+            # lineage entry, no warning. By convention this means the
+            # hook's config flag is off or a prerequisite is missing.
+            continue
         except Exception as e:
             logger.warning(
                 f"Post-parse hook {hook.__name__} ({phase}) "
                 f"failed for {file_path.name}: {e}"
             )
+            continue
+        parse_result.transformations.append({
+            "step": "hook",
+            "name": hook.__name__,
+            "phase": phase,
+        })
 
 
 # ---------------------------------------------------------------------------

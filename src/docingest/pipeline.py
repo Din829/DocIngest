@@ -1146,6 +1146,23 @@ def _enrich_with_vision(
         f"{cap_skipped} cap-skipped (parallel={parallel})"
     )
 
+    # Lineage record — only when at least one page was actually enriched.
+    # Pages triaged-out or failed are intentionally excluded: transformations
+    # is a positive provenance trail, not a failure log.
+    if described > 0:
+        pages_enriched = sorted(
+            parse_result.pages[idx].page_no for idx in results.keys()
+            if idx < len(parse_result.pages)
+        )
+        vision_model = get_nested(
+            config, "models.vision.primary.model", "unknown"
+        )
+        parse_result.transformations.append({
+            "step": "vision",
+            "model": vision_model,
+            "pages_enriched": pages_enriched,
+        })
+
 
 # ---------------------------------------------------------------------------
 # Docling + Vision deduplication
@@ -1215,6 +1232,85 @@ def _dedup_vision(markdown: str, config: dict[str, Any]) -> str:
             deduped_sections.append(section)
 
     return pagebreak.join(deduped_sections)
+
+
+# ---------------------------------------------------------------------------
+# Chunk lineage — attach provenance trail to each chunk
+# ---------------------------------------------------------------------------
+
+def _build_chunk_lineage(
+    parse_result,
+    chunker,
+    original_file: Path,
+    source_md_rel: str,
+) -> dict[str, Any]:
+    """
+    Build a lineage dict to attach to every chunk's metadata.
+
+    Structure — two parts:
+
+    1. SOURCES — where this chunk's content came from:
+       * source_markdown: the sources/*.md path the chunk was cut from.
+       * original_input:  the raw input file (PDF / DOCX / ... or URL).
+
+    2. TRANSFORMATIONS — ordered record of what shaped the chunk:
+       parser → pre-parse hook → post-parse hooks → vision → chunker.
+       Each entry carries its own schema; consumers filter by `step`.
+
+    Keeping this as a single sub-dict under `metadata.lineage` avoids
+    polluting the flat metadata namespace (chunk_index / tokens / etc.)
+    and gives RAG downstreams one obvious field to consult for citation
+    / quality attribution / reproducibility.
+
+    The function is intentionally additive: existing flat metadata keys
+    (source / original_file / format / language / title_path) are NOT
+    moved or removed. Downstream consumers reading those keys are not
+    affected.
+    """
+    original_input: dict[str, Any] = {"filename": original_file.name}
+    # Mimetype + hash come from docling's origin info when the parser is
+    # Docling; media / text parsers skip these. Mirror the existing flat
+    # fields rather than re-introspecting the file.
+    meta = parse_result.metadata or {}
+    origin = meta.get("docling_origin") or {}
+    if isinstance(origin, dict):
+        if origin.get("mimetype"):
+            original_input["mimetype"] = origin["mimetype"]
+        if origin.get("binary_hash") is not None:
+            original_input["binary_hash"] = origin["binary_hash"]
+    # last_modified was stamped onto doc_metadata earlier in process_single_file;
+    # we pull from there (via parse_result.metadata) so the lineage stays in sync
+    # with what the chunker's doc_metadata already carries.
+    if meta.get("last_modified"):
+        original_input["last_modified"] = meta["last_modified"]
+
+    # Copy transformations so later chunks can't accidentally mutate the
+    # parse_result's list (e.g. if post-processing logic ever appends).
+    transformations: list[dict[str, Any]] = list(parse_result.transformations or [])
+
+    # Add the chunker step LAST in provenance order. We read the chunker's
+    # public attrs directly — strategy name comes from class name, primary
+    # knobs come from BaseChunker's resolved _max_tokens / _min_tokens so
+    # the numbers match what actually ran (not the raw config values,
+    # which may carry defaults we don't want to stamp).
+    if chunker is not None:
+        chunker_entry: dict[str, Any] = {
+            "step": "chunker",
+            "name": chunker.__class__.__name__,
+        }
+        max_tokens = getattr(chunker, "_max_tokens", None)
+        if max_tokens is not None:
+            chunker_entry["max_tokens"] = max_tokens
+        # Concrete strategy is visible via class name; auto chunkers that
+        # dispatched internally record the dispatched name in their metadata
+        # (slide/sheet/heading/recursive/...) — we rely on that convention.
+        transformations.append(chunker_entry)
+
+    return {
+        "source_markdown": source_md_rel,
+        "original_input": original_input,
+        "transformations": transformations,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1363,7 +1459,10 @@ def process_single_file(
     # Hooks can return a BytesIO stream that replaces the file content before
     # Docling sees it. None means "use original file". Hooks never raise —
     # failures degrade to the original file with a warning.
-    override_stream = run_pre_parse_hooks(file_path, config)
+    # The second return value is the name of the winning hook (if any) —
+    # appended to transformations further down, after parsing succeeds,
+    # so provenance reflects actually-used enrichments only.
+    override_stream, pre_parse_hook_name = run_pre_parse_hooks(file_path, config)
 
     # --- Phase 1: Parse ---
     t0 = time.monotonic()
@@ -1388,6 +1487,24 @@ def process_single_file(
         return result, []
 
     result.format = parse_result.metadata.get("format", "unknown")
+
+    # Lineage record — pre_parse hook (if one was triggered) comes FIRST
+    # in the provenance trail because it ran BEFORE the parser saw the
+    # file. Parser transformation follows.
+    if pre_parse_hook_name:
+        parse_result.transformations.append({
+            "step": "hook",
+            "name": pre_parse_hook_name,
+            "phase": "pre_parse",
+        })
+    # parser.__class__.__name__ is stable and human-readable ("DoclingParser"
+    # / "MediaParser" / "TextParser"), which is exactly what a consumer
+    # wants to see in provenance trails.
+    parse_result.transformations.append({
+        "step": "parser",
+        "name": parser.__class__.__name__,
+        "format": result.format,
+    })
 
     # --- Phase 1.1: Garbled text detection + pymupdf fallback ---
     if parse_result.markdown and _detect_garbled(parse_result.markdown):
@@ -1552,6 +1669,30 @@ def process_single_file(
         # Apply enrichment: path injection (if enabled)
         if chunks and get_nested(config, "chunking.enrichment.path_injection", True):
             inject_paths(chunks)
+
+        # Attach per-chunk lineage — the provenance trail of what parser /
+        # hooks / vision / chunker produced this chunk. Built once and
+        # applied to every chunk (they share the same file-level trail;
+        # chunk-level differences live in existing flat metadata like
+        # title_path / chunk_index). Copy on write so post-processing
+        # anywhere else can't mutate one chunk's lineage into another's.
+        if chunks:
+            lineage = _build_chunk_lineage(
+                parse_result=parse_result,
+                chunker=chunker,
+                original_file=file_path,
+                source_md_rel=result.output_path,
+            )
+            for chunk in chunks:
+                # Deep-ish copy: transformations list is freshly built per
+                # file, but cloning once more here gives each chunk its
+                # own dict identity so downstream consumers can mutate
+                # freely without cross-chunk side effects.
+                chunk.metadata["lineage"] = {
+                    "source_markdown": lineage["source_markdown"],
+                    "original_input": dict(lineage["original_input"]),
+                    "transformations": [dict(t) for t in lineage["transformations"]],
+                }
 
         result.chunks_count = len(chunks)
         result.chunk_time_ms = int((time.monotonic() - t1) * 1000)

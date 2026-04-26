@@ -37,46 +37,69 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     name="DocIngest",
     instructions=(
-        "DocIngest preprocesses documents (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs) "
-        "into Markdown + chunks for RAG and Agentic Search.\n\n"
-        "Recommended workflow:\n"
-        "1. inspect — Check file sizes and page counts BEFORE processing (fast, no API cost)\n"
-        "2. run — Process documents into a knowledge base (incremental: skips unchanged files)\n"
-        "3. list_knowledge — Browse what's in the knowledge base (files, formats, sections)\n"
-        "4. search_knowledge — Find specific content by keyword (grep on sources/*.md)\n"
-        "5. refine — Optional: AI-powered cleanup for human readability\n\n"
-        "Tips:\n"
-        "- Always inspect first for large/unknown files to estimate Vision API cost\n"
-        "- Use config_overrides to dynamically adjust behavior (e.g. increase max_pages for large PDFs)\n"
-        "- run is incremental by default — safe to call repeatedly on the same directory\n"
-        "- search_knowledge also returns the knowledge_map summary for quick overview"
+        "DocIngest is a document-preprocessing engine: any input "
+        "(PDF / PPT / Excel / HTML / images / audio / video / ZIP / URLs) "
+        "becomes clean Markdown + chunked text + a searchable knowledge "
+        "map. Two downstreams consume the same output:\n"
+        "- RAG: vector search on chunks.jsonl (your own embedder)\n"
+        "- Agentic Search: grep / read on sources/*.md (via the tools below)\n"
+        "\n"
+        "DocIngest is NOT a retrieval engine — it does no embeddings, no "
+        "vector search, no LLM answer generation. It prepares the data; "
+        "the Agent (you) retrieves, cites, and reasons over it.\n"
+        "\n"
+        "TOOL ROLES AT A GLANCE\n"
+        "- inspect(paths)              — pre-flight cost estimate, NO parsing\n"
+        "- run(paths, output_dir)      — do the actual preprocessing\n"
+        "- list_knowledge(dir)         — inventory a processed base\n"
+        "- search_knowledge(q, dir)    — keyword grep over sources/*.md\n"
+        "- read_source(name, dir)      — read one full source file\n"
+        "- refine(files)               — OPTIONAL AI polish for humans\n"
+        "\n"
+        "WORKFLOWS YOU SHOULD REACH FOR\n"
+        "\n"
+        "A) User gave you new documents to ingest:\n"
+        "   inspect(paths) -> review est_cost_usd and recommendation\n"
+        "   run(paths, output_dir)\n"
+        "   list_knowledge(output_dir) -> confirm what landed\n"
+        "\n"
+        "B) User asks a question about an existing knowledge base:\n"
+        "   list_knowledge(dir) -> see files + sections + summary\n"
+        "   search_knowledge(query, dir) -> find matching lines\n"
+        "   read_source(file, dir, max_lines=200) -> read the relevant one\n"
+        "\n"
+        "C) User wants a cleaned / human-readable version:\n"
+        "   refine(files, skill='refine_default')  (or 'refine_faithful'\n"
+        "   when the user's domain is legal / contractual / compliance)\n"
+        "   read_source(file, dir, folder='readable') -> fetch polished\n"
+        "\n"
+        "IMPORTANT HABITS\n"
+        "- ALWAYS `inspect` first for unknown or large inputs. Going\n"
+        "  straight to `run` can silently cost tens of dollars in Vision\n"
+        "  API calls on a 300-page PDF.\n"
+        "- `run` is incremental: re-running on the same output_dir is\n"
+        "  cheap. Use `force=True` only when truly needed (e.g. chunking\n"
+        "  strategy changed and cache didn't auto-invalidate).\n"
+        "- `config_overrides` accepts BOTH flat dot-path form\n"
+        "  ({'parsing.vision.max_pages': 200}) AND nested dict form\n"
+        "  ({'parsing': {'vision': {'max_pages': 200}}}). Pick whichever\n"
+        "  is shorter; they mix freely.\n"
+        "- When `run` returns status='aborted_by_safety', DON'T retry\n"
+        "  silently — surface the violation summary (cost, pages) to the\n"
+        "  user, then retry with acknowledge_large=True if they agree.\n"
     ),
 )
 
 
 # ---------------------------------------------------------------------------
-# Helper: load config once per process
+# Tool implementations — all route through the public facade (docingest.api).
+#
+# MCP is kept as a THIN adapter: each @mcp.tool here maps directly onto a
+# function in docingest.api so config resolution / provider injection /
+# output whitelisting lives in exactly ONE place. Never replicate business
+# logic here — if you think you need to, add it to api.py and call that.
 # ---------------------------------------------------------------------------
 
-_cached_config: dict[str, Any] | None = None
-
-
-def _get_config(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Load base config (cached) and apply per-call overrides without mutation."""
-    global _cached_config
-    if _cached_config is None:
-        from .config import load_config
-        _cached_config = load_config()
-    if overrides:
-        import copy
-        from .config import deep_merge
-        return deep_merge(copy.deepcopy(_cached_config), overrides)
-    return _cached_config
-
-
-# ---------------------------------------------------------------------------
-# Tool: inspect
-# ---------------------------------------------------------------------------
 
 @mcp.tool
 def inspect(
@@ -84,24 +107,59 @@ def inspect(
     config_overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Inspect documents before processing — fast pre-flight check.
+    Pre-flight check — reports size / pages / estimated cost WITHOUT parsing.
 
-    Returns file size, page count, format, and processing recommendations
-    WITHOUT actually parsing the documents. Use this to understand what
-    you're about to process and estimate cost.
+    WHEN TO USE
+    - ALWAYS call this first when the user gives you unknown / large /
+      expensive inputs (PDFs over 20MB, whole directories, URLs, or any
+      input whose cost profile you cannot estimate). Skipping inspect
+      and going straight to `run` can silently incur 100+ Vision API
+      calls on a single file.
+    - SKIP ONLY when the input is clearly small and cheap: a handful of
+      short text / markdown files, or content that was already processed
+      in a previous turn.
+
+    WHAT THE RESULT TELLS YOU (per-file keys)
+    - `size_mb`, `pages` — raw volume. `pages` is the primary cost driver
+      (1 Vision call per page by default, up to parsing.vision.max_pages).
+    - `est_cost_usd` — approximate Vision spend if you `run` with current
+      config. If too high: either cap via config_overrides
+      (parsing.vision.max_pages), disable Vision
+      (parsing.vision.enabled=false), or ask the user to confirm.
+    - `recommendation` — "Ready" means all safety thresholds pass. Any
+      other string lists the violations (e.g. "pages=320 > 50"); decide
+      whether to proceed with `acknowledge_large=True` or tune config.
+    - Format-specific fields may appear: `sheets` (xlsx), `duration_sec`
+      (audio/video), `files_inside` (zip), `words` (docx).
+
+    TYPICAL WORKFLOW
+        results = inspect(["./docs/"])
+        # review est_cost_usd + recommendation
+        if total_cost_ok:
+            run(["./docs/"])
+        else:
+            # ask user OR lower max_pages OR disable Vision
 
     Args:
-        paths: List of file paths or directories to inspect.
-        config_overrides: Optional config overrides (e.g. {"parsing": {"vision": {"max_pages": 100}}}).
+        paths: File paths, directory paths, or URLs. Directories are
+            expanded recursively (hidden files skipped). URLs (http / https,
+            e.g. YouTube, Bilibili) resolved via yt-dlp.
+        config_overrides: Override any config value per call. Accepts
+            BOTH flat dot-path form ({"parsing.vision.max_pages": 200})
+            AND nested dict form
+            ({"parsing": {"vision": {"max_pages": 200}}}) — mix freely.
+            Common overrides for inspect:
+            - parsing.vision.max_pages — cap affects est_cost_usd
+            - parsing.vision.enabled — set false to zero out cost estimate
 
     Returns:
-        List of inspection results, one per file. Each contains:
-        name, format, size_mb, pages, recommendation.
+        List of dicts, one per file. Always includes: name, path, format,
+        size_mb, est_cost_usd, recommendation. Usually includes: pages,
+        chars_est. Format-specific fields vary (see above).
     """
-    from .inspect import inspect_files
+    from .api import inspect as api_inspect
 
-    config = _get_config(config_overrides)
-    return inspect_files([Path(p) for p in paths], config)
+    return api_inspect(paths, config_overrides=config_overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -121,82 +179,133 @@ def run(
     """
     Process documents into a knowledge base (Markdown + chunks + index).
 
-    Converts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs)
-    into clean Markdown files with metadata, chunked text for RAG, and
-    a searchable knowledge map.
+    Converts any document (PDF / PPT / Excel / HTML / images / audio /
+    video / ZIP / URLs) into clean Markdown + chunked text for RAG +
+    a searchable knowledge map. Incremental by default: unchanged files
+    from a previous run are cached and skipped automatically.
 
-    Incremental by default — only processes new/changed files.
+    WHEN TO USE
+    - This is the main processing tool. Call it after `inspect` confirms
+      the inputs are acceptable (for large / unknown inputs) or directly
+      (for small trusted inputs).
+    - SAFE to re-run on the same output_dir: the incremental cache means
+      only new / changed files are re-processed.
+
+    HOW TO CHOOSE THE ARGUMENTS
+
+    `no_chunks=True` — produce ONLY clean Markdown, skip chunks.jsonl.
+        Use when the downstream consumer only needs human-readable docs,
+        NOT a RAG vector store. Saves time on large corpora.
+
+    `strategy` — override chunking strategy. Default "auto" is usually right.
+        Override only when you know the document structure:
+        - "heading"    : force H1-H3 splits (good for well-structured reports)
+        - "recursive"  : force paragraph / sentence splits (good for prose)
+        - "slide"      : PPTX slide boundaries
+        - "sheet"      : XLSX sheet boundaries
+        Other values rejected.
+
+    `force=True` — ignore the incremental cache and re-process everything.
+        Use sparingly: large corpora re-runs are expensive. Appropriate
+        when you've changed config that affects output (e.g. chunking
+        strategy) but the cache didn't invalidate automatically, or
+        when debugging.
+
+    `acknowledge_large=True` — ONLY meaningful in safety.mode="strict".
+        Pre-run budget check flags oversized files → run aborts → you
+        pass this True to proceed anyway AFTER reviewing the violation
+        report. Recommended Agent workflow:
+          1) call `inspect(paths)` → note est_cost_usd and recommendation
+          2) call `run(paths)` (no acknowledge_large)
+          3) if result["status"] == "aborted_by_safety": inspect
+             result["safety"]["violations"], decide if cost is acceptable
+          4) if OK: retry `run(paths, acknowledge_large=True)`
+
+    HANDLING "aborted_by_safety"
+    When strict mode refuses, the return dict has:
+        {"status": "aborted_by_safety",
+         "safety": {"mode": "strict", "violations": [...],
+                    "summary": {total_files, total_pages,
+                                total_est_cost_usd}}}
+    Don't retry blindly — surface the cost to the user FIRST.
 
     Args:
-        paths: List of file paths, directories, or URLs to process.
-        output_dir: Output directory (default: ./knowledge).
-        no_chunks: If true, only output Markdown, skip chunks.jsonl.
-        strategy: Override chunking strategy (auto/heading/recursive/slide/sheet).
-        force: Ignore cache, re-process all files.
-        acknowledge_large: When safety.mode is "strict" and the pre-run
-            budget check flags one or more files, set True to proceed
-            anyway. Recommended workflow: call `inspect` first, review
-            pages/est_cost_usd, then call `run` with acknowledge_large=True
-            if the estimate looks acceptable. Ignored in warn/off modes.
-        config_overrides: Optional config overrides dict.
+        paths: File paths, directory paths, or URLs (http / https).
+            Directories expanded recursively. Mixed inputs allowed.
+        output_dir: Base output directory. Default "./knowledge". The
+            incremental cache lives under output_dir/.cache — re-using
+            the same output_dir is how you hit the cache.
+        no_chunks: If True, skip chunks.jsonl. See above.
+        strategy: Override chunking strategy. None keeps config default
+            (auto). See above for valid values.
+        force: Ignore incremental cache. See above.
+        acknowledge_large: Pass True ONLY after reviewing safety violations.
+            See above.
+        config_overrides: Override any config value. Accepts BOTH flat
+            dot-path ({"parsing.vision.max_pages": 200}) AND nested dict
+            forms — mix freely. Commonly useful:
+            - parsing.vision.max_pages — cap Vision calls per file
+            - parsing.vision.enabled=false — skip Vision entirely
+            - chunking.max_tokens — chunk size cap
+            - sanitize.enabled=true — opt-in PII masking (default off)
 
     Returns:
-        Processing summary. Keys:
-          total_files, successful, failed, total_chunks, total_tokens,
-          elapsed_ms, errors, quality.
-        Additional keys populated by Phase 0 safety:
-          safety — structured report (mode, violations, summary, ...);
-                   present when safety ran and produced data.
-          status — "aborted_by_safety" when strict mode refused the run;
-                   absent otherwise. Agents should inspect safety.violations
-                   and retry with acknowledge_large=True if the estimated
-                   cost is acceptable.
+        dict with processing summary:
+            total_files, successful, failed, total_chunks, total_tokens,
+            elapsed_ms, errors (list of {file, error}), quality (Vision
+            marker scan summary).
+        Optional keys:
+            safety — present when Phase 0 ran with violations.
+            status — "aborted_by_safety" when strict mode refused.
     """
-    from .parsers import create_parser
-    from .chunkers import create_chunker
-    from .pipeline import run_pipeline
+    from .api import ingest
 
-    # Build config with overrides
-    overrides: dict[str, Any] = {"output": {"dir": output_dir}}
-    if no_chunks:
-        overrides.setdefault("chunking", {})["enabled"] = False
+    # Translate MCP's positional-ish args into the facade's `outputs` and
+    # `config_overrides` forms. The MCP contract stays identical; the
+    # facade handles the heavy lifting.
+    extra: dict[str, Any] = {}
     if strategy:
-        overrides.setdefault("chunking", {})["strategy"] = strategy
-    if force:
-        overrides.setdefault("incremental", {})["force"] = True
-    if config_overrides:
-        from .config import deep_merge
-        overrides = deep_merge(overrides, config_overrides)
+        extra["chunking.strategy"] = strategy
+    outputs: list[str] | None = None
+    if no_chunks:
+        # Legacy flag: "Markdown only". We do not include "chunks" in the
+        # whitelist so chunking is disabled AND the chunks reader is skipped.
+        # Other optional outputs (index, knowledge_map, quality_report,
+        # run_log) remain enabled to match the historical MCP behaviour
+        # (no_chunks was narrowly about chunks.jsonl, not broad pruning).
+        outputs = ["markdown", "index", "knowledge_map", "quality_report", "run_log"]
 
-    config = _get_config(overrides)
-    parser = create_parser(config)
-    chunker = create_chunker(config) if not no_chunks else None
+    merged_overrides: dict[str, Any] = dict(config_overrides) if config_overrides else {}
+    merged_overrides.update(extra)
 
-    result = run_pipeline(
-        [Path(p) if not p.startswith(("http://", "https://")) else p for p in paths],
-        config,
-        parser,
-        chunker,
+    result = ingest(
+        paths,
+        output=output_dir,
+        outputs=outputs,
+        config_overrides=merged_overrides or None,
+        force=force,
         acknowledge_large=acknowledge_large,
     )
 
+    stats = result.stats
     out: dict[str, Any] = {
-        "total_files": result.total_files,
-        "successful": result.successful,
-        "failed": result.failed,
-        "total_chunks": result.total_chunks,
-        "total_tokens": result.total_tokens,
-        "elapsed_ms": result.elapsed_ms,
-        "errors": result.errors,
-        "quality": result.quality,
+        "total_files": stats.get("total_files", 0),
+        "successful": stats.get("successful", 0),
+        "failed": stats.get("failed", 0),
+        "total_chunks": stats.get("total_chunks", 0),
+        "total_tokens": stats.get("total_tokens", 0),
+        "elapsed_ms": stats.get("elapsed_ms", 0),
+        "errors": stats.get("errors", []),
+        "quality": stats.get("quality", {}),
     }
     # Surface Phase 0 safety report so agents can inspect violations and
     # decide whether to retry with acknowledge_large=True. Only included
     # when Phase 0 produced a non-empty dict (keeps typical successful
     # responses compact).
-    if getattr(result, "safety", None):
-        out["safety"] = result.safety
-        if result.safety.get("aborted"):
+    safety = stats.get("safety") or {}
+    if safety:
+        out["safety"] = safety
+        if safety.get("aborted"):
             out["status"] = "aborted_by_safety"
     return out
 
@@ -213,37 +322,70 @@ def refine(
     config_overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Refine Markdown files for human readability using AI.
+    AI-powered cleanup of Markdown for human readability.
 
-    Takes sources/*.md files and produces cleaned, well-formatted
-    versions in readable/*.md. Removes noise, merges duplicates,
-    improves structure.
+    Takes Markdown files from a processed knowledge base (typically
+    `sources/*.md`) and produces cleaned, polished versions under
+    `readable/<skill>/*.md`. Originals are NEVER modified.
 
-    Available skills:
-      - "refine_default" (default): readability-first, allows rewriting and polishing
-      - "refine_faithful": preserves original wording word-for-word, only deduplicates and reformats
+    WHEN TO USE
+    - ONLY when the user explicitly wants human-readable output (e.g.
+      "clean this up for publishing", "produce a readable summary").
+    - Do NOT call as part of a routine RAG pipeline: raw `sources/*.md`
+      are already what `search_knowledge` / `read_source` / downstream
+      chunk consumers want. Refine is a SEPARATE, optional human track.
+    - Do NOT refine large files blindly: the LLM call cost scales with
+      input tokens. The tool auto-skips files beyond
+      refine.max_input_tokens (default 8000) — check `skipped` in the
+      result and respond to user with a clear reason.
+
+    SKILL CHOICE
+    - "refine_default" (default): readability-first. The LLM may rewrite
+      sentences, merge redundant bullets, normalise formatting. Good for
+      general polishing.
+    - "refine_faithful": preserves original wording EXACTLY, only
+      removes duplicates and fixes layout. Use for legal / contractual /
+      compliance documents where paraphrasing is unacceptable.
+
+    TYPICAL WORKFLOW
+        # User: "clean up the contract doc for sharing"
+        refine(["./kb/sources/contract.md"], skill="refine_faithful")
+        # Then use read_source(..., folder="readable") to fetch result.
 
     Args:
-        files: List of Markdown file paths to refine.
-        output_dir: Output base directory (default: parent of first file).
-        skill: SKILL template name. Use "refine_faithful" to preserve original text exactly.
-        config_overrides: Optional config overrides dict.
+        files: Markdown file paths. If a file lives in `.../sources/`,
+            the output root defaults to the knowledge-base root
+            (one level up). Otherwise defaults to the file's parent dir.
+        output_dir: Override the output root. The final path is
+            output_dir/readable/<skill_short>/<filename>. Pass None to
+            use the auto-inferred default above.
+        skill: "refine_default" (default) or "refine_faithful". Other
+            values are looked up under skills/*.SKILL.md — custom
+            skills are possible but uncommon.
+        config_overrides: Per-call config overrides. Commonly useful:
+            - refine.max_input_tokens — raise to refine larger files
+            - refine.max_output_tokens — raise if output gets truncated
+            - models.chunking_assist — swap the LLM used
 
     Returns:
-        List of refine results: source, tokens_in, tokens_out, skipped, warning.
+        List of per-file results:
+            source          — input path
+            output          — written path (empty if skipped)
+            tokens_in       — input token estimate (CJK-aware)
+            tokens_out      — output token estimate (0 if skipped)
+            skipped         — True if skipped (too large, LLM failed, etc.)
+            warning         — reason for skip, or truncation notice
+        If `warning` is non-empty even for successful refines, the output
+        may be truncated (check for trailing `<!-- refine-truncated -->`).
     """
-    from .refine import refine_files
+    from .api import refine as api_refine
 
-    config = _get_config(config_overrides)
-    file_paths = [Path(f) for f in files]
-
-    if output_dir is None:
-        first = file_paths[0].resolve()
-        out = first.parent.parent if first.parent.name == "sources" else first.parent
-    else:
-        out = Path(output_dir)
-
-    return refine_files(file_paths, config, out, skill)
+    return api_refine(
+        files,
+        output=output_dir,
+        skill=skill,
+        config_overrides=config_overrides,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -257,24 +399,60 @@ def search_knowledge(
     max_results: int = 10,
 ) -> dict[str, Any]:
     """
-    Search a processed knowledge base using keyword matching.
+    Keyword search over a processed knowledge base (grep on sources/*.md).
 
-    Greps sources/*.md for the query string and returns matching lines
-    with surrounding context. Also loads the knowledge_map summary for
-    a quick overview of the knowledge base contents. Lightweight local
-    search — no vector database needed.
+    Case-insensitive literal match across every source Markdown file in
+    the knowledge base. Returns matched lines plus 1 line of context
+    before / after. Also surfaces the knowledge_map summary so you get
+    a quick overview of what's in the base.
+
+    WHEN TO USE
+    - Call this when the user asks about CONTENT inside documents
+      ("find where the contract mentions X", "documents containing Y").
+    - Call `list_knowledge` FIRST when you need to know what's in the
+      base — search_knowledge is for finding content, not for browsing.
+    - This is KEYWORD search (literal regex-escaped substring). For
+      semantic / conceptual queries, this tool is NOT enough — but
+      DocIngest is a preprocessing library, not a RAG engine, so there
+      is no semantic search tool here. If the user needs semantic
+      matching, tell them the chunks in chunks.jsonl are meant for
+      downstream vector search in their RAG stack.
+
+    TYPICAL WORKFLOW
+        # User: "Which doc talks about 解約手順?"
+        r = search_knowledge("解約手順", "./knowledge/pwc")
+        # r["matches"] lists files + line numbers + 1-line context
+        # Then drill in:
+        read_source(r["matches"][0]["file"], "./knowledge/pwc")
+
+    INTERPRETING THE RESULT
+    - `knowledge_map_summary` — populated when the base was built with
+      `knowledge_map.enabled=true` (default). Read this first for a
+      one-paragraph overview before diving into matches.
+    - `matches` — ordered by file name. Each entry has `file`, `line`
+      (1-based), `context` (up to 3 lines including the match).
+    - `total_matches` — capped at max_results; if equal to max_results,
+      there may be more matches not shown.
 
     Args:
-        query: Search query string (case-insensitive).
-        knowledge_dir: Path to knowledge base directory.
-        max_results: Maximum number of matching lines to return.
+        query: Literal search string. Case-insensitive. Regex special
+            characters are escaped automatically — you cannot pass regex.
+            Multi-word queries match the exact phrase, not individual words.
+        knowledge_dir: Path to the knowledge base root (the directory
+            that contains `sources/` and `index.json`). Default "./knowledge".
+        max_results: Hard cap on returned matches. Default 10 keeps the
+            response small for LLM context. Raise to 30-50 for broader
+            surveys, but note total_matches == max_results usually means
+            "refine your query" rather than "ingest all of these".
 
     Returns:
-        query: The search query.
-        matches: list of {file, line, context} dicts.
-        total_matches: Number of matches found.
-        knowledge_map_summary: Overall knowledge base description (if available).
-        stats: File/chunk/token counts (if available).
+        dict with keys:
+            query                  — echoed input
+            matches                — list of {file, line, context}
+            total_matches          — count (<= max_results)
+            knowledge_map_summary  — str or None
+            stats                  — dict with file / chunk / token counts
+                                     (from knowledge_map.yaml, or absent)
     """
     import re
 
@@ -335,17 +513,49 @@ def list_knowledge(
     knowledge_dir: str = "./knowledge",
 ) -> dict[str, Any]:
     """
-    List contents of a processed knowledge base.
+    Inventory of a processed knowledge base — returns raw index.json.
 
-    Returns the full index.json content — all files with their format,
-    language, sections, token counts, and chunk counts. Use this to
-    understand what's in the knowledge base before searching.
+    WHEN TO USE
+    - Call this FIRST when starting work with an unfamiliar knowledge
+      base (e.g. the user points at a directory and says "look at these
+      docs"). You'll learn what files are in it, their formats / languages
+      / sizes, and their section structure, all in one call.
+    - Call AFTER `run` to confirm what landed.
+    - Prefer `search_knowledge` when the user already knows what they
+      want (a keyword, a filename) — `list_knowledge` is for surveying,
+      not for finding.
+
+    WHAT THE RESULT CONTAINS
+    - `version`, `processed_at` — schema version and when the base was built.
+    - `files` — list of file entries. Each entry includes:
+        path             — relative .md path under sources/
+        original_file    — the input filename that produced it
+        format           — "pdf" / "pptx" / "docx" / "xlsx" / ...
+        title            — extracted title (usually filename stem)
+        language         — auto-detected: ja / zh / en / ko / unknown
+        pages            — page count (for paginated formats)
+        chunks_count     — how many chunks this file produced
+        tokens_estimated — CJK-aware token estimate
+        sections         — section headings extracted from the doc
+        element_boxes    — PDF bounding boxes per page (only for PDFs,
+                           useful for citation / highlighting in RAG UIs)
+
+    TYPICAL WORKFLOW
+        info = list_knowledge("./knowledge/pwc")
+        # Scan info["files"] — note format distribution, languages,
+        # total token volume. Use sections to hint search queries.
+        # Then: search_knowledge("...", "./knowledge/pwc")
+
+    HANDLING ERRORS
+    Returns {"error": "..."} when the knowledge base doesn't exist
+    (`run` not called yet) or index.json is corrupt. Agents should tell
+    the user to run `run` first when this happens.
 
     Args:
-        knowledge_dir: Path to knowledge base directory.
+        knowledge_dir: Path to the knowledge base root. Default "./knowledge".
 
     Returns:
-        The full index.json content, or error message if not found.
+        dict — either full index.json content, or {"error": "..."}.
     """
     index_path = Path(knowledge_dir) / "index.json"
     if not index_path.exists():
@@ -369,23 +579,59 @@ def read_source(
     max_lines: int | None = None,
 ) -> dict[str, Any]:
     """
-    Read the full content of a Markdown file from the knowledge base.
+    Read a full Markdown file from a processed knowledge base.
 
-    Use after search_knowledge or list_knowledge to read a specific file.
-    Set folder="readable" to read AI-refined versions (produced by refine tool).
+    WHEN TO USE
+    - After `search_knowledge` or `list_knowledge` gives you a file name
+      and you need the full content to answer the user.
+    - For LARGE files, ALWAYS pass `max_lines` first (e.g. max_lines=200)
+      to peek at the beginning without blowing your context window.
+      Follow up with targeted reads if needed.
+    - Do NOT use this to browse — call `list_knowledge` when you just
+      want to know what files exist.
+
+    FOLDER CHOICE
+    - `folder="sources"` (default) — raw parsed Markdown. This is the
+      ground truth used by search_knowledge and by downstream RAG.
+    - `folder="readable"` — AI-refined versions produced by the `refine`
+      tool. Use when the user wants the polished / human-friendly
+      version. Only exists if `refine` was called previously.
+      Files live under `readable/<skill_short>/` (e.g. readable/default/,
+      readable/faithful/). Pass `folder="readable/default"` to target a
+      specific skill.
+
+    TRUNCATION BEHAVIOUR
+    When max_lines is set and the file is longer, content is truncated
+    from the top (first N lines kept). The `truncated` flag is True and
+    `total_lines` reports the full file size so you can decide whether
+    to read more or change strategy (e.g. ask user what section they want).
+
+    TYPICAL WORKFLOW
+        # User asked about the contract's cancellation terms:
+        hits = search_knowledge("解約", "./kb")
+        # hits["matches"][0]["file"] = "contract.md", line = 42
+        # Peek at the file around that region:
+        r = read_source("contract.md", "./kb", max_lines=60)
+        # r["content"] has the first 60 lines; decide next action.
 
     Args:
-        file_name: Name of the file (e.g. "report.md").
-        knowledge_dir: Path to knowledge base directory.
-        folder: Subfolder to read from — "sources" (default, raw parsed) or "readable" (AI-refined).
-        max_lines: Optional line limit (None = full file). Use for very large files.
+        file_name: Filename (e.g. "report.md"). NOT a full path — just
+            the name as returned by list_knowledge / search_knowledge.
+        knowledge_dir: Path to the knowledge base root. Default "./knowledge".
+        folder: Which subfolder to read from. "sources" (default) or
+            "readable" or "readable/<skill>". See above.
+        max_lines: Read only the first N lines. None = full file
+            (dangerous for huge files). Recommended: pass 200 for a
+            peek; increase as needed.
 
     Returns:
-        file: The file name.
-        folder: Which folder was read.
-        content: The Markdown content (or truncated if max_lines set).
-        total_lines: Total line count of the file.
-        truncated: Whether the content was truncated.
+        dict with keys:
+            file         — echoed file name
+            folder       — echoed folder
+            content      — Markdown text (possibly truncated)
+            total_lines  — full line count of the file
+            truncated    — bool, True if max_lines cut it off
+        OR {"error": "..."} on file not found / read failure.
     """
     source_path = Path(knowledge_dir) / folder / file_name
     if not source_path.exists():
