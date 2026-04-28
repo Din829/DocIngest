@@ -212,12 +212,30 @@ def _register_default_hooks() -> None:
     except ImportError as e:
         logger.debug(f"PPTX chart hook not available: {e}")
 
-    # #3 File metadata enrichment (Docling origin + exiftool)
+    # #3 File metadata enrichment (Docling origin + exiftool + derived created)
     try:
         from .file_metadata import file_metadata_hook
         _register_post("pre_write", ["*"], file_metadata_hook)
     except ImportError as e:
         logger.debug(f"File metadata hook not available: {e}")
+
+    # Derived aliases (title / exif.Title / filename → cleaned alias list).
+    # Registered AFTER file_metadata_hook so exif.Title is available.
+    try:
+        from .derive_aliases import derive_aliases_hook
+        _register_post("pre_write", ["*"], derive_aliases_hook)
+    except ImportError as e:
+        logger.debug(f"derive_aliases hook not available: {e}")
+
+    # Derived tags stage 1 — format/lang. Stage 2 (keyword enrichment from
+    # knowledge_map) runs AFTER the pipeline finishes its main loop, in
+    # output/tags_enrichment.py, because keyword discrimination is a
+    # corpus-wide signal not available at hook time.
+    try:
+        from .derive_tags import derive_tags_hook
+        _register_post("pre_write", ["*"], derive_tags_hook)
+    except ImportError as e:
+        logger.debug(f"derive_tags hook not available: {e}")
 
     # Sensitive data sanitization (default OFF, must opt-in via config)
     try:

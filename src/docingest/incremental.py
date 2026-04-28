@@ -167,6 +167,12 @@ _RELEVANT_CONFIG_PATHS = [
                                            # what gets masked in markdown
     "metadata.exiftool.enabled",           # hook #3: exiftool gating
     "metadata.exiftool.fields",            # hook #3: whitelist changes
+    "output.markdown.frontmatter_fields",  # which fields appear in YAML
+                                           # frontmatter — change → re-emit md
+    "output.derived_metadata",             # whole subtree (created / aliases /
+                                           # tags toggles + filter patterns).
+                                           # Any knob below it changes what
+                                           # ends up in the frontmatter.
     "parsing.audio.prefer_subtitles",      # #5: subtitle vs ASR path
     "parsing.audio.language",              # #5: language affects ASR output
     "parsing.audio.include_timestamps",    # #5: timestamp format in output

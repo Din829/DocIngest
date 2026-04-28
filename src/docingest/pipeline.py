@@ -2108,6 +2108,23 @@ def run_pipeline(
             import logging
             logging.getLogger(__name__).warning(f"Knowledge map generation failed: {e}")
 
+        # Stage 2 of tags derivation: append kw/<word> tags to each
+        # sources/*.md frontmatter based on the corpus-wide TF-IDF
+        # filtered keyword index. Stage 1 (format/lang) ran during the
+        # pre_write hook for each file. Loaded lazily so a knowledge_map
+        # generation failure doesn't take this down with it.
+        try:
+            from .output.tags_enrichment import enrich_sources_with_tags
+            km_path = output_dir / get_nested(
+                config, "knowledge_map.output_file", "knowledge_map.yaml"
+            )
+            if km_path.exists():
+                km_data = yaml.safe_load(km_path.read_text(encoding="utf-8"))
+                if isinstance(km_data, dict):
+                    enrich_sources_with_tags(km_data, output_dir, config)
+        except Exception as e:
+            _pipeline_logger.warning(f"Tags enrichment failed: {e}")
+
     # Write errors.json if any failures
     report_file = get_nested(config, "error_handling.report_file", "errors.json")
     if pipeline_result.errors:

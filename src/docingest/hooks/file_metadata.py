@@ -34,6 +34,8 @@ Config (all under metadata.exiftool):
 from __future__ import annotations
 
 import logging
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -224,6 +226,113 @@ def _filter_fields(raw: dict[str, Any], whitelist: list[str]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Created date derivation (independent of exiftool — works without it)
+# ---------------------------------------------------------------------------
+# `created` answers "when was this document actually created", which is
+# different from `processed_at` (when DocIngest ran). Multi-source with an
+# explicit source tag so downstream readers (RAG / Bases / users) can
+# decide whether to trust it.
+#
+# Priority chain (high → low):
+#   1. embedded   — exiftool CreateDate / DateTimeOriginal (PDF, Office,
+#                   image EXIF, audio ID3) OR yt-dlp upload_date promoted
+#                   into metadata by MediaParser.
+#   2. filesystem — file mtime (works for everything, but reflects when
+#                   the file landed on this disk, not when it was authored).
+#   3. (none)     — neither field is written. Empty beats wrong.
+#
+# `created_source` records which branch won. Always paired with `created`
+# so a reader never sees a `created` value without knowing where it came
+# from.
+
+# Match exiftool's typical date format: "2024:08:15 09:30:00" (with
+# optional sub-second / timezone tail). We accept the loose form because
+# different formats use slightly different precisions.
+_EXIFTOOL_DATE_RE = re.compile(
+    r"^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})"
+)
+
+
+def _normalize_iso(value: Any) -> str | None:
+    """
+    Coerce an exiftool / yt-dlp / unknown date string into ISO 8601.
+
+    ExifTool emits "YYYY:MM:DD HH:MM:SS[+TZ]"; ISO wants "YYYY-MM-DDTHH:MM:SS".
+    yt-dlp upload_date is "YYYYMMDD". Anything else we leave alone if it
+    already parses, otherwise return None so the caller can fall through.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # yt-dlp compact form
+    if len(s) == 8 and s.isdigit():
+        try:
+            return datetime.strptime(s, "%Y%m%d").date().isoformat()
+        except ValueError:
+            return None
+
+    # ExifTool form
+    m = _EXIFTOOL_DATE_RE.match(s)
+    if m:
+        y, mo, d, hh, mm, ss = m.groups()
+        return f"{y}-{mo}-{d}T{hh}:{mm}:{ss}"
+
+    # Already ISO-ish — try parsing to confirm, but pass through original
+    # string so we don't mangle a timezone the user already had.
+    try:
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return s
+    except ValueError:
+        return None
+
+
+def _derive_created(file_path: Path, parse_result: ParseResult) -> None:
+    """
+    Set `created` + `created_source` on parse_result.metadata.
+
+    Runs unconditionally (no config gate). Skipping this when exiftool is
+    off would mean the field never appears, which defeats the point —
+    filesystem mtime is always available and is strictly more useful than
+    nothing for time-based filtering.
+
+    Existing `created` (e.g. set by a parser-specific path that already
+    knows better) is respected — we never overwrite.
+    """
+    if "created" in parse_result.metadata:
+        return  # someone upstream already filled it
+
+    # 1. Embedded sources (in priority order)
+    exif = parse_result.metadata.get("exif") or {}
+    candidates: list[tuple[str, Any]] = [
+        ("CreateDate", exif.get("CreateDate")),
+        ("DateTimeOriginal", exif.get("DateTimeOriginal")),
+        # MediaParser writes yt-dlp upload_date here for URL inputs.
+        # (It's a MediaParser convention; absent for non-URL files.)
+        ("yt_dlp_upload_date", parse_result.metadata.get("yt_dlp_upload_date")),
+    ]
+    for _label, raw in candidates:
+        iso = _normalize_iso(raw)
+        if iso:
+            parse_result.metadata["created"] = iso
+            parse_result.metadata["created_source"] = "embedded"
+            return
+
+    # 2. Filesystem fallback
+    try:
+        mtime = file_path.stat().st_mtime
+        parse_result.metadata["created"] = (
+            datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+        )
+        parse_result.metadata["created_source"] = "filesystem"
+    except OSError as e:
+        logger.debug(f"Could not stat {file_path.name} for created date: {e}")
+        # Both fields stay absent — empty beats wrong.
+
+
+# ---------------------------------------------------------------------------
 # Entry point (called by hooks registry)
 # ---------------------------------------------------------------------------
 
@@ -244,9 +353,25 @@ def file_metadata_hook(
     # Phase 1: Free promotion (Docling already gave us the data)
     _promote_docling_origin(parse_result)
 
-    # Phase 2: exiftool (gated by config + availability)
-    if not get_nested(config, "metadata.exiftool.enabled", False):
-        return
+    # Phase 2: exiftool (gated by config + availability).
+    # Done BEFORE _derive_created so its CreateDate / DateTimeOriginal
+    # become the highest-priority source for the date derivation below.
+    if get_nested(config, "metadata.exiftool.enabled", False):
+        _run_exiftool(file_path, parse_result, config)
+
+    # Phase 3: Derive `created` from whatever we've got (exif > mtime).
+    # Runs unconditionally — every file deserves a created date for
+    # downstream time-based filtering, even when exiftool is off.
+    _derive_created(file_path, parse_result)
+
+
+def _run_exiftool(
+    file_path: Path,
+    parse_result: ParseResult,
+    config: dict[str, Any],
+) -> None:
+    """ExifTool extraction extracted into its own helper so the main hook
+    body stays linear and the new derivation phase is easier to read."""
 
     # Legacy config key `metadata.exiftool.path` takes precedence over the
     # new `binaries.exiftool.path` for backwards compatibility. If the

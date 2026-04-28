@@ -92,8 +92,21 @@ def _build_frontmatter(
             fields = configured
 
     for field in fields:
-        if field in metadata and metadata[field] is not None:
-            lines.append(f"{field}: {_yaml_escape(metadata[field])}")
+        if field not in metadata or metadata[field] is None:
+            continue
+        value = metadata[field]
+        # Lists render as block-style YAML so Obsidian / Bases / generic
+        # YAML parsers see them as proper lists (not stringified Python
+        # repr). Empty lists are skipped — an empty `tags:` line is
+        # harmless but noisy.
+        if isinstance(value, list):
+            if not value:
+                continue
+            lines.append(f"{field}:")
+            for item in value:
+                lines.append(f"  - {_yaml_escape(item)}")
+        else:
+            lines.append(f"{field}: {_yaml_escape(value)}")
 
     lines.append(f"processed_at: {datetime.datetime.now().isoformat(timespec='seconds')}")
 

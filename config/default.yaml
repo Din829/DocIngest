@@ -374,6 +374,57 @@ output:
       # Exiftool enrichment (populated when metadata.exiftool.enabled)
       - author
       - created_at
+      # Derived metadata — see output.derived_metadata below.
+      # Always-on (best-effort): created falls back to filesystem mtime
+      # when no embedded date is available; aliases / tags are produced
+      # from in-memory data already in metadata. Each one is an
+      # independent toggle under output.derived_metadata.* if a deployment
+      # wants to opt out.
+      - created
+      - created_source
+      - aliases
+      - tags
+
+  # Derived metadata — fields synthesised from data already extracted by
+  # parsers / hooks. Independent of any external tool. Disabling these
+  # only suppresses the field; the underlying source data is unaffected.
+  derived_metadata:
+    created:
+      enabled: true               # write `created` + `created_source`
+                                  # (false → leave both absent)
+    aliases:
+      enabled: true
+      max_count: 5                # cap on emitted aliases per file
+      # Garbage candidates — match (case-insensitive) and the candidate
+      # is dropped entirely. Used for boilerplate titles like "Untitled"
+      # or "Microsoft Word - Document1" that pollute search.
+      garbage_patterns:
+        - "^untitled\\d*$"
+        - "^document\\d*$"
+        - "^microsoft word - "
+        - "^slide\\d+$"
+        - "^\\s*$"
+      # Temp filename markers — match → candidate is DEMOTED (kept only
+      # when it would otherwise leave the alias list empty / undersized).
+      # These are version markers and copy artefacts that real documents
+      # may have, so we don't drop them outright.
+      temp_filename_patterns:
+        - "\\bv\\d+\\b"
+        - "\\bfinal\\b"
+        - "_copy$"
+        - "\\(\\d+\\)$"
+        - "^tmp[_\\-]"
+        - "副本"
+        - "复件"
+    tags:
+      enabled: true
+      include_format: true        # add format/<f> tag (e.g. format/pdf)
+      include_language: true      # add lang/<l> tag (e.g. lang/ja)
+      # Stage 2: after the knowledge_map is built, append kw/<word> tags
+      # using the corpus-wide TF-IDF filtered keyword index. Set false
+      # to keep tags as just format/lang.
+      enrich_from_knowledge_map: true
+      max_keyword_tags: 5         # per-file cap on kw/<word> additions
 
 # =============================================================================
 # Phase 3: Chunking
