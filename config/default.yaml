@@ -28,6 +28,11 @@ models:
     # when unset. Kept explicit here because dense PDF pages routinely need
     # the full 32K budget.
     max_response_tokens: 32768
+    # Wall-clock cap per Vision call (single page). null = no timeout.
+    # Catches hung API calls so as_completed() doesn't wait forever.
+    # Independent of litellm's network-level retry — this bounds the
+    # whole call (incl. retries) at the application layer.
+    timeout_sec: 180
     primary:
       provider: "google"
       model: "gemini-3-flash-preview"
@@ -70,6 +75,12 @@ models:
 # =============================================================================
 parsing:
   engine: "docling"           # docling | docling_with_fallback
+
+  # Wall-clock cap for a single file's parse step. null = no timeout.
+  # A hung Docling call (rare but possible on malformed PDFs) is caught
+  # here so the rest of the pipeline keeps moving. The file is recorded
+  # as failed with error_type="timeout".
+  timeout_sec: 300
 
   # Generic Markdown post-processing — applied to all non-xlsx formats
   # (PDF / DOCX / PPTX / HTML / plain Markdown). The xlsx path has its own
@@ -564,7 +575,7 @@ performance:
 # Error Handling
 # =============================================================================
 error_handling:
-  on_parse_failure: "skip"    # skip | retry | fail
+  on_parse_failure: "skip"    # skip | fail
   on_vision_failure: "skip"   # chart description fails → skip (text preserved)
   on_chunk_failure: "fallback" # chunk fails → fallback to recursive
   max_retries: 2

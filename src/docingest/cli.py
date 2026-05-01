@@ -25,7 +25,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from .config import load_config, get_nested
+from .config import load_config, get_nested, ConfigError
 from .parsers import create_parser
 from .chunkers import create_chunker
 from .pipeline import run_pipeline
@@ -37,6 +37,39 @@ app = typer.Typer(
     invoke_without_command=True,
 )
 console = Console()
+# Dedicated stderr console for banners, progress, and errors. Keeps stdout
+# clean for `--json` consumers (agents / subprocess callers) without
+# changing behaviour for interactive users — Rich still renders to a
+# terminal, just the other stream.
+err_console = Console(stderr=True)
+
+
+def _load_config_or_exit(
+    project_config_path: Path | None = None,
+    cli_overrides: dict | None = None,
+) -> dict:
+    """
+    Wrap ``load_config`` so config problems surface as a friendly stderr
+    message + exit code 1, instead of either an opaque traceback (yaml
+    syntax error) or a silent fall-through (mistyped -c path).
+
+    Library callers (docingest.api / direct imports) keep the raw
+    ConfigError contract — only the CLI converts to exit-code semantics.
+    """
+    try:
+        return load_config(
+            project_config_path=project_config_path,
+            cli_overrides=cli_overrides,
+        )
+    except ConfigError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+    except FileNotFoundError as e:
+        # Reachable only when the bundled default.yaml is missing (corrupt
+        # install). User-facing project-config "not found" is now a
+        # ConfigError, handled above.
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)
@@ -99,6 +132,16 @@ def main(
             "a no-op."
         ),
     ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "Emit the run summary as JSON to stdout (for agent / subprocess "
+            "consumption). Banner, errors and progress info still go to "
+            "stderr. Exit code is unchanged: 0 success, 1 failures, 2 "
+            "safety abort."
+        ),
+    ),
 ) -> None:
     """Process documents for RAG and Agentic Search."""
 
@@ -122,7 +165,7 @@ def main(
         if len(inputs) == 1:
             output = Path("./knowledge") / inputs[0].stem
         else:
-            console.print(
+            err_console.print(
                 "[red]Error:[/red] multiple inputs require an explicit "
                 "[bold]-o / --output[/bold] flag so each knowledge base "
                 "gets its own root.\n"
@@ -149,44 +192,61 @@ def main(
     if force:
         cli_overrides.setdefault("incremental", {})["force"] = True
 
-    # Load config
-    try:
-        config = load_config(
-            project_config_path=config_file,
-            cli_overrides=cli_overrides,
-        )
-    except FileNotFoundError as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    # Load config — friendly errors on bad path / yaml syntax / non-mapping
+    # top-level. See _load_config_or_exit for the exit-code semantics.
+    config = _load_config_or_exit(
+        project_config_path=config_file,
+        cli_overrides=cli_overrides,
+    )
 
     # Create parser and chunker
     parser = create_parser(config)
     chunker = create_chunker(config) if config.get("chunking", {}).get("enabled", True) else None
 
-    # Show start info
-    console.print(f"\n[bold]DocIngest[/bold] v0.1.0")
-    console.print(f"  Input:    {', '.join(str(p) for p in inputs)}")
-    console.print(f"  Output:   {output}")
-    console.print(f"  Chunking: {'disabled' if not chunker else config.get('chunking', {}).get('strategy', 'auto')}")
-    console.print()
+    # Show start info — always to stderr so `--json` consumers get a clean
+    # stdout. Interactive users see banner + table on the terminal as before.
+    err_console.print(f"\n[bold]DocIngest[/bold] v0.1.0")
+    err_console.print(f"  Input:    {', '.join(str(p) for p in inputs)}")
+    err_console.print(f"  Output:   {output}")
+    err_console.print(f"  Chunking: {'disabled' if not chunker else config.get('chunking', {}).get('strategy', 'auto')}")
+    err_console.print()
 
-    # Run pipeline
+    # Run pipeline. CLI opts in to the SIGINT handler so Ctrl+C stops
+    # gracefully (finish current file, write aggregates, exit 130).
+    # Library callers default to install_signal_handler=False so they
+    # keep their own signal handling.
     result = run_pipeline(
         input_paths=inputs,
         config=config,
         parser=parser,
         chunker=chunker,
         acknowledge_large=yes,
+        install_signal_handler=True,
     )
 
-    # Show results
-    _print_results(result)
+    # Show results — JSON to stdout for agents, Rich table to stderr-attached
+    # console for humans. Exit codes are unchanged regardless of mode.
+    if json_output:
+        _print_results_json(result)
+    else:
+        _print_results(result)
 
     # Safety strict-mode abort → exit 2, distinct from generic failure (1).
     # Using a separate code lets scripts/CI distinguish "budget exceeded,
     # re-run with --yes" from "something actually broke".
     if result.safety.get("aborted"):
         raise typer.Exit(2)
+
+    # Graceful interrupt (Ctrl+C between files) → exit 130 (128 + SIGINT).
+    # Aggregates were already written for completed files; rerun resumes
+    # via incremental cache.
+    if getattr(result, "interrupted", False):
+        if not json_output:
+            console.print(
+                "\n[yellow]Run interrupted — partial results saved at "
+                f"{output}. Rerun to resume from cache.[/yellow]"
+            )
+        raise typer.Exit(130)
 
     if result.failed > 0:
         raise typer.Exit(1)
@@ -295,6 +355,37 @@ def _print_results(result) -> None:
     console.print()
 
 
+def _print_results_json(result) -> None:
+    """Print pipeline results as a single JSON object to stdout.
+
+    Field shape mirrors `IngestResult.stats` (docingest.api) and the MCP
+    `run` tool's return value, so CLI subprocess callers, library callers,
+    and MCP callers all see the same keys.
+
+    Banner / errors / quality summary still go to stderr via the human
+    path; this function only writes the machine-consumable summary.
+    """
+    payload: dict = {
+        "total_files": result.total_files,
+        "successful": result.successful,
+        "failed": result.failed,
+        "total_chunks": result.total_chunks,
+        "total_tokens": result.total_tokens,
+        "elapsed_ms": result.elapsed_ms,
+        "errors": list(result.errors),
+        "quality": dict(result.quality),
+        "token_usage": dict(result.token_usage),
+        "safety": dict(result.safety),
+    }
+    if payload["safety"].get("aborted"):
+        payload["status"] = "aborted_by_safety"
+    # Plain stdout write — no Rich, no color, no markup. Agents parse this.
+    import json as _json
+    import sys as _sys
+    _sys.stdout.write(_json.dumps(payload, ensure_ascii=False, indent=2))
+    _sys.stdout.write("\n")
+
+
 # ---------------------------------------------------------------------------
 # Inspect subcommand
 # ---------------------------------------------------------------------------
@@ -321,11 +412,17 @@ def inspect_cmd(
     import json as json_mod
     from .inspect import inspect_files
 
-    config = load_config(project_config_path=config_file)
+    config = _load_config_or_exit(project_config_path=config_file)
     results = inspect_files(inputs, config)
 
     if json_output:
-        console.print(json_mod.dumps(results, indent=2, ensure_ascii=False))
+        # Plain stdout write — bypass Rich so subprocess callers parsing
+        # this JSON don't trip on Rich's terminal-width wrapping or markup
+        # interpretation of multi-byte filenames. Same pattern as
+        # `run --json` via `_print_results_json`.
+        import sys as _sys
+        _sys.stdout.write(json_mod.dumps(results, indent=2, ensure_ascii=False))
+        _sys.stdout.write("\n")
         return
 
     # Rich table output
@@ -374,7 +471,7 @@ def doctor_cmd() -> None:
     """Check environment: packages, external tools, API keys."""
     from .doctor import run_doctor, print_doctor
 
-    config = load_config()
+    config = _load_config_or_exit()
     results = run_doctor(config)
     print_doctor(results)
 
@@ -409,7 +506,7 @@ def refine_cmd(
     """Refine Markdown files for human readability (AI-powered)."""
     from .refine import refine_files
 
-    config = load_config(project_config_path=config_file)
+    config = _load_config_or_exit(project_config_path=config_file)
 
     # Infer output_dir from first file if not specified
     # e.g. knowledge/sources/xxx.md → knowledge/

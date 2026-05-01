@@ -30,6 +30,21 @@ _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config" / "default.yaml"
 
 
 # ---------------------------------------------------------------------------
+# Public exception
+# ---------------------------------------------------------------------------
+
+class ConfigError(Exception):
+    """
+    Raised by load_config / load_yaml when a user-facing config problem is
+    detected: explicit -c path missing, YAML syntax error, top-level not a
+    mapping, etc. CLI catches this and prints a friendly hint; library
+    callers can catch it instead of yaml.YAMLError + FileNotFoundError +
+    silent {} fallthrough.
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
 # Deep merge utility
 # ---------------------------------------------------------------------------
 
@@ -61,12 +76,49 @@ def deep_merge(base: dict, override: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def load_yaml(path: Path) -> dict[str, Any]:
-    """Load a YAML file. Returns empty dict if file doesn't exist."""
+    """
+    Load a YAML file as a mapping.
+
+    Behaviour:
+      - Path does not exist → returns {} (auto-discovery callers rely on this).
+      - File exists but YAML is malformed → raises ConfigError with file +
+        line/column hint.
+      - File loads but top-level is not a mapping (a list, scalar, or null)
+        → raises ConfigError. Callers expect dict-shaped config.
+      - File loads as an empty document (`null` / whitespace) → returns {}
+        (treated as "user wrote nothing", not a structural error).
+    """
     if not path.exists():
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    return data if isinstance(data, dict) else {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        # PyYAML attaches mark info on parser errors — surface it when
+        # available so users see the exact line. Fall through to the bare
+        # message otherwise.
+        mark = getattr(e, "problem_mark", None)
+        if mark is not None:
+            location = f" at line {mark.line + 1}, column {mark.column + 1}"
+        else:
+            location = ""
+        raise ConfigError(
+            f"failed to parse config: {path}\n"
+            f"  yaml error{location}: {getattr(e, 'problem', None) or e}\n"
+            f"  Hint: check indentation / quoting around that spot. "
+            f"See config/default.yaml for the expected shape."
+        ) from e
+
+    if data is None:
+        # Empty file — treat as no overrides, not an error.
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(
+            f"config file {path} top-level must be a mapping (key: value), "
+            f"got {type(data).__name__}.\n"
+            f"  Hint: see config/default.yaml for the expected shape."
+        )
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +246,20 @@ def load_config(
         )
 
     # Layer 2: Project config (optional)
+    # When the caller passed an explicit path, treat "missing" as a hard
+    # error — silent fall-through used to let typos like `-c bad.yaml` look
+    # like a successful run that ignored the user's overrides.
+    # When auto-discovering (no path passed), missing is fine — the project
+    # simply has no overrides.
     if project_config_path is not None:
         project_path = Path(project_config_path)
+        if not project_path.exists():
+            raise ConfigError(
+                f"config file not found: {project_path}\n"
+                f"  Hint: check the path, or omit -c / --config to "
+                f"auto-discover docingest.yaml in the current directory."
+            )
     else:
-        # Auto-discover docingest.yaml in current working directory
         project_path = Path.cwd() / "docingest.yaml"
 
     if project_path.exists():

@@ -20,7 +20,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -59,6 +59,20 @@ class FileResult:
     format: str = ""
     success: bool = True
     error: str = ""
+    # Coarse classification of `error` so downstream consumers (Agent / MCP /
+    # CI) can branch without grepping the message. Empty string = unclassified
+    # (legacy callers that bypass process_single_file stay unaffected).
+    # Vocabulary — currently emitted by the pipeline:
+    #   ""               unclassified / success
+    #   "timeout"        wall-clock cap exceeded (parse / vision)
+    #   "parse_error"    parser raised or returned success=False
+    #   "io_error"       FileNotFoundError / PermissionError / OSError
+    # Reserved for future use (consumers may match defensively, but the
+    # pipeline does not emit these today):
+    #   "chunk_error"    reserved — chunker failures currently surface as parse_error
+    #   "interrupted"    reserved — graceful-stop skipped files don't produce an error entry today
+    #   "unknown"        reserved catch-all
+    error_type: str = ""
     chunks_count: int = 0
     tokens_estimated: int = 0
     parse_time_ms: int = 0
@@ -92,6 +106,12 @@ class PipelineResult:
     total_tokens: int = 0
     elapsed_ms: int = 0
     errors: list[dict[str, Any]] = field(default_factory=list)
+    # True when the run was halted by SIGINT (Ctrl+C) between files.
+    # Aggregate outputs (chunks.jsonl, index.json, knowledge_map) still
+    # write the partial result for already-processed files. False on a
+    # normal completion or on a forced exit (Ctrl+C×2, which propagates
+    # KeyboardInterrupt out of the pipeline).
+    interrupted: bool = False
     # Quality report summary (populated after Phase 4 if enabled).
     # Keys: total_files, files_with_issues, total_questions, total_unreadable,
     #       quality_score, files (only files with issues).
@@ -1073,19 +1093,28 @@ def _enrich_with_vision(
 
     doc_format = parse_result.metadata.get("format")
 
+    vision_timeout = get_nested(config, "models.vision.timeout_sec", 180)
+
     def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
+        from .utils.timeout import run_with_timeout
         try:
             # page_data.page_no is 1-based and matches the hook's
             # convention for populating structured_extractions_per_page.
             struct_data = structured_per_page.get(page_data.page_no)
-            return idx, describe_page_cached(
-                image_path=page_data.image_path,
-                page_text=page_data.text,
-                config=config,
-                cache=cache,
-                structured_data=struct_data,
-                doc_format=doc_format,
+            return idx, run_with_timeout(
+                lambda: describe_page_cached(
+                    image_path=page_data.image_path,
+                    page_text=page_data.text,
+                    config=config,
+                    cache=cache,
+                    structured_data=struct_data,
+                    doc_format=doc_format,
+                ),
+                vision_timeout,
             )
+        except TimeoutError as e:
+            logger.warning(f"Vision timed out for page {page_data.page_no}: {e}")
+            return idx, None
         except Exception as e:
             logger.warning(f"Vision failed for page {page_data.page_no}: {e}")
             return idx, None
@@ -1466,11 +1495,27 @@ def process_single_file(
 
     # --- Phase 1: Parse ---
     t0 = time.monotonic()
+    parse_timeout = get_nested(config, "parsing.timeout_sec", 300)
     try:
-        parse_result = parser.parse(file_path, override_stream=override_stream)
+        from .utils.timeout import run_with_timeout
+        parse_result = run_with_timeout(
+            lambda: parser.parse(file_path, override_stream=override_stream),
+            parse_timeout,
+        )
+    except TimeoutError as e:
+        result.success = False
+        result.error = f"Parse timed out: {e}"
+        result.error_type = "timeout"
+        return result, []
+    except (FileNotFoundError, PermissionError, OSError) as e:
+        result.success = False
+        result.error = f"Parse failed (io): {e}"
+        result.error_type = "io_error"
+        return result, []
     except Exception as e:
         result.success = False
         result.error = f"Parse failed: {e}"
+        result.error_type = "parse_error"
         return result, []
     result.parse_time_ms = int((time.monotonic() - t0) * 1000)
 
@@ -1480,10 +1525,12 @@ def process_single_file(
         if on_failure == "fail":
             result.success = False
             result.error = parse_result.error
+            result.error_type = "parse_error"
             return result, []
         # "skip" — mark as failed but continue pipeline for other files
         result.success = False
         result.error = parse_result.error
+        result.error_type = "parse_error"
         return result, []
 
     result.format = parse_result.metadata.get("format", "unknown")
@@ -1803,6 +1850,8 @@ def run_pipeline(
     chunker: BaseChunker | None = None,
     *,
     acknowledge_large: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+    install_signal_handler: bool = False,
 ) -> PipelineResult:
     """
     Run the full DocIngest pipeline.
@@ -1818,6 +1867,33 @@ def run_pipeline(
             --yes, MCP's acknowledge_large argument, or Python API users)
             expose this flag; the default False preserves strict mode's
             refuse-to-run behaviour.
+        on_progress: Optional callback invoked once per file completion
+            (cached, processed, failed, or skipped due to interrupt).
+            Receives a single dict argument — see "Progress events" below.
+            Exceptions raised from the callback are swallowed (logged at
+            warning level) so a buggy callback cannot break the run.
+        install_signal_handler: When True, install a SIGINT handler for
+            the duration of the run so Ctrl+C triggers a graceful stop
+            (finish current file, write aggregates, exit). Default False
+            because library callers usually want their own signal handling
+            to stay in effect; the CLI passes True. No-op when not on the
+            main thread.
+
+    Progress events:
+        Each call to ``on_progress`` receives a dict shaped like::
+
+            {
+                "kind":        "file_done",
+                "status":      "cached" | "added" | "updated" | "forced"
+                               | "failed" | "skipped",
+                "file":        "<basename>",
+                "current":     <1-based count of completed files>,
+                "total":       <total files in this run>,
+                "chunks":      <chunks produced for this file>,
+                "elapsed_ms":  <int — 0 for cached / skipped>,
+                "error":       <str | None — populated when status=="failed">,
+                "error_type":  <str — "" when success>,
+            }
 
     Returns:
         PipelineResult with details of all processed files. When safety
@@ -1891,6 +1967,45 @@ def run_pipeline(
         except Exception as e:
             # Phase 0 is advisory; a bug here must not kill the pipeline.
             _pipeline_logger.warning(f"Safety check failed, skipping: {e}")
+
+    # Progress reporting — opt-in callback fired once per file completion.
+    # `_progress_total` is fixed at the top of the run; `_progress_done`
+    # increments uniformly across cached / processed / skipped paths so
+    # `current/total` is meaningful for a UI progress bar.
+    _progress_total = len(files)
+    _progress_done = 0
+
+    def _emit_progress(
+        *,
+        status: str,
+        file_basename: str,
+        chunks: int = 0,
+        elapsed_ms: int = 0,
+        error: str | None = None,
+        error_type: str = "",
+    ) -> None:
+        nonlocal _progress_done
+        _progress_done += 1
+        if on_progress is None:
+            return
+        event = {
+            "kind": "file_done",
+            "status": status,
+            "file": file_basename,
+            "current": _progress_done,
+            "total": _progress_total,
+            "chunks": chunks,
+            "elapsed_ms": elapsed_ms,
+            "error": error,
+            "error_type": error_type,
+        }
+        try:
+            on_progress(event)
+        except Exception as e:
+            _pipeline_logger.warning(
+                f"on_progress callback raised "
+                f"{type(e).__name__}: {e}; ignored."
+            )
 
     # Track used output filenames (for dedup across files)
     existing_names: set[str] = set()
@@ -2002,77 +2117,157 @@ def run_pipeline(
             except OSError as e:
                 _pipeline_logger.warning(f"Could not update meta for {file_path.name}: {e}")
 
-    # --- Process uncached files: full pipeline ---
-    for file_path, prior_meta, cache_reason in to_process:
-        file_result, file_chunks = process_single_file(
-            file_path=file_path,
-            parser=parser,
-            chunker=chunker,
-            config=config,
-            output_dir=output_dir,
-            existing_names=existing_names,
+        _emit_progress(
+            status="cached",
+            file_basename=file_path.name,
+            chunks=file_result.chunks_count,
         )
 
-        # Tag lifecycle status for run_log. Order matters:
-        #   failure wins → forced wins over added/updated (it's a full
-        #   rebuild regardless of prior state) → prior_meta distinguishes
-        #   "added" (first time) from "updated" (cache invalidated).
-        if not file_result.success:
-            file_result.status = "failed"
-        elif force_rebuild:
-            file_result.status = "forced"
-        elif prior_meta is None:
-            file_result.status = "added"
-        else:
-            file_result.status = "updated"
-            file_result.cache_reason = cache_reason
+    # --- Process uncached files: full pipeline ---
+    # Graceful interrupt: first Ctrl+C sets a flag; the loop finishes the
+    # current file then breaks out to write aggregate outputs (chunks.jsonl,
+    # index.json, knowledge_map). Second Ctrl+C re-raises KeyboardInterrupt
+    # for a hard exit. signal.signal() must run on the main thread; if we're
+    # not on it (e.g. embedded in another runtime) we skip silently and the
+    # default SIGINT behaviour stands.
+    import signal as _signal
+    import threading as _threading
 
-        pipeline_result.files.append(file_result)
+    _stop_requested = {"flag": False}
+    _prev_sigint = None
+    _installed_handler = False
 
-        if file_result.success:
-            pipeline_result.successful += 1
-            pipeline_result.total_chunks += file_result.chunks_count
-            pipeline_result.total_tokens += file_result.tokens_estimated
-            new_chunks.extend(file_chunks)
+    def _on_sigint(_signum, _frame):
+        if _stop_requested["flag"]:
+            # Second interrupt → restore default and re-raise so the user
+            # gets an immediate exit.
+            _signal.signal(_signal.SIGINT, _signal.default_int_handler)
+            raise KeyboardInterrupt
+        _stop_requested["flag"] = True
+        _pipeline_logger.warning(
+            "Interrupt received — finishing current file then writing "
+            "aggregate outputs. Press Ctrl+C again to force exit."
+        )
 
-            # Add to index (returns the entry so we can store it in meta.json)
-            index_entry = index_builder.add_file(
-                parse_result=_make_index_parse_result(file_result, output_dir),
-                original_file=file_path,
-                output_path=output_dir / file_result.output_path,
+    # Install only when explicitly requested AND on the main thread.
+    # CLI passes install_signal_handler=True; library callers default to
+    # False so DocIngest does not preempt the host's own signal handling.
+    if install_signal_handler and _threading.current_thread() is _threading.main_thread():
+        try:
+            _prev_sigint = _signal.signal(_signal.SIGINT, _on_sigint)
+            _installed_handler = True
+        except (ValueError, OSError):
+            # ValueError: not in main thread; OSError: signal unavailable.
+            # Either way, fall through with no handler.
+            _installed_handler = False
+
+    try:
+        for _idx, (file_path, prior_meta, cache_reason) in enumerate(to_process):
+            if _stop_requested["flag"]:
+                remaining_paths = [t[0] for t in to_process[_idx:]]
+                _pipeline_logger.warning(
+                    f"Stopping early due to interrupt; "
+                    f"{len(remaining_paths)} file(s) left unprocessed. "
+                    f"Aggregate outputs will be written for completed files."
+                )
+                pipeline_result.interrupted = True
+                # Emit one "skipped" event per remaining file so a UI's
+                # progress bar can still reach 100% — the run is over,
+                # the caller should know how many were dropped.
+                for skipped in remaining_paths:
+                    _emit_progress(
+                        status="skipped",
+                        file_basename=skipped.name,
+                    )
+                break
+
+            file_result, file_chunks = process_single_file(
+                file_path=file_path,
+                parser=parser,
+                chunker=chunker,
+                config=config,
                 output_dir=output_dir,
-                chunks_count=file_result.chunks_count,
+                existing_names=existing_names,
             )
 
-            # Persist meta.json for next incremental run
-            if incremental_enabled:
-                try:
-                    from .output.chunks_writer import build_chunk_id
-                    cache_key = compute_cache_key(file_path)
-                    chunk_ids = [build_chunk_id(c) for c in file_chunks]
-                    asset_rels = _collect_asset_rels_for_file(file_path, output_dir, config)
-                    meta = build_meta(
-                        file_path=file_path,
-                        cache_key=cache_key,
-                        config_hash=config_hash,
-                        format_str=file_result.format,
-                        source_md_rel=file_result.output_path,
-                        asset_rels=asset_rels,
-                        chunk_ids=chunk_ids,
-                        index_entry=index_entry,
-                    )
-                    save_cached_meta(cache_dir, meta)
-                except Exception as e:
-                    _pipeline_logger.warning(
-                        f"Could not save incremental cache for {file_path.name}: {e}"
-                    )
-        else:
-            pipeline_result.failed += 1
-            pipeline_result.errors.append({
-                "file": file_result.original_file,
-                "error": file_result.error,
-            })
-            index_builder.add_error()
+            # Tag lifecycle status for run_log. Order matters:
+            #   failure wins → forced wins over added/updated (it's a full
+            #   rebuild regardless of prior state) → prior_meta distinguishes
+            #   "added" (first time) from "updated" (cache invalidated).
+            if not file_result.success:
+                file_result.status = "failed"
+            elif force_rebuild:
+                file_result.status = "forced"
+            elif prior_meta is None:
+                file_result.status = "added"
+            else:
+                file_result.status = "updated"
+                file_result.cache_reason = cache_reason
+
+            pipeline_result.files.append(file_result)
+
+            if file_result.success:
+                pipeline_result.successful += 1
+                pipeline_result.total_chunks += file_result.chunks_count
+                pipeline_result.total_tokens += file_result.tokens_estimated
+                new_chunks.extend(file_chunks)
+
+                # Add to index (returns the entry so we can store it in meta.json)
+                index_entry = index_builder.add_file(
+                    parse_result=_make_index_parse_result(file_result, output_dir),
+                    original_file=file_path,
+                    output_path=output_dir / file_result.output_path,
+                    output_dir=output_dir,
+                    chunks_count=file_result.chunks_count,
+                )
+
+                # Persist meta.json for next incremental run
+                if incremental_enabled:
+                    try:
+                        from .output.chunks_writer import build_chunk_id
+                        cache_key = compute_cache_key(file_path)
+                        chunk_ids = [build_chunk_id(c) for c in file_chunks]
+                        asset_rels = _collect_asset_rels_for_file(file_path, output_dir, config)
+                        meta = build_meta(
+                            file_path=file_path,
+                            cache_key=cache_key,
+                            config_hash=config_hash,
+                            format_str=file_result.format,
+                            source_md_rel=file_result.output_path,
+                            asset_rels=asset_rels,
+                            chunk_ids=chunk_ids,
+                            index_entry=index_entry,
+                        )
+                        save_cached_meta(cache_dir, meta)
+                    except Exception as e:
+                        _pipeline_logger.warning(
+                            f"Could not save incremental cache for {file_path.name}: {e}"
+                        )
+            else:
+                pipeline_result.failed += 1
+                pipeline_result.errors.append({
+                    "file": file_result.original_file,
+                    "error": file_result.error,
+                    "error_type": file_result.error_type,
+                })
+                index_builder.add_error()
+
+            # Emit one progress event per processed file. file_result.status
+            # is one of: added | updated | forced | failed (set above).
+            _emit_progress(
+                status=file_result.status or "added",
+                file_basename=file_path.name,
+                chunks=file_result.chunks_count,
+                elapsed_ms=file_result.parse_time_ms + file_result.chunk_time_ms,
+                error=file_result.error or None,
+                error_type=file_result.error_type,
+            )
+    finally:
+        if _installed_handler:
+            try:
+                _signal.signal(_signal.SIGINT, _prev_sigint)
+            except (ValueError, OSError):
+                pass
 
     # Write index.json
     index_builder.write_index(output_dir)

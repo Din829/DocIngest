@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Callable, Union
 
 from .config import load_config, deep_merge, get_nested
 from .providers import VisionProvider, AudioProvider, TextProvider
@@ -229,6 +229,8 @@ def ingest(
     config_file: str | Path | None = None,
     force: bool = False,
     acknowledge_large: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+    install_signal_handler: bool = False,
 ) -> IngestResult:
     """
     Process documents into a knowledge base (library entry point).
@@ -258,6 +260,16 @@ def ingest(
         force: Ignore incremental cache and reprocess all files.
         acknowledge_large: When ``safety.mode`` is ``"strict"`` and the
             pre-run check flags violations, set this to proceed anyway.
+        on_progress: Optional callback fired once per file completion
+            (cached, processed, failed, or skipped due to a graceful
+            interrupt). Receives a single dict — see
+            :func:`docingest.pipeline.run_pipeline` for the event schema.
+            Useful for piping progress to a UI / SSE stream.
+        install_signal_handler: When True, the pipeline installs its
+            graceful-stop SIGINT handler for the duration of the run.
+            Default False so library callers (web servers, long-running
+            hosts) keep their own signal handling intact. The CLI passes
+            True to give users the expected Ctrl+C-stops-cleanly behaviour.
 
     Returns:
         :class:`IngestResult` — statistics + actual artefact contents
@@ -308,6 +320,8 @@ def ingest(
         parser=parser,
         chunker=chunker,
         acknowledge_large=acknowledge_large,
+        on_progress=on_progress,
+        install_signal_handler=install_signal_handler,
     )
 
     # Build IngestResult by reading artefacts back from disk, filtered by
@@ -523,6 +537,7 @@ def _pipeline_stats(pipeline_result: Any) -> dict[str, Any]:
         "quality": dict(pipeline_result.quality),
         "token_usage": dict(pipeline_result.token_usage),
         "safety": dict(pipeline_result.safety),
+        "interrupted": bool(getattr(pipeline_result, "interrupted", False)),
     }
 
 
