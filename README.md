@@ -171,6 +171,17 @@ result = docingest.ingest(
 )
 ```
 
+**Progress callback (optional)** — pass `on_progress=...` to receive one event per file completion (cached / added / updated / failed / skipped). Useful when piping progress to a UI or SSE stream. The callback runs synchronously on the pipeline thread; exceptions are swallowed (logged at warning level) so a buggy callback can't break the run:
+
+```python
+def on_event(e):
+    print(f"[{e['current']}/{e['total']}] {e['file']} — {e['status']}")
+
+docingest.ingest("./docs/", output="./kb/", on_progress=on_event)
+```
+
+**Signal handling** — by default DocIngest does NOT install a SIGINT handler when used as a library, so embedding it in a long-running host (web server, daemon) leaves your own Ctrl+C handling intact. The CLI opts in to graceful Ctrl+C (`install_signal_handler=True`); library callers can do the same explicitly when running stand-alone.
+
 **Return value** — `IngestResult` carries the produced artefacts so callers don't have to re-read the output directory:
 
 | Field | Populated when | Shape |
@@ -454,6 +465,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rati
 - **Knowledge Map** — auto-generated search guide + keyword reverse index. Optional SudachiPy integration for high-precision Japanese keyword extraction (language-routed: Japanese → SudachiPy, Chinese/Korean/English → regex).
 - **Multi-provider** — Gemini / OpenAI / Anthropic / DashScope with automatic fallback.
 - **Network-level retry** — every LLM call (Vision / text completion / ASR) passes `num_retries` to litellm, which applies exponential backoff on transient errors (rate limits, 5xx, TCP resets). Default 2 retries via `models.defaults.max_retries`; per-task override (e.g. `models.vision.max_retries: 5` for a flaky endpoint). Orthogonal to truncation retry (`retry_on_truncation`) which sits at the application layer.
+- **Wall-clock timeouts** — bounded parse and Vision calls so a single hung file can't stall the run. `parsing.timeout_sec` (default 300s) caps Docling per file; `models.vision.timeout_sec` (default 180s) caps each Vision page call. On timeout the file is recorded as failed with `error_type: "timeout"` in `errors.json` and the pipeline continues. Set either to `null` to disable.
+- **Graceful interrupt** — Ctrl+C between files lets the current file finish, then writes `chunks.jsonl` / `index.json` / `knowledge_map.yaml` for everything completed so far and exits with code 130. Rerun resumes from the incremental cache. Press Ctrl+C twice for a hard exit.
+- **Classified errors** — `errors.json` entries carry an `error_type` field (`timeout` / `parse_error` / `chunk_error` / `io_error` / `interrupted` / `unknown`) so downstream consumers can branch without grepping the message.
 - **Per-format Vision overrides** — `parsing.<pdf|pptx|docx|xlsx>.vision` shallow-merges over the global Vision config to tune `model` / `max_response_tokens` / `image_dpi` per format. Raise DPI for dense PDFs, cap output for content-light PPTs, swap models for scans — without affecting other formats. Unset fields fall through to global.
 - **Cross-platform binary finder** — auto-discovers LibreOffice, ffmpeg, yt-dlp, exiftool on Windows/macOS/Linux standard paths.
 - **Config-driven** — all thresholds, strategies, models in YAML. No hardcoding.
@@ -492,4 +506,4 @@ your own changes.
 ## Documentation
 
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt
-- **[MARKITDOWN_BORROW.md](MARKITDOWN_BORROW.md)** — Historical log of features borrowed from MarkItDown (archived)
+- **[INTEGRATION.md](INTEGRATION.md)** — How to integrate DocIngest into your own system (CLI subprocess / Python library / MCP), per-scenario recipes, cross-cutting concerns
