@@ -16,6 +16,8 @@ DocIngest is a moving target. Treat the recipes here as starting points, not con
 
 Public Python API surface is exactly what `docingest/__init__.py` re-exports — `ingest`, `inspect`, `refine`, `IngestResult`, `build_config`, and the Provider classes. Everything else (`docingest.pipeline`, `docingest.parsers`, `docingest.chunkers`, ...) is internal and may change without notice.
 
+**Optional graph layer** — `docingest.graph` is a separately-versioned subpackage exposing `build` / `query` / `status` for an opt-in GraphRAG layer on top of the main pipeline's outputs. It is NOT auto-imported and requires `pip install -e ".[graph]"`. Import explicitly: `import docingest.graph`. See README.md "GraphRAG (optional)" and ARCHITECTURE.md §10 for details.
+
 ---
 
 ## Scenarios

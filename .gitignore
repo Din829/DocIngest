@@ -11,6 +11,7 @@ build/
 # Knowledge outputs (user-generated, not source code)
 # All output goes under knowledge/<name>/ subdirectories
 knowledge/
+kb_*/
 
 # Test outputs (generated during test runs)
 tests/incremental/out/

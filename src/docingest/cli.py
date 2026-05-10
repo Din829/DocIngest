@@ -36,6 +36,18 @@ app = typer.Typer(
     add_completion=False,
     invoke_without_command=True,
 )
+
+# Optional GraphRAG subcommand — registered only when the docingest.graph
+# subpackage imports cleanly (i.e. the [graph] extras are installed). The
+# graph subpackage's own __init__ defers heavy imports, so this try/except
+# is cheap when extras ARE installed and entirely silent when they aren't.
+# Failure here must never block the rest of the CLI from working.
+try:
+    from .graph.cli import graph_app
+    app.add_typer(graph_app, name="graph")
+except ImportError:
+    pass
+
 console = Console()
 # Dedicated stderr console for banners, progress, and errors. Keeps stdout
 # clean for `--json` consumers (agents / subprocess callers) without

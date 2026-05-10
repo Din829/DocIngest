@@ -847,3 +847,151 @@ sanitize:
   rules: null                       # null = use built-in defaults
 
   # Key = sha256(model_id + file_content_hash + relevant_config_hash)
+
+# =============================================================================
+# GraphRAG (optional — requires `pip install -e ".[graph]"`)
+# =============================================================================
+# Builds an entity / relation knowledge graph + (optionally) community
+# summaries on top of the chunks.jsonl that the main pipeline produces.
+# This is a strictly OPT-IN downstream stage — main `docingest run` never
+# touches it, the import path `docingest.graph` only loads when explicitly
+# imported, and the produced files live in {output.dir}/{graph.output_subdir}/
+# so deleting the directory leaves the rest of the knowledge base intact.
+#
+# Two retrieval modes (selected per build, baked into the index):
+#   vector_only  — entity + relation embeddings only. Cheap. Single / two-hop
+#                  questions and "find me content about X" style retrieval.
+#                  Skips community detection + community summaries entirely.
+#                  (Maps to LightRAG's "naive" + "local" query modes.)
+#   full         — adds Leiden community detection + per-community LLM
+#                  summaries. Enables global / hybrid / mix queries that
+#                  answer "what are the main themes / trends" style
+#                  questions. (Maps to LightRAG's full mode set.)
+#
+# Default OFF. Even when enabled, no work runs until the user invokes
+# `docingest graph build` or `docingest.graph.build()` explicitly.
+graph:
+  enabled: false                       # master switch — default OFF
+  backend: "lightrag"                  # lightrag (only backend in v1)
+  mode: "full"                         # vector_only | full
+  output_subdir: "graph"               # relative to output.dir
+
+  # Which chunks feed the graph. Sourced exclusively from chunks.jsonl —
+  # graph build NEVER re-parses original documents.
+  input:
+    chunks_file: "chunks.jsonl"        # relative to output.dir
+    # Restrict to specific source formats. null = all formats.
+    formats: null                      # e.g. ["pdf", "docx"]
+    # Skip chunks shorter than this — page-headers / numbers / boilerplate
+    # produce noise during entity extraction.
+    min_chunk_tokens: 50
+
+  # LLM for entity / relation extraction + community summaries.
+  # Independent from models.vision / models.chunking_assist — graph is a
+  # separate task that often wants a cheaper / smaller model. The shape
+  # mirrors models.<task> exactly (primary / fallback / max_response_tokens
+  # / max_retries) so the same provider.py code paths apply.
+  llm:
+    primary:
+      provider: "openai"
+      model: "gpt-5.4-mini"
+      api_key_env: "OPENAI_API_KEY"
+    fallback:
+      provider: "google"
+      model: "gemini-3-flash-preview"
+      api_key_env: "GEMINI_API_KEY"
+    max_response_tokens: 8192          # entity extraction returns structured
+                                       # JSON — 8K is plenty for typical chunks
+
+  # Embedding model — independent from LLM (different provider OK).
+  # Cannot be changed after first build without --force-rebuild: vector
+  # dimensions are baked into the index files at creation time.
+  embedding:
+    provider: "openai"                 # openai | google | sentence_transformers
+    model: "text-embedding-3-small"
+    api_key_env: "OPENAI_API_KEY"
+    dimension: 1536                    # MUST match the chosen model
+    max_token_size: 8192               # max input tokens per embedding call
+    max_batch_size: 32                 # batch size for ainsert
+
+  # LightRAG-specific knobs. Other backends ignore unknown keys.
+  lightrag:
+    # LightRAG re-chunks internally — we feed DocIngest chunks as input,
+    # but LightRAG may merge adjacent ones up to this size before doing
+    # entity extraction. Default 1200 matches LightRAG's own default.
+    chunk_token_size: 1200
+    chunk_overlap_token_size: 100
+    # Extra LLM passes per chunk to recover entities the first pass missed.
+    # 0 = no extra pass; 1 = one extra (recommended); 2+ rapidly hits
+    # diminishing returns at multiplied cost.
+    entity_extract_max_gleaning: 1
+    # LightRAG's own per-prompt LLM result cache (separate from DocIngest's
+    # extraction cache below; both layers compose).
+    enable_llm_cache: true
+    # Output language passed to LightRAG's prompt templates. "auto" reads
+    # the dominant language from the knowledge base's index.json language
+    # tally; explicit values ("English" / "Chinese" / "Japanese" / ...)
+    # bypass detection.
+    language: "auto"
+    # Community detection knobs (only consulted when graph.mode == "full").
+    community:
+      algorithm: "leiden"              # leiden (LightRAG's default)
+      max_cluster_size: 10
+      max_levels: 3                    # depth of community hierarchy
+
+  # Incremental cache — reuses extraction results when chunk content
+  # unchanged. Keyed by (chunk_id + content_hash + llm_config_hash). This
+  # is independent of incremental.* (which guards the main pipeline) and
+  # of LightRAG's own LLM cache (which dedups by exact prompt). All three
+  # compose: a chunk that hasn't changed AND has a matching LLM config
+  # skips extraction entirely; if extraction does run, identical prompts
+  # hit LightRAG's prompt cache.
+  cache:
+    enabled: true
+    cache_dir: ".graph_cache"          # relative to output.dir
+
+  # Chunk enrichment — feed the graph's entity / description back into a
+  # NEW jsonl file so traditional RAG (vector search on chunks) also gets
+  # to use what GraphRAG extracted. The original chunks.jsonl is NEVER
+  # modified — enrichment writes a parallel output_file the user can opt
+  # to consume instead. Deleting that file leaves everything else intact.
+  #
+  # Why bother:
+  # - Synonym recall: "修繕費" → matches a chunk where the entity is
+  #   "原状回復費用" (their descriptions are now adjacent in the embedding
+  #   space).
+  # - Anchor signal: in a 1000-token chunk where 30 tokens are about
+  #   "敷金", an explicit "[关键实体: 敷金 — 預かり金]" header gives the
+  #   embedding model a clearer anchor.
+  # - Metadata filtering: vector DBs can do `WHERE entities CONTAINS '敷金'`
+  #   when the field is in metadata.
+  enrich_chunks:
+    enabled: false                     # master toggle — default OFF
+    output_file: "chunks_enriched.jsonl"  # written next to chunks.jsonl
+
+    # How many entities to inject per chunk. Picked from those whose graph
+    # source_id includes that chunk, sorted by:
+    #   1) chunks where the entity is exclusive (only this chunk) — most
+    #      "definitional", highest signal
+    #   2) shorter entity names (longer names are usually doc-headers /
+    #      boilerplate carrying low information density)
+    max_entities_per_chunk: 5
+
+    # Per-entity description truncation, characters. The whole point is a
+    # short anchor; full LLM-generated descriptions can be 200+ chars and
+    # would balloon every chunk uselessly.
+    max_description_length: 100
+
+    # Two independent injection channels — disable either to keep the
+    # other. Most users want both.
+    inject_into_text: true             # adds "[关键实体: ...]" header line
+                                       # → benefits pure vector RAG
+    inject_into_metadata: true         # adds metadata.entities = [...]
+                                       # → benefits metadata filtering / hybrid search
+
+    # Templated so the injected line works in any language. {entities} is
+    # the joined entity string; per-entity formatting uses
+    # name_desc_separator.
+    text_template: "[关键实体: {entities}]"
+    entity_separator: "; "             # between consecutive entities
+    name_desc_separator: " — "         # between entity name and its description

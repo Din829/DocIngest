@@ -54,11 +54,31 @@ mcp = [
 audio = [
     "dashscope",              # Qwen3-ASR (default audio transcription engine)
 ]
+graph = [
+    # Optional GraphRAG layer (docingest.graph). Loads only when explicitly
+    # imported via `import docingest.graph`; main `docingest run` works
+    # unchanged without these installed.
+    "lightrag-hku>=1.0,<2.0", # Knowledge graph + community detection backend
+    "openai>=1.50",           # OpenAI embeddings (default embedding provider)
+    # numpy is already a transitive dep of docling/litellm; no need to pin.
+]
+graph-local = [
+    # Local sentence-transformers embeddings (zero API cost). Adds ~2 GB of
+    # PyTorch wheels — kept separate so users opting for OpenAI / Gemini
+    # embeddings don't pay this download.
+    "sentence-transformers>=2.7",
+]
+graph-gemini = [
+    # Optional: Gemini embeddings via google-generativeai. Most users on
+    # the [graph] path use OpenAI embeddings; opt in only if you want
+    # Gemini's text-embedding-004.
+    "google-generativeai>=0.7",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
-# Install everything: pip install -e ".[nlp,mcp,audio,ocr]"
+# Install everything: pip install -e ".[nlp,mcp,audio,ocr,graph]"
 
 [project.scripts]
 docingest = "docingest.cli:app"

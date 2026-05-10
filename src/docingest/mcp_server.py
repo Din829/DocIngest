@@ -659,6 +659,243 @@ def read_source(
 
 
 # ---------------------------------------------------------------------------
+# Optional GraphRAG tools — registered only when docingest.graph imports
+# cleanly (i.e. the [graph] extras are installed). When the extras are not
+# installed the tools simply don't appear in the listing; the rest of the
+# MCP server is unaffected. Stays consistent with the CLI's conditional
+# registration at src/docingest/cli.py.
+# ---------------------------------------------------------------------------
+
+try:
+    # Probe-import only — the actual graph module is re-imported inside each
+    # tool body via `from . import graph` so static type checkers can see
+    # the binding regardless of whether the probe succeeded.
+    from . import graph as _graph_probe  # noqa: F401 — import probe only
+    _GRAPH_AVAILABLE = True
+except ImportError:
+    _GRAPH_AVAILABLE = False
+
+
+if _GRAPH_AVAILABLE:
+
+    @mcp.tool
+    def build_graph(
+        knowledge_dir: str,
+        mode: str | None = None,
+        force: bool = False,
+        config_overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Build (or incrementally extend) a knowledge graph on top of an
+        existing knowledge base produced by the `run` tool.
+
+        WHEN TO USE
+        - Only after a successful `run` produced chunks.jsonl in the same
+          knowledge_dir. Graph build never re-parses original documents.
+        - When the user wants to ask MULTI-HOP or GLOBAL questions
+          ("themes / trends / connections across the corpus") that
+          ordinary RAG can't answer well.
+        - SKIP when the user only needs single-document or single-fact
+          retrieval — `search_knowledge` is cheaper and faster.
+
+        ARGS
+        - knowledge_dir: same path you passed as output_dir to `run`.
+        - mode: 'vector_only' (cheap, single/two-hop only) or 'full'
+                (adds community detection + global queries). None = use
+                config default ('full').
+        - force: ignore the graph extraction cache and rebuild from
+                scratch. Use sparingly — extraction is the most expensive
+                step in the whole stack.
+        - config_overrides: same nested-dict / dot-path semantics as `run`.
+
+        IMPORTANT HABITS
+        - The first build of a 1000-chunk corpus typically costs single-
+          digit dollars in LLM calls. Surface the cost estimate to the
+          user before running on unfamiliar data.
+        - Subsequent builds are nearly free thanks to incremental cache —
+          only chunks whose content changed are re-extracted.
+
+        RETURNS
+        Dict with keys: backend, mode, entities_count, relations_count,
+        communities_count, chunks_processed, chunks_skipped_cached,
+        elapsed_ms, output_dir, errors.
+        """
+        try:
+            from . import graph as _graph_module
+            result = _graph_module.build(
+                knowledge_dir,
+                mode=mode,
+                force=force,
+                config_overrides=config_overrides,
+            )
+        except (ImportError, ValueError, FileNotFoundError) as e:
+            return {"error": str(e)}
+
+        return {
+            "backend": result.backend,
+            "mode": result.mode,
+            "entities_count": result.entities_count,
+            "relations_count": result.relations_count,
+            "communities_count": result.communities_count,
+            "chunks_processed": result.chunks_processed,
+            "chunks_skipped_cached": result.chunks_skipped_cached,
+            "elapsed_ms": result.elapsed_ms,
+            "output_dir": result.output_dir,
+            "errors": result.errors,
+        }
+
+    @mcp.tool
+    def query_graph(
+        question: str,
+        knowledge_dir: str,
+        mode: str = "hybrid",
+        top_k: int | None = None,
+        config_overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Query a previously-built knowledge graph.
+
+        WHEN TO USE
+        - The user asks a question that benefits from graph traversal:
+          multi-hop reasoning, "what are the main themes", "how is X
+          connected to Y across documents". Reach for this AFTER the
+          knowledge_dir has been graph-built (`build_graph`).
+        - SKIP for single-document fact lookup — `read_source` /
+          `search_knowledge` are simpler and don't risk LLM hallucination
+          atop the graph.
+
+        ARGS
+        - question: natural-language query.
+        - knowledge_dir: same path you used for `build_graph`.
+        - mode: 'naive' (pure vector RAG), 'local' (entity-anchored),
+                'global' (community summaries — broad questions),
+                'hybrid' (local + global, default), 'mix' (everything).
+                A graph built with mode='vector_only' rejects 'global' /
+                'hybrid' / 'mix' — call `graph_status` first to check.
+        - top_k: backend-specific retrieval cutoff. None = backend default.
+        - config_overrides: same as `run`.
+
+        RETURNS
+        Dict with keys: answer (the LLM's response), mode_used,
+        elapsed_ms, output_dir. On configuration / file errors returns
+        {"error": "..."} instead.
+        """
+        try:
+            from . import graph as _graph_module
+            result = _graph_module.query(
+                question,
+                knowledge_dir=knowledge_dir,
+                mode=mode,
+                top_k=top_k,
+                config_overrides=config_overrides,
+            )
+        except (ImportError, ValueError, FileNotFoundError) as e:
+            return {"error": str(e)}
+
+        return {
+            "answer": result.answer,
+            "mode_used": result.mode_used,
+            "elapsed_ms": result.elapsed_ms,
+            "output_dir": result.output_dir,
+        }
+
+    @mcp.tool
+    def graph_status(knowledge_dir: str) -> dict[str, Any]:
+        """
+        Inspect whether a knowledge base has a graph built.
+
+        WHEN TO USE
+        - Before calling `query_graph`, especially when you're not sure
+          whether `build_graph` has been run on this knowledge_dir.
+        - To present the user with current graph stats (entity / relation
+          / community counts) before deciding whether a rebuild is needed.
+
+        ARGS
+        - knowledge_dir: knowledge base root.
+
+        RETURNS
+        Dict with keys: built (bool), backend, mode, entities_count,
+        relations_count, communities_count, last_built_at,
+        embedding_model, embedding_dimension, output_dir.
+        """
+        from . import graph as _graph_module
+        info = _graph_module.status(knowledge_dir)
+        return {
+            "built": info.built,
+            "backend": info.backend,
+            "mode": info.mode,
+            "entities_count": info.entities_count,
+            "relations_count": info.relations_count,
+            "communities_count": info.communities_count,
+            "last_built_at": info.last_built_at,
+            "embedding_model": info.embedding_model,
+            "embedding_dimension": info.embedding_dimension,
+            "output_dir": info.output_dir,
+        }
+
+    @mcp.tool
+    def enrich_chunks(
+        knowledge_dir: str,
+        config_overrides: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Generate chunks_enriched.jsonl from an already-built graph,
+        feeding entity descriptions back into a sibling chunks file so
+        traditional vector RAG also benefits from the graph's extraction.
+
+        WHEN TO USE
+        - The user wants their EXISTING vector RAG pipeline to recall
+          documents better — without rewriting the RAG side.
+        - The graph was built earlier (status -> built=True) but the user
+          didn't pass --enrich-chunks at build time.
+        - SKIP when the graph isn't built yet (call build_graph first).
+
+        EFFECT
+        - Writes a NEW file `chunks_enriched.jsonl` next to chunks.jsonl.
+        - The original chunks.jsonl is NEVER modified — delete the
+          enriched file at any time to drop back to the original
+          behaviour.
+        - No LLM / embedding calls are made — pure replay over the graph
+          artefacts already on disk. Cheap.
+
+        ARGS
+        - knowledge_dir: knowledge base root (the same path you used for
+          build_graph).
+        - config_overrides: optional, same dict-form semantics as `run`.
+          Useful knobs:
+            graph.enrich_chunks.max_entities_per_chunk
+            graph.enrich_chunks.max_description_length
+            graph.enrich_chunks.inject_into_text
+            graph.enrich_chunks.inject_into_metadata
+
+        RETURNS
+        Dict with keys: written_path, chunks_total, chunks_enriched,
+        chunks_unchanged, total_entities_injected, avg_entities_per_chunk,
+        elapsed_ms, errors. On configuration / file errors returns
+        {"error": "..."} instead.
+        """
+        try:
+            from . import graph as _graph_module
+            result = _graph_module.enrich_chunks(
+                knowledge_dir,
+                config_overrides=config_overrides,
+            )
+        except (ImportError, ValueError, FileNotFoundError) as e:
+            return {"error": str(e)}
+
+        return {
+            "written_path": result.written_path,
+            "chunks_total": result.chunks_total,
+            "chunks_enriched": result.chunks_enriched,
+            "chunks_unchanged": result.chunks_unchanged,
+            "total_entities_injected": result.total_entities_injected,
+            "avg_entities_per_chunk": result.avg_entities_per_chunk,
+            "elapsed_ms": result.elapsed_ms,
+            "errors": result.errors,
+        }
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

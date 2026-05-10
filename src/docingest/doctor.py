@@ -82,6 +82,8 @@ def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
         "dashscope": {"import": "dashscope", "install": 'pip install -e ".[audio]"', "purpose": "Audio transcription (Qwen3-ASR)"},
         "magika": {"import": "magika", "install": "pip install magika", "purpose": "Content-based file type detection"},
         "yt-dlp": {"import": "yt_dlp", "install": "pip install yt-dlp", "purpose": "YouTube/Bilibili URL support"},
+        "lightrag-hku": {"import": "lightrag", "install": 'pip install -e ".[graph]"', "purpose": "GraphRAG layer (entity / relation / community graph + queries)"},
+        "sentence-transformers": {"import": "sentence_transformers", "install": 'pip install -e ".[graph-local]"', "purpose": "Local embeddings for GraphRAG (zero API cost)"},
     }
     for pkg_name, info in optional_packages.items():
         ver, err = _check_import(info["import"])

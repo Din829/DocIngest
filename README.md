@@ -14,6 +14,8 @@ Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → pa
 | `knowledge_map.yaml` + `knowledge_search.SKILL.md` | Auto-generated search guide |
 | `quality_report.json` | Vision accuracy health check (`[?]` + `[unreadable]` scan) |
 | `readable/*.md` | Human-readable version (optional, via `refine`) |
+| `graph/` | Knowledge graph artefacts (optional, via `docingest graph build` — see [GraphRAG](#graphrag-optional)) |
+| `chunks_enriched.jsonl` | Same chunks as `chunks.jsonl` but with graph entity descriptions injected, for traditional vector RAG (optional, via `docingest graph enrich` or `--enrich-chunks`) |
 
 ## Install
 
@@ -31,6 +33,8 @@ Optional extras (install as needed):
 pip install -e ".[nlp]"              # Japanese keyword extraction (SudachiPy)
 pip install -e ".[mcp]"              # MCP Server (FastMCP)
 pip install -e ".[audio]"            # Audio transcription (DashScope Qwen3-ASR)
+pip install -e ".[graph]"            # Optional GraphRAG layer (LightRAG)
+pip install -e ".[graph-local]"      # Add local embedding model (zero API cost)
 pip install -e ".[nlp,mcp,audio]"    # All optional Python packages
 ```
 
@@ -237,6 +241,12 @@ python -m docingest.mcp_server --transport sse    # SSE (web clients)
 | `search_knowledge` | Keyword search on processed knowledge base | grep on `sources/*.md` |
 | `list_knowledge` | List knowledge base contents (files, stats) | reads `index.json` |
 | `read_source` | Read full content of a source Markdown file | reads `sources/*.md` |
+| `build_graph` | Build / extend knowledge graph (opt-in, requires `[graph]`) | `docingest.graph.build()` |
+| `query_graph` | Query the graph (local / global / hybrid / mix / naive) | `docingest.graph.query()` |
+| `graph_status` | Inspect graph build state + entity / relation / community counts | `docingest.graph.status()` |
+| `enrich_chunks` | Replay graph entities into `chunks_enriched.jsonl` so traditional vector RAG also benefits | `docingest.graph.enrich_chunks()` |
+
+The four graph tools are registered **only when `lightrag-hku` is installed** (`pip install -e ".[graph]"`); without the extras they don't appear in the tool listing and the rest of the server is unaffected.
 
 **Client configuration:**
 
@@ -316,6 +326,114 @@ run(["docs/"], config_overrides={
 - "Module not found" → `pip install -e ".[mcp]"`
 - API key errors → set `GEMINI_API_KEY` / `DASHSCOPE_API_KEY` in `.env` or environment. As an alternative, library callers can inject keys directly via Provider classes (`docingest.GeminiProvider(api_key="...")`) without touching env vars — see the Python Library section above.
 - Large files hang → run `inspect` first and use `config_overrides` to raise `max_pages`
+
+## GraphRAG (optional)
+
+Build an entity / relation knowledge graph on top of an existing knowledge base, then run global / local / hybrid queries via [LightRAG](https://github.com/HKUDS/LightRAG). **Strictly opt-in** — `docingest run` never touches it, and the import path `docingest.graph` only loads when explicitly imported.
+
+> **Note on communities** — LightRAG ≥ 1.4 no longer generates community reports automatically during `ainsert`; the build step produces entities + relations + per-entity / per-relation embeddings. The `global` query mode still works (it falls back to relation-level retrieval), but you won't see community summaries in `status` output — `Communities = 0` is expected, not a bug.
+
+```bash
+# 1. Install the optional extras (LightRAG + OpenAI embedding client)
+pip install -e ".[graph]"
+
+# 2. Process documents as usual
+docingest run ./docs/ -o ./kb/
+
+# 3. Build the graph on top of the knowledge base
+docingest graph build ./kb/                          # full mode (default)
+docingest graph build ./kb/ --mode vector_only       # cheap: skip community detection
+
+# 4. Query
+docingest graph query "整个语料的主要主题是什么？" --kb ./kb/ --mode global
+docingest graph query "X 和 Y 什么关系？"            --kb ./kb/ --mode local
+docingest graph query "comprehensive answer please" --kb ./kb/ --mode hybrid
+docingest graph status ./kb/                         # entity / relation / community counts
+```
+
+Two retrieval modes:
+
+| Build mode | Cost | Query modes available | Best for |
+|---|---|---|---|
+| `vector_only` | Cheap (skips community summary LLM calls) | `naive`, `local` | Single-fact / two-hop questions |
+| `full` (default) | Higher (per-community LLM summary) | `naive`, `local`, `global`, `hybrid`, `mix` | Multi-hop reasoning, "main themes / trends" |
+
+Python library:
+
+```python
+import docingest
+import docingest.graph                 # explicit import — never triggered by `import docingest`
+
+# Build (incremental — second run reuses cache for unchanged chunks)
+result = docingest.graph.build(
+    "./kb/",
+    mode="full",
+    llm=docingest.OpenAIProvider(api_key="...", model="gpt-5.4-mini"),
+    embedding=docingest.graph.OpenAIEmbedding(
+        api_key="...",
+        model="text-embedding-3-small",
+        dimension=1536,
+    ),
+    config_overrides={"graph.lightrag.entity_extract_max_gleaning": 2},
+)
+print(result.entities_count, "entities,", result.relations_count, "relations")
+
+# Query
+answer = docingest.graph.query(
+    "What are the main themes across the corpus?",
+    knowledge_dir="./kb/",
+    mode="hybrid",
+)
+print(answer.answer)
+```
+
+Outputs land under `./kb/graph/` (LightRAG's working_dir layout); deleting the folder leaves the rest of the knowledge base intact. Extraction is incremental — chunks whose content + LLM config hash hasn't changed since last build are skipped.
+
+Embedding providers (`docingest.graph.OpenAIEmbedding` / `GeminiEmbedding` / `SentenceTransformerEmbedding`) are independent from the main pipeline's Vision / ASR providers — pick a small / cheap model just for graph extraction without affecting `docingest run`. Sentence-transformers (`pip install -e ".[graph-local]"`) gives zero-API-cost local embeddings.
+
+**Credential resolution order** (highest wins):
+
+1. Explicit `Provider(api_key="...")` argument
+2. Environment variable (e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY`)
+3. `.env` file in the working directory (auto-loaded **on the CLI path only**)
+4. YAML config
+
+**Library callers** (`docingest.graph.build(...)`) do NOT auto-load `.env` — by design, so embedding DocIngest into a long-running host doesn't pollute the process environment. If you want `.env` behaviour from the library, call `load_dotenv()` yourself before invoking the facade, or pass keys via Provider objects.
+
+### Boost traditional RAG with graph entities (`chunks_enriched.jsonl`)
+
+GraphRAG queries are great, but most teams already have a vector RAG pipeline they want to keep. The optional **chunk enrichment** stage feeds the graph's extracted entity names + descriptions back into a NEW jsonl file — giving your existing vector RAG a precision boost without rewriting it.
+
+```bash
+# Either as a follow-up of build:
+docingest graph build ./kb/ --enrich-chunks
+
+# Or standalone (graph already built earlier):
+docingest graph enrich ./kb/
+```
+
+What it does:
+- Reads `graph/vdb_entities.json` and the chunk-id map (no LLM calls).
+- For each chunk, picks the top-N most relevant entities (entities that occur **only** in this chunk are prioritised, then shorter names — longer names tend to be doc-level boilerplate).
+- Writes a sibling `chunks_enriched.jsonl` with two channels of enrichment:
+  - **Text channel** — injects `[关键实体: 敷金 — 預かり金として扱われる費用; ...]` right after the `[来源: ...]` header. Pure vector RAG benefits because the embedding model now sees explicit anchors for the entities, easing synonym recall ("修繕費" finds the chunk where the entity description mentions "修繕" even though the surface form differs).
+  - **Metadata channel** — adds `metadata.entities = [{"name", "description", "exclusive"}, ...]`. Hybrid / metadata-filtered RAG (Qdrant `WHERE entities CONTAINS '敷金'`, BM25+vector) can use this directly.
+
+Invariants:
+- **The original `chunks.jsonl` is NEVER modified.** Hash-checked by tests.
+- **No LLM / embedding calls** during enrichment — pure replay over on-disk graph data. 44 chunks ≈ 35 ms.
+- Re-running replaces (not stacks) the previous injection. Deterministic output for the same input.
+
+Tune via config:
+```yaml
+graph:
+  enrich_chunks:
+    enabled: false                # default OFF
+    max_entities_per_chunk: 5
+    max_description_length: 100
+    inject_into_text: true
+    inject_into_metadata: true
+```
 
 ## Configuration
 
@@ -438,9 +556,12 @@ for each new file:
       │
       ▼
 index.json + chunks.jsonl + knowledge_map.yaml + quality_report.json
+      │
+      ▼  (OPTIONAL, opt-in via `docingest graph build` — see GraphRAG section)
+LightRAG entity / relation extraction → graph/  (graphml + entity vdb + chunk vdb)
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rationale, and how to add new formats / hooks / chunkers.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rationale, and how to add new formats / hooks / chunkers. The optional graph layer is documented in [ARCHITECTURE.md §10](ARCHITECTURE.md#10-graphrag-子模块docingestgraph可选).
 
 ## Key Features
 
@@ -496,6 +617,15 @@ python tests/unit/test_config_override.py
 
 # Incremental cache behaviour (modify / delete / config-change scenarios)
 python tests/incremental/run_tests.py
+
+# GraphRAG layer — optionality regression (passes with or without [graph] extras)
+python tests/unit/test_graph_optional.py
+
+# GraphRAG layer — internals (chunks_loader filters, cache hashing, mode validation)
+python tests/unit/test_graph_internals.py
+
+# GraphRAG chunk enrichment (chunks.jsonl preservation, top-N selection, idempotency)
+python tests/unit/test_graph_enrich.py
 ```
 
 `tests/unit/test_mixed.py` exists but currently has a known failure in its
@@ -505,5 +635,5 @@ your own changes.
 
 ## Documentation
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt. **§10** covers the optional `docingest.graph` layer (boundaries, module layout, three-tier caching, swapping backends).
 - **[INTEGRATION.md](INTEGRATION.md)** — How to integrate DocIngest into your own system (CLI subprocess / Python library / MCP), per-scenario recipes, cross-cutting concerns
