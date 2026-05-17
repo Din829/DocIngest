@@ -37,4 +37,19 @@ docingest run ./docs/ -o ./knowledge/
 - `sources/*.md` 是 RAG / agentic search 的真源；`refine` 只为人可读，**不是** RAG 流水线的一步。
 - CLI 子进程消费：`docingest run --json` / `inspect --json` 把 JSON 写 stdout，banner 走 stderr。
 
+## GraphRAG 层（可选，opt-in）
+
+主流程不动；用户主动调才生效。**只在用户问"主题/关系/多跳"类问题时考虑**——比 Vision 还贵。
+
+| 何时用 graph | 何时不用 |
+|---|---|
+| "X 和 Y 的关系" | "X 是什么" → 普通 RAG / grep 更便宜 |
+| "整个语料的主题" | 单一事实查找 |
+| 跨文档关联推理 | 同一文档内信息提取 |
+
+四个 MCP 工具：`build_graph` / `query_graph` / `graph_status` / `enrich_chunks`。装 `pip install -e ".[graph]"` 才出现。
+
+典型流：`graph_status` → 未建则 `build_graph`（一次性烧钱，几分钟）→ `query_graph(mode="hybrid")`。
+想让传统向量 RAG 也吃图的红利：`enrich_chunks` 生成 `chunks_enriched.jsonl`，原 chunks.jsonl 不动。
+
 完整功能、配置、Python API、MCP 客户端配置见 [README.md](README.md)。
