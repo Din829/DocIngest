@@ -921,10 +921,33 @@ graph:
     # entity extraction. Default 1200 matches LightRAG's own default.
     chunk_token_size: 1200
     chunk_overlap_token_size: 100
+
     # Extra LLM passes per chunk to recover entities the first pass missed.
-    # 0 = no extra pass; 1 = one extra (recommended); 2+ rapidly hits
-    # diminishing returns at multiplied cost.
-    entity_extract_max_gleaning: 1
+    # 0 = no extra pass (DocIngest default); 1 = LightRAG's own default;
+    # 2+ rapidly hits diminishing returns at multiplied cost.
+    #
+    # Why we default to 0 (different from LightRAG's 1):
+    #   The typical DocIngest input is a STRUCTURED document — DB design
+    #   sheets, API specs, Q&A tables, contracts — where the first
+    #   extraction pass already captures ~95%+ of meaningful entities.
+    #   Gleaning doubles the LLM call count for a marginal recall bump
+    #   that's mostly irrelevant on this shape of input.
+    # When to raise back to 1 (or 2):
+    #   - Free-flowing prose / academic papers / news articles.
+    #   - Domain-specific jargon density that the first pass tends to
+    #     miss (medical / legal corpus where edge entities matter).
+    #   - You've observed empty / sparse entity counts in graph status
+    #     and want a recall safety net.
+    entity_extract_max_gleaning: 0
+
+    # Chunks processed in parallel during build. LightRAG's own default
+    # is 2 (conservative); 4 is a reasonable middle ground for most
+    # OpenAI / Gemini accounts that have left tier-1 limits.
+    # Higher values (6-8) need a high LLM tier or you'll hit rate
+    # limits; lower values (1-2) protect a shared / low-quota account.
+    # Has ZERO effect on extraction precision — pure throughput knob.
+    max_parallel_insert: 4
+
     # LightRAG's own per-prompt LLM result cache (separate from DocIngest's
     # extraction cache below; both layers compose).
     enable_llm_cache: true

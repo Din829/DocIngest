@@ -205,6 +205,14 @@ class LightRAGBackend(GraphBackend):
         # Construct with only the parameters LightRAG documents. Unknown
         # kwargs would raise — better to fail loud at install time than to
         # silently misconfigure.
+        #
+        # Defaults here mirror config/default.yaml, NOT LightRAG's own
+        # defaults — specifically:
+        #   * entity_extract_max_gleaning: 0 (we override LightRAG's 1)
+        #     to halve the LLM call count on structured documents, see
+        #     default.yaml for the rationale.
+        #   * max_parallel_insert: 4 (LightRAG defaults to 2) to roughly
+        #     double extraction throughput at no precision cost.
         kwargs: dict[str, Any] = {
             "working_dir": str(working_dir),
             "llm_model_func": llm_func,
@@ -214,7 +222,10 @@ class LightRAGBackend(GraphBackend):
                 self.lightrag_cfg.get("chunk_overlap_token_size", 100)
             ),
             "entity_extract_max_gleaning": int(
-                self.lightrag_cfg.get("entity_extract_max_gleaning", 1)
+                self.lightrag_cfg.get("entity_extract_max_gleaning", 0)
+            ),
+            "max_parallel_insert": int(
+                self.lightrag_cfg.get("max_parallel_insert", 4)
             ),
             "enable_llm_cache": bool(
                 self.lightrag_cfg.get("enable_llm_cache", True)

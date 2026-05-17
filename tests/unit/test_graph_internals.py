@@ -351,6 +351,89 @@ def test_query_mode_validation() -> None:
     print("OK: query mode validation matrix")
 
 
+def test_lightrag_kwargs_pass_through() -> None:
+    """
+    Verify the LightRAGBackend forwards the right kwargs to LightRAG's
+    constructor — in particular our two perf knobs (entity_extract_max_gleaning
+    and max_parallel_insert) which directly control build cost.
+
+    Regression guard: if a future refactor accidentally drops one of
+    these from the kwargs dict, build performance silently regresses
+    to LightRAG's defaults (gleaning=1, parallel=2) and a tiny corpus
+    suddenly takes twice as long. This test catches that immediately.
+
+    We monkeypatch ``lightrag.LightRAG`` to capture the constructor
+    kwargs without actually constructing a real LightRAG instance —
+    the real one would need network + storage init.
+    """
+    from docingest.graph.backends import lightrag_backend
+    from docingest.graph.providers import OpenAIEmbedding
+
+    captured_kwargs: dict = {}
+
+    class _FakeLightRAG:
+        """Capture kwargs and stop here; we never need real behaviour."""
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+    # The backend lazy-imports `from lightrag import LightRAG` inside
+    # _build_lightrag, so we patch the module attribute. Explicitly
+    # import lightrag here (skipping the test cleanly if [graph] extras
+    # aren't installed) so the patch site exists.
+    try:
+        import lightrag as real_lightrag
+    except ImportError:
+        print("OK: lightrag_kwargs test skipped — [graph] extras not installed")
+        return
+
+    # Use setattr / getattr so static checkers don't complain about
+    # the dynamic monkey-patch (they don't model 3rd-party module attrs).
+    saved_LightRAG = getattr(real_lightrag, "LightRAG")
+    setattr(real_lightrag, "LightRAG", _FakeLightRAG)
+
+    try:
+        # Synthetic config that matches the shape default.yaml produces.
+        config = {
+            "graph": {
+                "output_subdir": "graph",
+                "mode": "full",
+                "lightrag": {
+                    "chunk_token_size": 1200,
+                    "chunk_overlap_token_size": 100,
+                    "entity_extract_max_gleaning": 0,   # our new default
+                    "max_parallel_insert": 4,            # our new default
+                    "enable_llm_cache": True,
+                    "language": "default",   # don't trigger auto-resolve
+                },
+            },
+        }
+        embedding = OpenAIEmbedding(api_key="test", dimension=1536)
+        backend = lightrag_backend.LightRAGBackend(config, embedding)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working_dir = Path(tmp) / "graph"
+            output_dir = Path(tmp)
+            backend._build_lightrag(working_dir, output_dir)
+    finally:
+        setattr(real_lightrag, "LightRAG", saved_LightRAG)
+
+    # Verify both perf knobs got through with our DocIngest defaults
+    # (NOT LightRAG's own gleaning=1 / parallel=2).
+    assert captured_kwargs.get("entity_extract_max_gleaning") == 0, (
+        f"gleaning not forwarded; got {captured_kwargs.get('entity_extract_max_gleaning')!r}"
+    )
+    assert captured_kwargs.get("max_parallel_insert") == 4, (
+        f"max_parallel_insert not forwarded; got {captured_kwargs.get('max_parallel_insert')!r}"
+    )
+    # Sanity checks on the other kwargs to catch accidental kwarg drops.
+    for required in ("working_dir", "llm_model_func", "embedding_func",
+                     "chunk_token_size", "chunk_overlap_token_size",
+                     "enable_llm_cache"):
+        assert required in captured_kwargs, f"{required} missing from LightRAG kwargs"
+
+    print("OK: LightRAGBackend forwards gleaning + max_parallel_insert correctly")
+
+
 def test_query_propagates_backend_error_on_empty_answer() -> None:
     """
     Regression guard: when a backend returns an empty answer (the way
@@ -423,6 +506,7 @@ def main() -> None:
     test_api_normalize_overrides()
     test_api_resolve_embedding_dispatch()
     test_query_mode_validation()
+    test_lightrag_kwargs_pass_through()
     test_query_propagates_backend_error_on_empty_answer()
     print("\nAll graph-internals tests passed.")
 

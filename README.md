@@ -445,6 +445,26 @@ graph:
     inject_into_metadata: true
 ```
 
+### Speed vs. precision — two knobs that matter
+
+Graph build is dominated by LLM calls during entity extraction — each chunk gets sent to the LLM at least once with a ~16K-character prompt (LightRAG's own template + few-shot examples + your chunk content, ~88% of which is the fixed template overhead). Two YAML knobs let you trade speed against extraction recall:
+
+```yaml
+graph:
+  lightrag:
+    entity_extract_max_gleaning: 0  # DocIngest default: skip the 2nd "did you miss anything?" pass
+    max_parallel_insert: 4          # chunks processed in parallel; LightRAG's own default is 2
+```
+
+| Knob | Default | When to raise | When to lower |
+|---|---|---|---|
+| `entity_extract_max_gleaning` | **0** | Set to `1` (or `2`) for **prose / academic / legal** corpora where the first extraction misses ~10-15% of edge entities. Doubles LLM cost per chunk. | Already at floor. |
+| `max_parallel_insert` | **4** | `6-8` if your LLM tier supports high RPM (helps wall-clock proportionally). Zero effect on precision — pure throughput knob. | `1-2` if you share an OpenAI tier-1 key with other workloads (avoids rate-limit retries). |
+
+Why the DocIngest default for gleaning is **0** (different from LightRAG's `1`): the typical input here is a **structured document** — DB design sheets, API specs, Q&A tables, contracts — where the first extraction already captures 95%+ of meaningful entities. Gleaning doubles LLM calls for a marginal recall bump that's mostly irrelevant on this input shape. If you're feeding free-flowing prose, raise it back to `1`.
+
+A small (~50 chunk) corpus typically rebuilds in **2-3 minutes** with these defaults vs. **6-8 minutes** at LightRAG's defaults — same precision on structured input, half the LLM bill.
+
 ## Configuration
 
 Four layers, highest wins:
