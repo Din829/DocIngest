@@ -124,11 +124,28 @@ parsing:
                                 # false = all pages sent to Vision (maximum quality, higher cost)
       min_text_length: 50       # Pages with less text than this → always send to Vision
       max_replacement_ratio: 0.05  # U+FFFD ratio above this → always send to Vision
-      table_line_threshold: 10  # Markdown table rows above this → always send to Vision
-      max_mixed_script_fragments: 3  # Mixed-script anomaly count above this → send to Vision
-                                    # Detects CJK mismap garbling (e.g. する→寸, 査→查)
-                                    # Short ASCII fragments (1-3 chars) sandwiched between CJK
-                                    # Normal CJK docs rarely exceed 1-2 (e.g. "の PwC の" has spaces)
+      table_line_threshold: 30  # Markdown table rows above this → send to Vision.
+                                # Raised from the earlier 10 after real-world
+                                # 仕様書 / API spec / Q&A 表 testing: nearly
+                                # every page in those docs has 10+ rows of
+                                # routine tables that Docling handles fine,
+                                # so the old threshold of 10 sent ~100% of
+                                # pages to Vision unnecessarily. 30 still
+                                # catches the giant merged-cell tables where
+                                # Vision actually helps verify structure.
+      max_mixed_script_fragments: 8  # Mixed-script anomaly count above this
+                                    # → send to Vision. Detects CJK mismap
+                                    # garbling (e.g. する→寸, 査→查) via
+                                    # short ASCII (1-3 chars) directly
+                                    # adjacent to CJK characters.
+                                    # Raised from the earlier 3 after real
+                                    # Japanese technical-spec testing:
+                                    # legitimate jargon like "プロトコルHTTP1.1",
+                                    # "方式client_secret_jwt", "TLS1.2以上"
+                                    # routinely produces 3–6 fragments per
+                                    # page. 8 keeps the OCR-garbling signal
+                                    # (real cases produce 10+ per page) while
+                                    # no longer flagging clean tech prose.
 
       # Language-script consistency check — the strongest signal for CMap
       # failures that produce CLEAN but WRONG Unicode (e.g. Docling yielding
