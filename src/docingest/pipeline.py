@@ -1681,17 +1681,80 @@ def process_single_file(
         t1 = time.monotonic()
 
         # Build document metadata for chunker.
-        # element_boxes is a per-file structure (page → bbox list) that used
-        # to end up copied into every chunk via **parse_result.metadata.
-        # Result: a 186 KB bbox dict was duplicated into all 300+ chunks of
-        # a 9-PDF corpus, making chunks.jsonl ~3x larger than needed. It is
-        # now written once per file to index.json instead (see
-        # index_builder.py), and excluded from chunk metadata here. The
-        # public "per-element coordinates for RAG citation" guarantee is
-        # preserved — only the *location* of the data changed.
+        #
+        # parse_result.metadata accumulates file-level fields throughout
+        # parsing (Docling origin, file_metadata / aliases / tags hooks,
+        # xlsx embedded image list, frontmatter timestamps, …). The
+        # earlier ``**parse_result.metadata`` splat copied ALL of them
+        # into every chunk's metadata, which then went straight into
+        # chunks.jsonl. Real measurement on nra_kinou (152 chunks):
+        # metadata accounted for 74% of the jsonl size and 19 of those
+        # fields had byte-for-byte-identical values across every chunk —
+        # textbook "file-level data, wrong scope."
+        #
+        # Solution: keep ONE source of truth for each field.
+        #   - File-level fields → sources/*.md frontmatter + index.json.
+        #     Chunks reference them via metadata.source / .original_file
+        #     (path-based join). Do NOT copy them onto every chunk.
+        #   - Chunk-level fields → stay on the chunk (chunk_index,
+        #     total_chunks, tokens, title_path, sheet_name, has_table,
+        #     has_image_ref, source, original_file, format, language).
+        #     "source" and "original_file" are kept on the chunk because
+        #     they're the join-key downstream uses; everything else
+        #     file-level is dropped here.
+        #
+        # The blacklist is INTENTIONALLY hard-coded — these are facts
+        # about which scope each field belongs to, not user preferences,
+        # so a YAML knob would add complexity without value. If a
+        # consumer ever needs binary_hash on chunks for dedup, the
+        # ``lineage.original_input.binary_hash`` channel still carries
+        # it (ARCHITECTURE.md §5.10).
+        _CHUNK_METADATA_BLACKLIST = frozenset({
+            # Pre-existing exclusion: 186 KB bbox dict, lives in
+            # index.json (see _build_index_entry).
+            "element_boxes",
+            # File-level identity / Docling origin — promoted to top-level
+            # frontmatter keys by the file_metadata hook; chunk gets the
+            # same info via `lineage.original_input.{filename,mimetype,
+            # binary_hash}`.
+            "docling_origin",
+            "docling_name",
+            "mimetype",
+            "binary_hash",
+            # File-level embedded-asset registry. The full list lives in
+            # index.json (per-file "files[].assets"); chunk-side image
+            # references are conveyed via inline `<!-- image: ... -->`
+            # markers in the chunk text itself.
+            "xlsx_embedded_images",
+            # File-level warnings (e.g. "Excel produced 19 pages, only
+            # first 10 sent to Vision") — surfaced to sources/*.md
+            # frontmatter, not per-chunk relevant.
+            "warnings",
+            # File-level timestamps / search-tags. The frontmatter writer
+            # already emits them per file; chunks duplicate without gain.
+            # NOTE: last_modified is deliberately NOT here — it is also
+            # added unconditionally a few lines below from file_path.stat()
+            # (kept on chunks because some retrieval pipelines use it as
+            # an incremental-indexing watermark, where having it per-chunk
+            # makes sense even though the value is constant per file).
+            "created",
+            "created_source",
+            "aliases",
+            "tags",
+            # File-level scalar/booleans that describe the whole document,
+            # not this chunk. The chunk has its own narrower analogues
+            # `has_table` (singular) and `has_image_ref` (set by
+            # _postprocess_chunks based on chunk.text).
+            "pages",
+            "has_images",
+            "has_tables",
+            "suffix_format",        # only set when magika overrode the suffix
+            "hidden_text",          # PDF-only doc-level flag
+            "structured_extractions_per_page",  # hook-internal, pre-Vision
+        })
         parse_meta_for_chunks = {
             k: v for k, v in parse_result.metadata.items()
-            if k != "element_boxes"
+            if k not in _CHUNK_METADATA_BLACKLIST
         }
         doc_metadata = {
             "source": result.output_path,
