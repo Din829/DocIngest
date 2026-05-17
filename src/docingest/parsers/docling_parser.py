@@ -1253,12 +1253,25 @@ def _render_xlsx_sheet_to_markdown(
 
     # Helper: emit the image markers for a given source row, immediately
     # after the corresponding markdown row. Multiple images on the same
-    # row each get their own marker line (the Vision triage just needs
-    # "any <!-- image --> present" to fire, but the filename is kept for
-    # downstream resolution).
+    # row each get their own line.
+    #
+    # Markers are wrapped as valid Markdown table rows
+    # (``| <!-- image: ... --> |...``) rather than emitted as bare comment
+    # lines. Why this matters: the SheetChunker's table-segment detector
+    # treats any non-``|``-prefixed line as a hard segment boundary, so a
+    # bare ``<!-- image: ... -->`` mid-table breaks the table in two and
+    # makes the next data row look like a NEW header — which then gets
+    # repeated at the top of every subsequent chunk in that sub-segment.
+    # Real symptom seen on nra_kinou: row 137 ("５．２ 作業要員...") was
+    # duplicated across chunks because an image marker right above it
+    # split the table at that exact spot. Wrapping the marker in a table
+    # row keeps the segment continuous; downstream consumers still see
+    # the marker text intact (``<!-- image`` prefix), so chunk metadata's
+    # ``has_image_ref`` and any RAG-side filename grep work unchanged.
     def _emit_markers(src_row: int) -> None:
         for fname in image_anchors.get(src_row, []):
-            lines.append(f"<!-- image: {fname} -->")
+            cells = [f"<!-- image: {fname} -->"] + [""] * (n - 1)
+            lines.append("| " + " | ".join(cells) + " |")
 
     # Header (first emitted row).
     first_row_src, first_row_cells = emitted[0]
