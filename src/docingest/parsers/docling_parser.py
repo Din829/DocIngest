@@ -153,6 +153,25 @@ class DoclingParser(BaseParser):
         """
         from .base import PageData
 
+        # xlsx pre-route: Docling's Excel backend misaligns sheet bodies
+        # against their `## SheetName` headers (a sheet's content can end up
+        # under the previous sheet's heading), which breaks title_path
+        # routing for chunks. Render xlsx directly via openpyxl instead —
+        # every sheet's body is guaranteed to live under its own heading.
+        # All other formats keep going through Docling unchanged.
+        # Config knob (default ON): parsing.xlsx.use_openpyxl_renderer.
+        if (
+            file_path.suffix.lower() in (".xlsx", ".xls")
+            and get_nested(self.config, "parsing.xlsx.use_openpyxl_renderer", True)
+        ):
+            xlsx_result = self._parse_xlsx_via_openpyxl(file_path, override_stream)
+            if xlsx_result is not None and xlsx_result.success:
+                return xlsx_result
+            # Renderer unavailable (openpyxl missing) or refused (file broken)
+            # → fall through to the Docling path so we still get *something*
+            # rather than failing the file. A debug log is emitted by the
+            # helper to make this observable.
+
         try:
             converter = self._get_converter()
             if override_stream is not None:
@@ -543,6 +562,254 @@ class DoclingParser(BaseParser):
             logger.info(f"Extracted {len(extracted)} embedded images from {file_path.name}")
         return extracted
 
+    # -----------------------------------------------------------------
+    # xlsx renderer (openpyxl-based)
+    # -----------------------------------------------------------------
+
+    def _parse_xlsx_via_openpyxl(
+        self,
+        file_path: Path,
+        override_stream: BytesIO | None,
+    ) -> ParseResult | None:
+        """
+        Render xlsx → markdown using openpyxl, bypassing Docling.
+
+        Why this exists: Docling's Excel backend renders all sheets into one
+        flat document and *misaligns* sheet headings against bodies — content
+        from sheet N can end up under sheet N-1's `## name` heading. That
+        leaks into chunk metadata (`title_path` wrong) and breaks downstream
+        per-sheet retrieval. openpyxl reads each sheet's cells directly, so
+        every sheet's body is guaranteed to live under its own heading.
+
+        Output contract — identical to the Docling path:
+          * markdown: one ``## <sheet name>`` heading per visible sheet,
+            sheets separated by PAGEBREAK_MARKER, body rendered as a
+            standard Markdown table.
+          * metadata: format / title / pages (= sheet count) / has_tables /
+            docling_origin (synthesized: mimetype + binary_hash so the
+            file_metadata hook and frontmatter writer behave identically).
+          * pages: empty list — LibreOffice page-image fallback in the
+            pipeline later populates this for Vision enrichment, exactly
+            the same as it does for Docling-rendered xlsx today.
+
+        Returns:
+          * ParseResult(success=True, ...) on successful render
+          * ParseResult(success=False, error=...) when the file refuses to
+            open (corrupt / not a real xlsx) — caller will fall back to
+            Docling
+          * None when openpyxl itself is not installed — caller falls back
+            silently (no error surfaced to the user)
+        """
+        try:
+            import openpyxl
+        except ImportError:
+            logger.debug(
+                "openpyxl not installed — falling back to Docling for xlsx. "
+                "Install with: pip install openpyxl"
+            )
+            return None
+
+        try:
+            # override_stream wins (lets a pre-parse hook transform the file
+            # before we see it, mirroring the Docling path's contract).
+            if override_stream is not None:
+                override_stream.seek(0)
+                wb = openpyxl.load_workbook(
+                    override_stream, data_only=True, read_only=False
+                )
+            else:
+                wb = openpyxl.load_workbook(
+                    str(file_path), data_only=True, read_only=False
+                )
+
+            # Pre-extract embedded images and read anchor info directly
+            # from the xlsx OOXML structure. We deliberately *do not* use
+            # openpyxl's ``ws._images`` here — it silently drops EMF/WMF
+            # at load time AND rewrites surviving entries' ``path`` to a
+            # value that no longer matches the real zip media (observed
+            # on real spec sheets, see ``_collect_xlsx_image_anchors``
+            # docstring). Reading the xml ourselves recovers every
+            # embedded picture regardless of format.
+            assets_dir = Path(get_nested(
+                self.config, "output.dir", "./knowledge"
+            )) / get_nested(self.config, "output.assets_dir", "assets")
+            assets_dir.mkdir(parents=True, exist_ok=True)
+
+            xlsx_denoise = get_nested(self.config, "parsing.xlsx.denoising", {})
+            extracted: list[str] = []
+            if xlsx_denoise.get("extract_images", True):
+                extracted = self._extract_xlsx_images(file_path, assets_dir)
+
+            # Map zip basename → asset filename written to assets/.
+            # ``_extract_xlsx_images`` writes ``{stem}-{zip_basename}``,
+            # so stripping the stem prefix gives us the key the OOXML
+            # drawing rels uses (e.g. ``image1.emf``).
+            stem_prefix = f"{file_path.stem}-"
+            asset_by_zip_name: dict[str, str] = {}
+            for asset_path in extracted:
+                fname = Path(asset_path).name
+                if fname.startswith(stem_prefix):
+                    asset_by_zip_name[fname[len(stem_prefix):]] = fname
+                else:
+                    asset_by_zip_name[fname] = fname
+
+            # Read sheet→anchor index from the xlsx OOXML. Best-effort:
+            # any failure returns an empty dict, which makes the renderer
+            # behave as if there were no images (all extracted media end
+            # up in the orphan footer below, so info is never lost).
+            anchors_by_sheet = _collect_xlsx_image_anchors(file_path)
+
+            sheet_sections: list[str] = []
+            anchored_assets: set[str] = set()
+
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                # Skip hidden sheets so chunked output mirrors what users
+                # see when they open the file. (Docling's behaviour for
+                # hidden sheets varies; explicit skip keeps us predictable.)
+                if getattr(ws, "sheet_state", "visible") != "visible":
+                    continue
+
+                row_to_assets: dict[int, list[str]] = {}
+                for anchor_info in anchors_by_sheet.get(sheet_name, []):
+                    media = anchor_info.get("media")
+                    if not media:
+                        continue
+                    asset_fname = asset_by_zip_name.get(media)
+                    if not asset_fname:
+                        # Image declared in OOXML but never extracted —
+                        # likely because parsing.xlsx.denoising.extract_images
+                        # was disabled. Skip silently; the renderer just
+                        # won't emit a marker for it.
+                        continue
+                    row_1 = anchor_info.get("row")
+                    if not isinstance(row_1, int):
+                        continue
+                    row_to_assets.setdefault(row_1, []).append(asset_fname)
+                    anchored_assets.add(asset_fname)
+
+                body_lines = _render_xlsx_sheet_to_markdown(
+                    ws,
+                    image_anchors=row_to_assets,
+                    # Per-sheet orphans are emitted by the workbook-level
+                    # footer instead (further down) — passing None here
+                    # avoids listing the same orphan on every sheet.
+                    orphan_image_names=None,
+                )
+                if body_lines:
+                    sheet_sections.append(
+                        f"## {sheet_name}\n\n" + "\n".join(body_lines)
+                    )
+                else:
+                    # Render visible-but-empty sheets as a stub so the
+                    # `## name` heading is still present — preserves the
+                    # invariant "every sheet has its own section".
+                    sheet_sections.append(f"## {sheet_name}\n\n*(empty)*")
+            wb.close()
+
+            if not sheet_sections:
+                # No visible sheets — let Docling try (it might see hidden ones).
+                return ParseResult(
+                    markdown="",
+                    success=False,
+                    error="openpyxl: no visible sheets",
+                )
+
+            # Workbook-level orphan footer — images that exist in the xlsx
+            # zip but weren't anchored to any visible sheet's row by
+            # openpyxl. Common cause: EMF/WMF formats dropped at load.
+            # Listed in the LAST sheet section so they live inside a
+            # pagebreak segment (consistent with sheet-scoped content) and
+            # downstream chunkers / Vision triage can pick them up.
+            orphan_files = sorted(
+                Path(p).name for p in extracted
+                if Path(p).name not in anchored_assets
+            )
+            if orphan_files and sheet_sections:
+                footer_lines = [
+                    "",
+                    "*Embedded images without resolvable anchor "
+                    "(present in the workbook but their cell position "
+                    "could not be read — most often EMF/WMF; see "
+                    "`assets/`):*",
+                ]
+                for fname in orphan_files:
+                    footer_lines.append(f"- <!-- image: {fname} -->")
+                sheet_sections[-1] = (
+                    sheet_sections[-1] + "\n" + "\n".join(footer_lines)
+                )
+
+            # Sheets joined by PAGEBREAK_MARKER, matching the convention of
+            # Docling.export_to_markdown(page_break_placeholder=PAGEBREAK_MARKER).
+            markdown = f"\n{PAGEBREAK_MARKER}\n".join(sheet_sections)
+
+            # Build metadata — match Docling-path shape so downstream hooks
+            # (file_metadata, frontmatter writer, chunk lineage) need zero
+            # special-casing.
+            import mimetypes
+            import hashlib
+
+            mimetype = mimetypes.guess_type(file_path.name)[0] or \
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            try:
+                # Stable 64-bit signature of file contents. Not required to
+                # match Docling's own hash byte-for-byte — it's a provenance
+                # field, not a cache key. Using SHA-256 truncated to 8 bytes
+                # gives us a deterministic int that fits in JSON safely.
+                with open(file_path, "rb") as fh:
+                    digest = hashlib.sha256(fh.read()).digest()
+                binary_hash = int.from_bytes(digest[:8], "big")
+            except Exception:
+                binary_hash = None
+
+            docling_origin: dict[str, Any] = {
+                "filename": file_path.name,
+                "mimetype": mimetype,
+            }
+            if binary_hash is not None:
+                docling_origin["binary_hash"] = binary_hash
+
+            metadata: dict[str, Any] = {
+                "format": "xlsx",
+                "title": file_path.stem,
+                "pages": len(sheet_sections),
+                "has_tables": True,
+                # has_images is true when ANY image marker ends up in the
+                # rendered markdown — that's the canonical signal the
+                # rest of the pipeline (Vision triage, chunk metadata,
+                # quality report) keys off.
+                "has_images": "<!-- image" in markdown,
+                "docling_origin": docling_origin,
+                "docling_name": file_path.stem,
+            }
+            if extracted:
+                metadata["xlsx_embedded_images"] = extracted
+
+            logger.info(
+                f"xlsx rendered via openpyxl: {file_path.name} "
+                f"→ {len(sheet_sections)} sheet(s), {len(markdown):,} chars"
+            )
+
+            return ParseResult(
+                markdown=markdown,
+                metadata=metadata,
+                pages=[],   # LibreOffice fallback in pipeline fills this
+                success=True,
+            )
+
+        except Exception as e:
+            # File broken / not a real xlsx / openpyxl bug — surface for
+            # fallback. Don't crash the file; the caller will try Docling.
+            logger.warning(
+                f"openpyxl xlsx render failed for {file_path.name}: {e}. "
+                f"Falling back to Docling."
+            )
+            return ParseResult(
+                markdown="",
+                success=False,
+                error=f"openpyxl render failed: {e}",
+            )
+
     def _try_external_page_images(
         self, file_path: Path, assets_dir: Path, pages_data: list
     ) -> None:
@@ -627,3 +894,403 @@ class DoclingParser(BaseParser):
             ".md", ".txt", ".csv",
             ".asciidoc", ".adoc",
         }
+
+
+# ---------------------------------------------------------------------------
+# xlsx rendering helpers (module-level, pure functions — easy to unit-test)
+# ---------------------------------------------------------------------------
+
+# XML namespaces used by the OOXML xlsx format for sheet drawings.
+# Defined once here so both the anchor collector and any future helper
+# share the same constants without re-declaring them.
+_OOXML_NS = {
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+}
+
+
+def _ooxml_normalize_target(target: str, base_path: str) -> str:
+    """
+    Normalise an OOXML Relationship Target into an absolute zip path.
+
+    Relationships use paths that are either absolute (``/xl/...``) or
+    relative to the directory of the referencing xml file. The xlsx zip
+    itself stores everything as flat absolute names (without a leading
+    slash), so we resolve here:
+
+      ``/xl/worksheets/sheet1.xml``           → ``xl/worksheets/sheet1.xml``
+      ``../drawings/drawing1.xml`` from sheet → ``xl/drawings/drawing1.xml``
+
+    Returns the normalised zip-internal path; the caller is responsible
+    for checking it actually exists in the zip namelist.
+    """
+    if target.startswith("/"):
+        return target.lstrip("/")
+    base_dir = base_path.rsplit("/", 1)[0] if "/" in base_path else ""
+    segments = (base_dir.split("/") if base_dir else []) + target.split("/")
+    stack: list[str] = []
+    for seg in segments:
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if stack:
+                stack.pop()
+        else:
+            stack.append(seg)
+    return "/".join(stack)
+
+
+def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any]]]:
+    """
+    Read sheet→image anchor info directly from the xlsx OOXML structure.
+
+    Why this exists (we tried openpyxl first):
+      ``openpyxl.load_workbook(...).worksheets[i]._images`` silently drops
+      EMF/WMF images at load time ("wmf image format is not supported")
+      and additionally rewrites the surviving entries' ``path`` attribute
+      to a value that no longer matches the actual media file in the zip
+      (observed on real spec sheets: 5 anchors all claiming
+      ``/xl/media/image1.png`` when the file is really ``image1.emf``).
+      Reading the OOXML directly sidesteps both problems — every image
+      anchor declared in ``xl/drawings/drawing*.xml`` becomes available,
+      regardless of format.
+
+    What gets collected:
+      Only ``<xdr:pic>`` anchors (embedded pictures). Shape anchors
+      (``<xdr:sp>``, ``<xdr:cxnSp>`` — text boxes, arrows, connectors
+      used in sequence diagrams) are deliberately skipped: they carry no
+      media reference and the LibreOffice page-image render already
+      describes them via the Vision path. Including them here would
+      produce ghost image markers with no corresponding ``assets/`` file.
+
+    Returns:
+      {sheet_display_name: [{"row": int, "col": int, "media": str}, ...]}
+
+      ``row`` / ``col`` are 1-indexed (matching ``ws.cell(row=...)``).
+      ``media`` is the basename of the embedded media file (e.g.
+      ``"image1.emf"``), matching the names emitted by
+      ``_extract_xlsx_images``.
+
+      Sheets with no drawing reference get an empty list. Workbooks that
+      are not real xlsx (or that fail to open) return ``{}``.
+
+    Errors are swallowed: this is a best-effort enrichment, never a
+    correctness gate. If we can't read the anchors, downstream behaviour
+    is "no markers inserted, all extracted media listed as orphans"
+    — degraded but never broken.
+    """
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    result: dict[str, list[dict[str, Any]]] = {}
+    if not zipfile.is_zipfile(str(file_path)):
+        return result
+
+    try:
+        zf = zipfile.ZipFile(str(file_path))
+    except Exception as exc:
+        logger.debug(f"xlsx anchor collect: cannot open zip ({exc})")
+        return result
+
+    try:
+        names = set(zf.namelist())
+        try:
+            wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+            wb_rels_xml = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+        except (KeyError, ET.ParseError) as exc:
+            logger.debug(f"xlsx anchor collect: workbook.xml/rels missing or unparseable ({exc})")
+            return result
+
+        wb_rels: dict[str, str] = {}
+        for rel in wb_rels_xml:
+            rid = rel.attrib.get("Id")
+            target = rel.attrib.get("Target", "")
+            if rid:
+                wb_rels[rid] = target
+
+        sheets_elem = wb_xml.find("main:sheets", _OOXML_NS)
+        if sheets_elem is None:
+            return result
+
+        r_ns = _OOXML_NS["r"]
+        a_ns = _OOXML_NS["a"]
+
+        for sh in sheets_elem.findall("main:sheet", _OOXML_NS):
+            sheet_name = sh.attrib.get("name", "")
+            rid = sh.attrib.get(f"{{{r_ns}}}id")
+            if not sheet_name or not rid:
+                continue
+            sheet_target = wb_rels.get(rid)
+            if not sheet_target:
+                continue
+            sheet_path = _ooxml_normalize_target(sheet_target, "xl/workbook.xml")
+            if sheet_path not in names:
+                continue
+
+            try:
+                sheet_xml = ET.fromstring(zf.read(sheet_path))
+            except (KeyError, ET.ParseError):
+                continue
+            drawing_elem = sheet_xml.find("main:drawing", _OOXML_NS)
+            if drawing_elem is None:
+                result[sheet_name] = []
+                continue
+            drawing_rid = drawing_elem.attrib.get(f"{{{r_ns}}}id")
+            if not drawing_rid:
+                result[sheet_name] = []
+                continue
+
+            # Sheet-level rels: rId → drawing xml path
+            sheet_dir, _, sheet_fname = sheet_path.rpartition("/")
+            sheet_rels_path = f"{sheet_dir}/_rels/{sheet_fname}.rels"
+            if sheet_rels_path not in names:
+                result[sheet_name] = []
+                continue
+            try:
+                sheet_rels_xml = ET.fromstring(zf.read(sheet_rels_path))
+            except (KeyError, ET.ParseError):
+                continue
+            sheet_rels: dict[str, str] = {}
+            for rel in sheet_rels_xml:
+                rid_ = rel.attrib.get("Id")
+                target = rel.attrib.get("Target", "")
+                if rid_:
+                    sheet_rels[rid_] = target
+
+            drawing_target = sheet_rels.get(drawing_rid)
+            if not drawing_target:
+                result[sheet_name] = []
+                continue
+            drawing_path = _ooxml_normalize_target(drawing_target, sheet_path)
+            if drawing_path not in names:
+                continue
+
+            # Drawing-level rels: rId → media basename
+            drawing_dir, _, drawing_fname = drawing_path.rpartition("/")
+            drawing_rels_path = f"{drawing_dir}/_rels/{drawing_fname}.rels"
+            drawing_rels: dict[str, str] = {}
+            if drawing_rels_path in names:
+                try:
+                    drx = ET.fromstring(zf.read(drawing_rels_path))
+                    for rel in drx:
+                        drx_id = rel.attrib.get("Id")
+                        drx_target = rel.attrib.get("Target", "")
+                        if drx_id and drx_target:
+                            # Only need the basename — caller pairs this
+                            # with `_extract_xlsx_images`'s output, which
+                            # uses ``{stem}-{basename}`` naming.
+                            drawing_rels[drx_id] = Path(drx_target).name
+                except (KeyError, ET.ParseError):
+                    pass
+
+            try:
+                drawing_xml = ET.fromstring(zf.read(drawing_path))
+            except (KeyError, ET.ParseError):
+                continue
+
+            anchors: list[dict[str, Any]] = []
+            for anchor_tag in ("twoCellAnchor", "oneCellAnchor"):
+                for anc in drawing_xml.findall(f"xdr:{anchor_tag}", _OOXML_NS):
+                    from_elem = anc.find("xdr:from", _OOXML_NS)
+                    if from_elem is None:
+                        continue
+                    row_elem = from_elem.find("xdr:row", _OOXML_NS)
+                    col_elem = from_elem.find("xdr:col", _OOXML_NS)
+                    if row_elem is None or col_elem is None:
+                        continue
+                    try:
+                        row_1 = int((row_elem.text or "0").strip()) + 1
+                        col_1 = int((col_elem.text or "0").strip()) + 1
+                    except ValueError:
+                        continue
+
+                    # Picture anchors only — skip shape (``sp``) and
+                    # connector (``cxnSp``) anchors; they have no media
+                    # reference and would otherwise produce ghost markers.
+                    pic = anc.find("xdr:pic", _OOXML_NS)
+                    if pic is None:
+                        continue
+                    embed_rid = None
+                    for blip in pic.iter(f"{{{a_ns}}}blip"):
+                        embed_rid = blip.attrib.get(f"{{{r_ns}}}embed")
+                        if embed_rid:
+                            break
+                    if not embed_rid:
+                        continue
+                    media_basename = drawing_rels.get(embed_rid)
+                    if not media_basename:
+                        continue
+                    anchors.append({
+                        "row": row_1,
+                        "col": col_1,
+                        "media": media_basename,
+                    })
+
+            result[sheet_name] = anchors
+    finally:
+        zf.close()
+
+    return result
+
+
+def _render_xlsx_sheet_to_markdown(
+    ws,
+    image_anchors: dict[int, list[str]] | None = None,
+    orphan_image_names: list[str] | None = None,
+) -> list[str]:
+    """
+    Render a single openpyxl Worksheet to Markdown table lines.
+
+    Design choices (each defends against a specific failure mode seen on
+    real Japanese spec sheets — see ARCHITECTURE.md §5):
+
+      * Merged cells: only the anchor (top-left) cell keeps its value; the
+        cells it "spans into" are left empty. This is the OPPOSITE of
+        Docling's behaviour (which duplicates the merged value into every
+        spanned position), and it avoids the "N×N inflation" that drives
+        merged-cell-heavy sheets up to multi-MB outputs.
+      * Empty-column pruning: 方眼紙 spec sheets often span 100+ columns
+        with only a handful actually used. We collect the set of columns
+        that hold real values and drop the rest entirely from the output —
+        the table widens to match what's actually there, not the worksheet's
+        nominal max_column.
+      * Empty-row pruning: rows whose every (pruned) column is empty are
+        skipped. Decorative blank rows between content blocks vanish.
+      * Pipe / newline escaping: cell values are sanitized so Markdown
+        parsing stays robust (newline → space; ``|`` → ``\\|``).
+      * Embedded image anchors: when ``image_anchors`` is provided, a
+        ``<!-- image: <filename> -->`` line is emitted AFTER the row that
+        owns each image. This both feeds the Vision triage (which treats
+        any ``<!-- image -->`` token as "send to Vision") AND keeps the
+        filename next to the row that visually contains the image, so
+        downstream RAG / chunk lineage can resolve picture references.
+
+    Args:
+      ws: openpyxl Worksheet.
+      image_anchors: row(1-indexed) → list of asset filenames anchored at
+        that row. Pass ``None`` (or empty dict) to disable image markers
+        — preserves the original behaviour for callers that don't have
+        anchor info (and keeps the function easy to unit-test).
+      orphan_image_names: image filenames that exist in the xlsx zip but
+        whose anchor cannot be resolved (e.g. EMF / WMF dropped by
+        openpyxl). When non-empty, a footer block lists them so the
+        information is not lost downstream — every chunk consumer can at
+        least know the images exist and find them in ``assets/``.
+
+    Returns a list of markdown lines (header + separator + body, with
+    optional image marker lines and orphan footer interleaved) ready for
+    joining with ``\\n``. Returns an empty list when the sheet has no
+    content at all — caller decides whether to emit a stub or skip.
+    """
+    # Build a (row, col) → 'anchor' | 'spanned' map for merged regions.
+    spanned: set[tuple[int, int]] = set()
+    for mr in ws.merged_cells.ranges:
+        for r in range(mr.min_row, mr.max_row + 1):
+            for c in range(mr.min_col, mr.max_col + 1):
+                if not (r == mr.min_row and c == mr.min_col):
+                    spanned.add((r, c))
+
+    # First pass: harvest values, remember which columns are actually used.
+    cell_values: dict[tuple[int, int], str] = {}
+    cols_with_content: set[int] = set()
+    max_row = ws.max_row or 0
+    max_col = ws.max_column or 0
+
+    for r in range(1, max_row + 1):
+        for c in range(1, max_col + 1):
+            if (r, c) in spanned:
+                continue
+            v = ws.cell(row=r, column=c).value
+            if v is None:
+                continue
+            # Coerce to a single-line, pipe-safe string.
+            text = str(v).replace("\n", " ").replace("\r", " ")
+            text = text.replace("|", r"\|").strip()
+            if text:
+                cell_values[(r, c)] = text
+                cols_with_content.add(c)
+
+    # An image-only row (no cell text but an anchor sits on it) still
+    # deserves a markdown line — without one, the image marker would
+    # become orphaned and lose its "where in the sheet" context. So we
+    # widen the set of "rows worth emitting" to include image anchor rows.
+    image_anchors = image_anchors or {}
+    anchor_rows = set(image_anchors.keys())
+
+    if not cols_with_content and not anchor_rows:
+        # Truly empty sheet — let caller emit a stub.
+        # Even orphan images won't be useful without any context, so we
+        # skip the footer in this corner case (caller's stub is enough).
+        return []
+
+    kept_cols = sorted(cols_with_content)
+
+    # Second pass: emit rows in original row order. Track the source row
+    # number for each emitted body row so we can interleave image markers.
+    # When a row has no cell content but DOES anchor an image, we still
+    # emit it as an empty row so the marker that follows lines up visually.
+    emitted: list[tuple[int, list[str] | None]] = []   # (src_row, cells_or_None)
+    for r in range(1, max_row + 1):
+        row = [cell_values.get((r, c), "") for c in kept_cols] if kept_cols else []
+        if any(row):
+            emitted.append((r, row))
+        elif r in anchor_rows:
+            # Empty row but holds an image anchor → keep a placeholder row
+            # so the marker has a home. ``None`` signals "no cell line".
+            emitted.append((r, None))
+
+    if not emitted:
+        return []
+
+    # Standard Markdown table: header row + separator + body rows.
+    # We treat the first emitted row with cell content as the header.
+    # If the very first emitted row is image-only (rare), we still emit
+    # a 1-cell stub header so the rest of the table stays valid Markdown.
+    n = max(len(kept_cols), 1)
+    lines: list[str] = []
+
+    # Helper: emit the image markers for a given source row, immediately
+    # after the corresponding markdown row. Multiple images on the same
+    # row each get their own marker line (the Vision triage just needs
+    # "any <!-- image --> present" to fire, but the filename is kept for
+    # downstream resolution).
+    def _emit_markers(src_row: int) -> None:
+        for fname in image_anchors.get(src_row, []):
+            lines.append(f"<!-- image: {fname} -->")
+
+    # Header (first emitted row).
+    first_row_src, first_row_cells = emitted[0]
+    if first_row_cells is not None:
+        lines.append("| " + " | ".join(first_row_cells) + " |")
+    else:
+        # Image-only first row — emit a stub one-cell header so MD stays valid.
+        lines.append("| |")
+    lines.append("|" + "|".join(["---"] * n) + "|")
+    _emit_markers(first_row_src)
+
+    # Body.
+    for src_row, cells in emitted[1:]:
+        if cells is not None:
+            lines.append("| " + " | ".join(cells) + " |")
+        else:
+            # Image-only body row — emit an empty table row so the marker
+            # below it makes sense as "image at this position".
+            lines.append("| " + " | ".join([""] * n) + " |")
+        _emit_markers(src_row)
+
+    # Orphan footer (only when we actually have orphans).
+    if orphan_image_names:
+        lines.append("")
+        lines.append(
+            "*Embedded images without resolvable anchor "
+            "(see `assets/`):*"
+        )
+        for fname in orphan_image_names:
+            # Keep the marker form so Vision/triage hooks still see them
+            # as image references, but also list them as bullets for human
+            # readers. One line each — tokens cost peanuts here.
+            lines.append(f"- <!-- image: {fname} -->")
+
+    return lines

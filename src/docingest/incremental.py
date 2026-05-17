@@ -157,10 +157,14 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.pptx.vision",                 # entire subtree, since model/dpi/
     "parsing.docx.vision",                 # max_tokens any change → re-run
     "parsing.xlsx.vision",
+    "parsing.xlsx.use_openpyxl_renderer",  # switches xlsx parser engine —
+                                           # flipping it changes the markdown
+                                           # produced for the same file
     "output.markdown.include_metadata_header",
     "output.dedup.enabled",                # Vision/Docling dedup toggle —
                                            # disabling it keeps both versions in sources/*.md
     "output.dedup.vision_ratio_threshold", # dedup threshold — alters sources/*.md content
+    "output.dedup.vision_min_chars",       # absolute Vision floor — affects when dedup fires
     "sanitize.enabled",                    # PII sanitize hook master toggle —
                                            # flipping it rewrites markdown before write
     "sanitize.rules",                      # custom PII rule set — changes

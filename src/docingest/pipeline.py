@@ -508,7 +508,19 @@ def _clean_excel_markdown(
       3. metadata:     extract key-value pairs from first N rows into metadata
 
     Returns cleaned markdown. Metadata extraction is best-effort (non-destructive).
+
+    Sheet boundaries (PAGEBREAK_MARKER) are preserved — cleaning is done
+    per-section so downstream Vision injection / dedup / chunking stay aligned
+    to sheets. Without this guard, multi-sheet xlsx files lose pagebreaks
+    here and a later Vision-dedup pass can silently drop entire sheets.
     """
+    # Preserve sheet boundaries: clean each section independently, then rejoin.
+    if PAGEBREAK_MARKER in markdown:
+        parts = markdown.split(PAGEBREAK_MARKER)
+        return PAGEBREAK_MARKER.join(
+            _clean_excel_markdown(p, config) for p in parts
+        )
+
     xlsx_denoise = get_nested(config, "parsing.xlsx.denoising", {})
     if not xlsx_denoise.get("enabled", True):
         return markdown
@@ -1201,24 +1213,29 @@ def _dedup_vision(markdown: str, config: dict[str, Any]) -> str:
     """
     Remove Docling-Vision content overlap in a markdown string.
 
-    Applied to BOTH sources/*.md and chunking input (unified logic).
-    Vision receives Docling text as prompt context, so its output is
-    typically a superset of Docling's content. Keeping both creates
-    redundancy that hurts grep (Agentic Search) and inflates tokens.
+    DEFAULT OFF — keep both Docling and Vision views (no content loss).
+    The "Vision is a superset of Docling" assumption only holds reliably
+    for single-page-per-section formats (text PDF, PPTX); for xlsx / docx
+    a length-ratio check cannot tell whether the two views describe the
+    same content, and the wrong side may silently overwrite the right side.
 
-    For each pagebreak section with both Docling text and
-    <!-- vision-enriched --> content:
-      - Vision content >= threshold × Docling length → keep only Vision
-      - Vision content < threshold → keep BOTH (Vision may have missed content)
+    When enabled (`output.dedup.enabled: true`) and a pagebreak section
+    contains both a Docling block and a <!-- vision-enriched --> block:
+      - Vision len >= threshold × Docling len AND Vision len >= min_chars
+        → drop Docling, keep only Vision
+      - Otherwise → keep BOTH (safe path)
 
-    Sections WITHOUT vision-enriched stay untouched.
-    Controlled by output.dedup.enabled and output.dedup.vision_ratio_threshold.
+    Sections WITHOUT vision-enriched stay untouched regardless of setting.
+    Knobs: output.dedup.enabled / vision_ratio_threshold / vision_min_chars.
     """
-    if not get_nested(config, "output.dedup.enabled", True):
+    if not get_nested(config, "output.dedup.enabled", False):
         return markdown
 
     threshold = float(get_nested(
         config, "output.dedup.vision_ratio_threshold", 0.7
+    ))
+    min_chars = int(get_nested(
+        config, "output.dedup.vision_min_chars", 200
     ))
 
     pagebreak = PAGEBREAK_MARKER
@@ -1240,12 +1257,22 @@ def _dedup_vision(markdown: str, config: dict[str, Any]) -> str:
             else:
                 frontmatter = None
 
-            # Safety check: only dedup if Vision captured enough content
+            # Safety check: only dedup if Vision captured enough content.
+            # Two independent gates — both must pass to drop Docling:
+            #   1. ratio: Vision is ≥ threshold × Docling length
+            #   2. absolute floor: Vision is ≥ min_chars
+            # Gate 2 catches the failure mode where a sparse page yields a
+            # tiny Vision blob that proportionally matches a denoised Docling
+            # block, silently wiping real content. Empty Docling sections
+            # remain safe to replace (they have nothing to lose).
             docling_len = len(docling_text)
             vision_len = len(vision_content)
             vision_sufficient = (
                 docling_len == 0
-                or vision_len >= docling_len * threshold
+                or (
+                    vision_len >= docling_len * threshold
+                    and vision_len >= min_chars
+                )
             )
 
             if vision_sufficient:

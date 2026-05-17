@@ -574,13 +574,19 @@ partition by incremental cache  (skip unchanged files)
 for each new file:
       ├─ pre_parse hook        DOCX OMML → LaTeX
       ├─ Docling / Media / Text
+      │     ↳ xlsx pre-route: openpyxl renderer (default ON) —
+      │       per-sheet headings, merged-cell anchor-only, empty
+      │       columns pruned. Bypasses Docling's Excel backend to
+      │       guarantee correct title_path on chunks.
       ├─ garbled fallback      glyph< → pymupdf
       ├─ Excel denoise         merged cells, sparse rows
       ├─ LibreOffice pages     xlsx/docx/pptx → PDF → screenshots
       ├─ post_parse hook       PPTX chart direct-read
       ├─ Vision enrichment     per-page, 8-layer triage, parallel
       ├─ pre_write hook        exiftool / sanitize
-      ├─ Vision dedup          keep the better of Docling / Vision
+      ├─ Vision dedup          OFF by default — both Docling and Vision kept
+                                (opt-in via output.dedup.enabled when both
+                                 views are known to overlap reliably)
       ├─ write sources/*.md    + assets/
       └─ chunk + path-inject   auto / heading / slide / sheet / timestamp
       │
@@ -603,6 +609,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rati
 - **PPTX chart direct-read** — python-pptx extracts chart data (categories, series, values) as 100% accurate Markdown tables. Vision supplements with visual context.
 - **DOCX math equations** — OMML → LaTeX preprocessing before Docling parses. `$E=mc^{2}$` instead of garbled text.
 - **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists) and per-type `on_overflow` strategy — oversized Markdown tables are split at data-row boundaries with the header repeated in every sub-chunk (2026 industry standard, handles Docling's merged-cell expansion). Single-pass heading merge (prelude + orphan-heading + small-section policies) produces zero-fragment chunks with the deepest-available title_path. Adjacent byte-identical chunks auto-deduplicated. All behaviour is config-driven — every knob in `chunking.heading.*` and `chunking.protection.*`.
+- **Excel via openpyxl (default)** — xlsx is rendered by `openpyxl` instead of Docling: every sheet's body lives under its own `## SheetName` heading (so chunk `title_path` always points at the right sheet), merged cells stay anchor-only (no N×N value duplication), entirely-empty columns are pruned out of wide layouts. Embedded pictures pasted into cells (PNG/JPEG/GIF/BMP/TIFF/WebP **and** EMF/WMF — read directly from the xlsx OOXML structure, bypassing openpyxl's silent EMF drop) are anchored to their actual row with a `<!-- image: <filename> -->` marker so Vision triage can pick them up and downstream RAG / Agentic Search can locate them. Falls back to Docling automatically if openpyxl is unavailable or the workbook can't open. Disable via `parsing.xlsx.use_openpyxl_renderer: false`.
 - **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction.
 - **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.

@@ -323,6 +323,24 @@ parsing:
     max_rows: 10000
     include_formulas: false
 
+    # Render xlsx directly via openpyxl instead of routing through Docling.
+    # Why this is the default: Docling's Excel backend renders all sheets
+    # into one flat markdown stream and *misaligns* sheet headings against
+    # their bodies — content from sheet N can end up under sheet N-1's
+    # `## name` heading. That contaminates chunk metadata (title_path
+    # points at the wrong sheet) and silently breaks per-sheet retrieval.
+    # openpyxl reads cells directly so every sheet's body is guaranteed
+    # to live under its own heading. Merged cells stay as anchor-only
+    # (no Docling-style cell duplication), columns that are entirely
+    # empty across the sheet are pruned, and the existing
+    # parsing.xlsx.denoising / vision / ensure_page_images logic still
+    # applies on top.
+    # Falls back to Docling automatically if openpyxl is not installed
+    # or the workbook refuses to open. Flip to false to force the legacy
+    # Docling path (e.g. for A/B testing or if your xlsx hits an openpyxl
+    # bug — please file an issue when this happens).
+    use_openpyxl_renderer: true
+
     # Excel denoising (applied to ALL xlsx/xls, not just 仕様書)
     # Data-heavy spreadsheets pass through with minimal change;
     # layout-heavy ones get significant noise removed.
@@ -352,15 +370,37 @@ output:
   index_file: "index.json"
   include_bounding_boxes: true  # Extract per-element coordinates from Docling
 
-  # Docling+Vision dedup: when Vision enrichment produces a version of a page,
-  # decide whether to keep both or only the better version in sources/*.md.
-  # Vision receives Docling text as input, so its output is typically a
-  # superset — keeping only Vision avoids duplication without info loss.
+  # Docling+Vision dedup — DEFAULT OFF.
+  #
+  # When Vision enrichment runs on a page, the pipeline produces two views of
+  # that page: Docling's text/table extraction AND Vision's image-based
+  # description. Old default behaviour was "if Vision looks long enough, keep
+  # only Vision and drop Docling" — that assumes Vision is a faithful superset
+  # of Docling. In practice that assumption only holds reliably for single-
+  # page-per-section formats (text PDF, PPTX). For xlsx / docx / mixed
+  # workloads the two views describe different things (e.g. Docling sees
+  # sheet body text, Vision sees the rendered page area) and a length-ratio
+  # check cannot tell whether real content overlaps. The wrong side then
+  # silently overwrites the right side and there is no warning.
+  #
+  # Default keeps BOTH views — markdown is slightly larger but no content is
+  # ever lost. Downstream consumers (RAG / Agentic Search / grep) match on
+  # whichever channel happens to have the answer, raising recall without
+  # changing the API shape. Re-enable only when you have evidence that on
+  # YOUR corpus Vision is a faithful superset of Docling (e.g. clean text
+  # PDFs) and you want to shrink the markdown.
   dedup:
-    enabled: true               # true = deduplicate (recommended)
-                                # false = keep both Docling + Vision (legacy behavior)
-    vision_ratio_threshold: 0.7 # Vision content >= this × Docling length → keep only Vision
-                                # Below threshold → keep both (Vision may have missed content)
+    enabled: false              # false = keep both (default, safe)
+                                # true  = drop Docling when Vision passes the
+                                #         ratio + absolute-floor gates below
+    vision_ratio_threshold: 0.7 # Only consulted when enabled=true.
+                                # Vision len >= this × Docling len → may drop Docling.
+    vision_min_chars: 200       # Only consulted when enabled=true.
+                                # Absolute floor: Vision must also be >= this many
+                                # chars before dropping Docling. Guards the failure
+                                # mode where a tiny Vision blob proportionally
+                                # matches a denoised Docling block and wipes real
+                                # content. Set to 0 to rely on ratio alone.
 
   markdown:
     include_metadata_header: true  # YAML frontmatter in each file
@@ -871,7 +911,18 @@ sanitize:
 # Default OFF. Even when enabled, no work runs until the user invokes
 # `docingest graph build` or `docingest.graph.build()` explicitly.
 graph:
-  enabled: false                       # master switch — default OFF
+  # Declarative flag: the user (or automation) telling DocIngest "I do
+  # want a graph layer on this knowledge base". It is NOT a gate that
+  # prevents graph commands from running — what actually keeps the
+  # graph layer dormant is:
+  #   (1) [graph] extras not installed → docingest.graph module fails
+  #       to import, CLI / MCP simply don't show the `graph` commands;
+  #   (2) the main `docingest run` pipeline never touches the graph
+  #       subpackage; nothing happens until the user explicitly invokes
+  #       `docingest graph build` or `docingest.graph.build()`.
+  # Set true if a downstream script keys off this value to decide
+  # whether to trigger a build automatically.
+  enabled: false                       # informational flag — default OFF
   backend: "lightrag"                  # lightrag (only backend in v1)
   mode: "full"                         # vector_only | full
   output_subdir: "graph"               # relative to output.dir
