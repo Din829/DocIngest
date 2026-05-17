@@ -351,6 +351,65 @@ def test_query_mode_validation() -> None:
     print("OK: query mode validation matrix")
 
 
+def test_query_propagates_backend_error_on_empty_answer() -> None:
+    """
+    Regression guard: when a backend returns an empty answer (the way
+    LightRAG silently fails on its Lock-event-loop bug), the facade
+    QueryResult MUST carry the error in ``stats["error"]`` so callers
+    can detect the failure.
+
+    We don't exercise the real LightRAG path (that would require
+    network + a built graph); instead we monkeypatch the backend
+    factory to return a stub backend that mimics the empty-answer
+    failure mode the production backend now reports.
+    """
+    from docingest.graph import api as graph_api
+    from docingest.graph.backends.base import GraphBackend, QueryOutcome
+
+    class _StubBackend(GraphBackend):
+        """Minimal backend; the only method query() exercises is query()."""
+
+        def build(self, chunks_path, output_dir, *, force=False, on_progress=None):  # type: ignore[override]
+            raise NotImplementedError
+
+        def status(self):  # type: ignore[override]
+            raise NotImplementedError
+
+        def query(self, query, *, mode, top_k=None, return_context=False, extra=None):  # type: ignore[override]
+            # Mimic the post-fix backend behaviour: empty answer triggers
+            # an explicit error entry in stats. The facade must surface this.
+            return QueryOutcome(
+                answer="",
+                mode_used=mode,
+                elapsed_ms=42,
+                stats={"error": "synthetic: backend returned empty"},
+            )
+
+    # Patch the factory used by the facade. tmp dir avoids touching a
+    # real knowledge base — the stub backend never reads disk.
+    original_factory = graph_api._create_backend
+    graph_api._create_backend = lambda config, embedding: _StubBackend()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            result = graph_api.query(
+                "anything",
+                knowledge_dir=tmp,
+                mode="local",
+            )
+        finally:
+            graph_api._create_backend = original_factory
+
+    assert result.answer == ""
+    assert isinstance(result.stats, dict)
+    err = result.stats.get("error")
+    assert err and "synthetic" in err, (
+        f"facade did not propagate backend stats.error; got stats={result.stats!r}"
+    )
+
+    print("OK: facade propagates backend stats.error on empty answer")
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -364,6 +423,7 @@ def main() -> None:
     test_api_normalize_overrides()
     test_api_resolve_embedding_dispatch()
     test_query_mode_validation()
+    test_query_propagates_backend_error_on_empty_answer()
     print("\nAll graph-internals tests passed.")
 
 

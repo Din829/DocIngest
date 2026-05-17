@@ -400,6 +400,8 @@ Embedding providers (`docingest.graph.OpenAIEmbedding` / `GeminiEmbedding` / `Se
 
 **Library callers** (`docingest.graph.build(...)`) do NOT auto-load `.env` — by design, so embedding DocIngest into a long-running host doesn't pollute the process environment. If you want `.env` behaviour from the library, call `load_dotenv()` yourself before invoking the facade, or pass keys via Provider objects.
 
+**Known issue — `query()` in the same Python process can silently fail on the 2nd+ call.** LightRAG 1.4's internal `asyncio.Lock` is bound to the first event loop, but `docingest.graph.query()` uses a fresh `asyncio.run()` per call; subsequent invocations hit a "Lock bound to a different event loop" error inside LightRAG. We now detect this — `result.stats["error"]` is populated and the answer is empty — but the underlying bug is upstream. **Workaround**: call from the CLI (`docingest graph query`, one subprocess per call), or spawn one subprocess per query from your Python code. Reusing the same process across many queries will not work until LightRAG fixes the lock binding.
+
 ### Boost traditional RAG with graph entities (`chunks_enriched.jsonl`)
 
 GraphRAG queries are great, but most teams already have a vector RAG pipeline they want to keep. The optional **chunk enrichment** stage feeds the graph's extracted entity names + descriptions back into a NEW jsonl file — giving your existing vector RAG a precision boost without rewriting it.

@@ -247,6 +247,11 @@ def query_cmd(
         err_console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
 
+    # Backend signals soft failure (incl. LightRAG-internal silent
+    # failures) via result.stats["error"]. Surface it visibly so users
+    # don't mistake an empty answer for "no relevant info found".
+    backend_error = result.stats.get("error") if result.stats else None
+
     if json_output:
         payload = {
             "answer": result.answer,
@@ -254,13 +259,21 @@ def query_cmd(
             "elapsed_ms": result.elapsed_ms,
             "output_dir": result.output_dir,
         }
+        if backend_error:
+            payload["error"] = backend_error
         sys.stdout.write(json_mod.dumps(payload, ensure_ascii=False, indent=2))
         sys.stdout.write("\n")
+        # Non-zero exit code makes shell pipelines / agents notice.
+        if backend_error:
+            raise typer.Exit(1)
     else:
         err_console.print(
             f"\n[bold]Mode:[/bold] {result.mode_used}  "
             f"[dim]({result.elapsed_ms} ms)[/dim]\n"
         )
+        if backend_error:
+            err_console.print(f"[red]Backend error:[/red] {backend_error}\n")
+            raise typer.Exit(1)
         # Answer goes to stdout so users can pipe `docingest graph query ... > out.md`
         sys.stdout.write(result.answer + "\n")
 

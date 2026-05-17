@@ -513,13 +513,43 @@ class LightRAGBackend(GraphBackend):
                     stats={"error": f"aquery failed: {e}"},
                 )
 
+            # Empty-answer detection.
+            #
+            # LightRAG's aquery does NOT always raise on internal failure —
+            # it logs the error via its own logger and returns None / "".
+            # The most common cause in practice is its module-level
+            # asyncio.Lock getting bound to the event loop of the FIRST
+            # asyncio.run() call; subsequent in-process query() calls
+            # invoke a fresh loop, the Lock rejects the new loop, and
+            # aquery silently returns empty.
+            #
+            # Without this guard, callers see ``answer=""`` and ``stats={}``
+            # and can't distinguish "no answer found" from "backend
+            # silently failed". Treat empty/whitespace-only answers as
+            # an error so the API contract holds:
+            #     stats["error"] present  →  failure (don't trust answer)
+            #     stats["error"] absent   →  success
+            answer_str = str(answer) if answer is not None else ""
+            stats: dict[str, Any] = {}
+            if not answer_str.strip():
+                stats["error"] = (
+                    "backend returned empty answer — likely an internal "
+                    "LightRAG failure. Check stderr for ERROR lines (a "
+                    "common cause is calling docingest.graph.query() "
+                    "multiple times in the same Python process: "
+                    "LightRAG 1.4's asyncio.Lock binds to the first "
+                    "event loop and rejects subsequent ones). Workaround: "
+                    "use the CLI (`docingest graph query`) or spawn a "
+                    "fresh subprocess per call."
+                )
             return QueryOutcome(
-                answer=str(answer) if answer is not None else "",
+                answer=answer_str,
                 context=[],   # LightRAG bundles context into the answer text
                               # when only_need_context=True; we forward as-is
                               # in `answer` for now (Phase 2 can split it).
                 mode_used=normalised_mode,
                 elapsed_ms=int((time.monotonic() - t_start) * 1000),
+                stats=stats,
             )
         finally:
             try:

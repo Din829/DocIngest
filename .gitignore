@@ -36,3 +36,6 @@ test_pptx_*/
 
 # Misc
 errors.json
+
+# Local debug scripts (ad-hoc repro / verification — not part of test suite)
+debug_*.py
