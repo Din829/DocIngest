@@ -83,6 +83,7 @@ def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
         "magika": {"import": "magika", "install": "pip install magika", "purpose": "Content-based file type detection"},
         "yt-dlp": {"import": "yt_dlp", "install": "pip install yt-dlp", "purpose": "YouTube/Bilibili URL support"},
         "lightrag-hku": {"import": "lightrag", "install": 'pip install -e ".[graph]"', "purpose": "GraphRAG layer (entity / relation / community graph + queries)"},
+        "nest_asyncio": {"import": "nest_asyncio", "install": 'pip install -e ".[graph]"', "purpose": "Enables repeated graph.query() in MCP server (auto-applied there)"},
         "sentence-transformers": {"import": "sentence_transformers", "install": 'pip install -e ".[graph-local]"', "purpose": "Local embeddings for GraphRAG (zero API cost)"},
     }
     for pkg_name, info in optional_packages.items():

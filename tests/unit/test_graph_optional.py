@@ -141,10 +141,63 @@ def test_cli_loads_with_or_without_graph() -> None:
         )
 
 
+def test_mcp_server_applies_nest_asyncio() -> None:
+    """
+    Importing docingest.mcp_server should apply nest_asyncio when both
+    lightrag-hku AND nest_asyncio are installed — this is what lets the
+    long-running MCP server invoke docingest.graph.query() repeatedly
+    without hitting LightRAG's asyncio.Lock-bound-to-first-loop bug.
+
+    We only assert when both deps are available; otherwise we accept
+    "not applied" as the documented graceful-degradation path.
+
+    Detection: nest_asyncio.apply() sets a sentinel attribute
+    ``_nest_patched`` on the asyncio module (per nest_asyncio's source).
+    """
+    for name in list(sys.modules):
+        if name.startswith("docingest") or name == "nest_asyncio":
+            del sys.modules[name]
+
+    # Probe whether [graph] extras are fully installed.
+    try:
+        import lightrag  # noqa: F401
+        import nest_asyncio  # noqa: F401
+        extras_available = True
+    except ImportError:
+        extras_available = False
+
+    if not extras_available:
+        print("OK: nest_asyncio test skipped — [graph] extras not installed")
+        return
+
+    # Fresh asyncio import — make sure no prior test in this run already
+    # patched it for unrelated reasons.
+    import asyncio
+    was_patched_before = getattr(asyncio, "_nest_patched", False)
+
+    # The actual import-under-test.
+    import docingest.mcp_server  # noqa: F401
+
+    # nest_asyncio.apply() flips the sentinel.
+    is_patched_now = getattr(asyncio, "_nest_patched", False)
+
+    assert is_patched_now, (
+        "docingest.mcp_server import did not apply nest_asyncio "
+        "(both lightrag and nest_asyncio ARE installed). The MCP "
+        "server will silently fail on the 2nd query_graph call."
+    )
+
+    if was_patched_before:
+        print("OK: nest_asyncio already applied before MCP import (idempotent)")
+    else:
+        print("OK: nest_asyncio applied by MCP server import")
+
+
 def main() -> None:
     test_main_package_imports_clean()
     test_graph_subpackage_isolated()
     test_cli_loads_with_or_without_graph()
+    test_mcp_server_applies_nest_asyncio()
     print("\nAll graph-optional regression tests passed.")
 
 

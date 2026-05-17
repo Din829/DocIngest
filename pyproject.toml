@@ -60,6 +60,14 @@ graph = [
     # unchanged without these installed.
     "lightrag-hku>=1.0,<2.0", # Knowledge graph + community detection backend
     "openai>=1.50",           # OpenAI embeddings (default embedding provider)
+    # nest_asyncio is applied ONLY by the MCP server entry point (not the
+    # library / CLI path). LightRAG 1.4's internal asyncio.Lock binds to
+    # the first event loop and rejects subsequent asyncio.run() calls,
+    # which silently breaks the 2nd+ query in the long-running MCP server
+    # process. nest_asyncio.apply() lets asyncio.run() reuse / nest the
+    # existing loop instead of spawning a fresh one each time. See
+    # mcp_server.py for the apply site and README "Known issue" section.
+    "nest_asyncio>=1.6",
     # numpy is already a transitive dep of docling/litellm; no need to pin.
 ]
 graph-local = [

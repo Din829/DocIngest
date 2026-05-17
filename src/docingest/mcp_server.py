@@ -676,6 +676,45 @@ except ImportError:
     _GRAPH_AVAILABLE = False
 
 
+# ---------------------------------------------------------------------------
+# nest_asyncio: required so the long-running MCP server can call
+# docingest.graph.query() more than once in the same process.
+#
+# Why this lives ONLY in the MCP entry point (not in docingest.graph
+# itself):
+#   - nest_asyncio.apply() is a global monkeypatch on Python's asyncio.
+#     It must not be silently applied to library callers' processes —
+#     embedding DocIngest into a long-running host (web service, daemon)
+#     should leave the host's asyncio untouched.
+#   - The MCP server, by definition, IS the long-running host for graph
+#     tool calls. Agents reach it via stdio/SSE and invoke query_graph
+#     repeatedly; without nest_asyncio the 2nd+ call hits LightRAG's
+#     known asyncio.Lock-bound-to-first-event-loop bug and returns an
+#     empty answer (now surfaced as stats["error"], but still failed).
+#   - The CLI path is unaffected by this bug because each `docingest
+#     graph query` invocation is its own subprocess — Locks die with
+#     the process, so no apply needed there either.
+#
+# Failure-tolerant: if nest_asyncio isn't installed (older [graph]
+# extras, or someone hand-picked deps), we silently skip — the empty-
+# answer detection in lightrag_backend still makes the 2nd-call failure
+# visible to the agent via stats["error"]. So worst case: degraded
+# behaviour with a clear error message, never a hard crash.
+# ---------------------------------------------------------------------------
+
+if _GRAPH_AVAILABLE:
+    try:
+        import nest_asyncio  # type: ignore[import-not-found]
+        nest_asyncio.apply()
+        _NEST_ASYNCIO_APPLIED = True
+    except ImportError:
+        _NEST_ASYNCIO_APPLIED = False
+        logger.warning(
+            "nest_asyncio is not installed — repeated query_graph calls "
+            "in this MCP server will fail on the 2nd attempt (LightRAG "
+            "asyncio.Lock bug). Install with: pip install -e \".[graph]\""
+        )
+
 if _GRAPH_AVAILABLE:
 
     @mcp.tool

@@ -400,7 +400,15 @@ Embedding providers (`docingest.graph.OpenAIEmbedding` / `GeminiEmbedding` / `Se
 
 **Library callers** (`docingest.graph.build(...)`) do NOT auto-load `.env` — by design, so embedding DocIngest into a long-running host doesn't pollute the process environment. If you want `.env` behaviour from the library, call `load_dotenv()` yourself before invoking the facade, or pass keys via Provider objects.
 
-**Known issue — `query()` in the same Python process can silently fail on the 2nd+ call.** LightRAG 1.4's internal `asyncio.Lock` is bound to the first event loop, but `docingest.graph.query()` uses a fresh `asyncio.run()` per call; subsequent invocations hit a "Lock bound to a different event loop" error inside LightRAG. We now detect this — `result.stats["error"]` is populated and the answer is empty — but the underlying bug is upstream. **Workaround**: call from the CLI (`docingest graph query`, one subprocess per call), or spawn one subprocess per query from your Python code. Reusing the same process across many queries will not work until LightRAG fixes the lock binding.
+**Known issue — repeated `query()` in the same Python process.** LightRAG 1.4's internal `asyncio.Lock` is bound to the first event loop, so a fresh `asyncio.run()` per call (which is what `docingest.graph.query()` does) fails on the 2nd+ invocation with "Lock bound to a different event loop". We handle this differently per entry point:
+
+| Entry point | Multiple calls per process? | Status |
+|---|---|---|
+| **CLI** (`docingest graph query`) | No — each invocation is a fresh subprocess | ✅ Just works, nothing to do |
+| **MCP server** (`build_graph` / `query_graph` tools) | Yes — long-running server, agents call repeatedly | ✅ Auto-fixed: the MCP entry point applies `nest_asyncio` so subsequent `asyncio.run()` calls reuse the existing loop. Agents see no difference |
+| **Python library** (`docingest.graph.query(...)`) | Depends on caller | 🟡 Not auto-fixed (we don't want to monkey-patch host's asyncio). Three workarounds: (1) call `nest_asyncio.apply()` yourself before looping over queries; (2) spawn one subprocess per query; (3) issue a single call per process |
+
+When the bug DOES bite (library path without workaround), the empty answer is surfaced as `result.stats["error"]` with a descriptive message — you can detect failure programmatically, you just can't recover from it without the workaround.
 
 ### Boost traditional RAG with graph entities (`chunks_enriched.jsonl`)
 
