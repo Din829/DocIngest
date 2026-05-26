@@ -27,6 +27,98 @@ _TABLE_ROW_RE = re.compile(r"^\s*\|.+\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|[-:| ]+\|\s*$")
 
 
+def _count_cells(line: str) -> int:
+    """
+    Count data cells in a markdown table row.
+
+    A row like `| a | b | c |` has 3 cells. Escaped pipes (`\\|`) inside cell
+    content are not separators. Returns 0 for empty / non-row input so callers
+    can use `_count_cells(x) > 1` safely without a type check.
+    """
+    s = line.strip()
+    if not (s.startswith("|") and s.endswith("|")):
+        return 0
+    # Replace escaped pipes with a placeholder so they don't count as separators.
+    s = s.replace(r"\|", "\x00")
+    # A row of N cells has N+1 pipe characters; subtract 1 to get cell count.
+    return max(0, s.count("|") - 1)
+
+
+def _detect_caption_header(table_lines: list[str]) -> int:
+    """
+    Detect a leading "caption row + separator" preamble that should be carried
+    along with the real column-header row when the table is split into chunks.
+
+    Excel files frequently start a sheet with a one-cell title above the real
+    column headers, e.g.
+
+        | ■運用全般ルール・対応指針 |    ← caption (1 cell)
+        | --- |                          ← separator
+        |  | No | Category1 | ... |      ← real header (many cells)
+        |  | 1 | メール | ... |           ← data
+        |  | 2 | メール | ... |           ← data
+
+    Markdown table chunkers that blindly treat the FIRST row as the header
+    end up replicating only the caption into every chunk and dropping the
+    real column names from chunks 1..N — meaning downstream RAG / LLM sees
+    `| 22 | 運用 | ... |` without ever knowing the columns are
+    `No / Category1 / Category2 / ...`.
+
+    This helper looks at the first few rows and returns how many leading
+    rows form the caption preamble. Returns 0 (no caption) for tables that
+    look normal — keeping the caller's behaviour byte-identical for the
+    common case.
+
+    Returns:
+        0  — no caption preamble; the first row IS the real header
+        2  — first row is a caption + separator pair; the REAL header is row[2]
+             (the caller treats rows 0..2 as the header_block to repeat)
+
+    Heuristic (purely structural, no content sniffing — works for any xlsx
+    whose caption isn't recognised by name):
+      - row[0] has exactly 1 cell  (caption is a single-cell title)
+      - row[1] is a markdown separator
+      - row[2] exists and has > 1 cell  (real header has multiple columns)
+      - the typical data row (sampled from row[3] onward) has a cell count
+        within 2 of row[2]'s cell count  (real header ≈ data row width)
+      - row[2] is itself a regular row, NOT another separator
+    """
+    if len(table_lines) < 4:
+        # Need at least: caption + sep + real_header + at least 1 data row.
+        return 0
+
+    cap_cells = _count_cells(table_lines[0])
+    if cap_cells != 1:
+        return 0
+    if not _TABLE_SEP_RE.match(table_lines[1]):
+        return 0
+    if _TABLE_SEP_RE.match(table_lines[2]):
+        # Two separators in a row — not a caption preamble, just an odd table.
+        return 0
+
+    real_header_cells = _count_cells(table_lines[2])
+    if real_header_cells <= 1:
+        # Real header should be wider than the caption — otherwise we can't
+        # tell it apart from a continuation of the caption.
+        return 0
+
+    # Sample up to 5 subsequent rows and check their cell-count agreement
+    # with the would-be real header. A real header has roughly the same width
+    # as its data rows; a caption usually does not.
+    sample = table_lines[3:8]
+    if not sample:
+        return 0
+    matches = sum(
+        1 for ln in sample
+        if abs(_count_cells(ln) - real_header_cells) <= 2
+    )
+    # Require majority agreement so a stray row doesn't trip the heuristic.
+    if matches < max(1, len(sample) // 2):
+        return 0
+
+    return 2  # caption(0) + separator(1) — real header is at index 2
+
+
 class SheetChunker(BaseChunker):
     """Split Excel/CSV Markdown by sheets and row groups with header repetition."""
 
@@ -193,18 +285,34 @@ class SheetChunker(BaseChunker):
         Chunk a single table (header + separator + data rows) into row groups.
 
         Header is repeated at the top of each chunk.
+
+        When the table starts with a single-cell caption above the real column
+        header (a common shape for xlsx sheets that have a title row above the
+        column names — see `_detect_caption_header`), BOTH the caption row and
+        the real header row are kept in the per-chunk header block. This way
+        every chunk carries the column names, not just the caption — so an LLM
+        reading chunk N can still tell which column means "No" vs "Category"
+        vs "ルール" etc. For ordinary tables (no caption), behaviour is
+        unchanged.
         """
         if len(table_lines) < 3:
             return None  # Need at least header + separator + 1 data row
 
-        header_line = table_lines[0]
-        separator_line = table_lines[1]
-        data_rows = table_lines[2:]
+        # Detect optional caption preamble. When present (offset == 2), the
+        # real header sits at index 2 and the caption + separator at 0..1
+        # need to be carried into every chunk too.
+        caption_offset = _detect_caption_header(table_lines)
+        if caption_offset == 2:
+            header_lines = table_lines[0:3]  # caption + sep + real header
+            data_rows = table_lines[3:]
+        else:
+            header_lines = table_lines[0:2]  # original behaviour
+            data_rows = table_lines[2:]
 
         if not data_rows:
             return None
 
-        header_block = f"{header_line}\n{separator_line}"
+        header_block = "\n".join(header_lines)
         header_tokens = self.estimate_tokens(header_block)
 
         # Budget for data per chunk
