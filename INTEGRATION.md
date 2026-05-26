@@ -102,9 +102,11 @@ Claude / Cursor / Copilot agents talking to DocIngest as a tool.
 
 Stdio is the default transport. For browser-side / web clients, run `python -m docingest.mcp_server --transport sse` and connect over SSE instead.
 
-Tools exposed: `inspect`, `run`, `refine`, `search_knowledge`, `list_knowledge`, `read_source`. Every tool docstring spells out WHEN TO USE / TYPICAL WORKFLOW / how to interpret the result — agents read those at startup. The MCP layer is a thin transport wrapper around the same Python facade, so tool behaviour mirrors `docingest.ingest()` exactly.
+Tools exposed: `inspect`, `run`, `refine` (and the four optional `build_graph` / `query_graph` / `graph_status` / `enrich_chunks` tools when `[graph]` extras are installed). Every tool docstring spells out WHEN TO USE / TYPICAL WORKFLOW / how to interpret the result — agents read those at startup. The MCP layer is a thin transport wrapper around the same Python facade, so tool behaviour mirrors `docingest.ingest()` exactly.
 
-The recommended agent flow for any non-trivial input: **`inspect` → review cost → `run` → `search_knowledge` / `read_source`**. See `mcp_server.py` tool docstrings for the full pattern.
+Browsing / searching / reading the produced knowledge base is **deliberately NOT exposed as MCP tools** — DocIngest is a preprocessing engine, not a retrieval engine. Each agent already has Grep / Read / Glob that out-perform any wrapper we could ship, and the auto-generated `<output_dir>/knowledge_search.SKILL.md` gives them the corpus summary, file index, keyword index, and a language-routed search protocol in one Read. This keeps DocIngest as the universal upstream layer — every agent uses its own native tooling on the produced artefacts.
+
+The recommended agent flow for any non-trivial input: **`inspect` → review cost → `run` → native Read on `knowledge_search.SKILL.md` → native Grep / Read on `sources/*.md`**. See `mcp_server.py`'s top-level `FastMCP(instructions=...)` block for the full pattern surfaced to agents at session start.
 
 ### 6. Refine for human-readable output
 

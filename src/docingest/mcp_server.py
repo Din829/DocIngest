@@ -22,9 +22,7 @@ Requires: pip install fastmcp   (or pip install -e ".[mcp]")
 
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -42,36 +40,47 @@ mcp = FastMCP(
         "becomes clean Markdown + chunked text + a searchable knowledge "
         "map. Two downstreams consume the same output:\n"
         "- RAG: vector search on chunks.jsonl (your own embedder)\n"
-        "- Agentic Search: grep / read on sources/*.md (via the tools below)\n"
+        "- Agentic Search: your native Grep / Read tools on sources/*.md\n"
         "\n"
         "DocIngest is NOT a retrieval engine — it does no embeddings, no "
         "vector search, no LLM answer generation. It prepares the data; "
-        "the Agent (you) retrieves, cites, and reasons over it.\n"
+        "the Agent (you) retrieves, cites, and reasons over it using your "
+        "own native tools (Grep / Read / Glob).\n"
         "\n"
         "TOOL ROLES AT A GLANCE\n"
         "- inspect(paths)              — pre-flight cost estimate, NO parsing\n"
         "- run(paths, output_dir)      — do the actual preprocessing\n"
-        "- list_knowledge(dir)         — inventory a processed base\n"
-        "- search_knowledge(q, dir)    — keyword grep over sources/*.md\n"
-        "- read_source(name, dir)      — read one full source file\n"
         "- refine(files)               — OPTIONAL AI polish for humans\n"
+        "\n"
+        "Searching / reading the knowledge base is NOT exposed as an MCP\n"
+        "tool by design — use your own native Grep / Read / Glob on the\n"
+        "produced artefacts. See WORKFLOW B below for how to bootstrap.\n"
         "\n"
         "WORKFLOWS YOU SHOULD REACH FOR\n"
         "\n"
         "A) User gave you new documents to ingest:\n"
         "   inspect(paths) -> review est_cost_usd and recommendation\n"
         "   run(paths, output_dir)\n"
-        "   list_knowledge(output_dir) -> confirm what landed\n"
+        "   (Then use native Read on output_dir/index.json to confirm\n"
+        "   what landed — see WORKFLOW B for the exploration pattern.)\n"
         "\n"
         "B) User asks a question about an existing knowledge base:\n"
-        "   list_knowledge(dir) -> see files + sections + summary\n"
-        "   search_knowledge(query, dir) -> find matching lines\n"
-        "   read_source(file, dir, max_lines=200) -> read the relevant one\n"
+        "   1. Read <output_dir>/knowledge_search.SKILL.md FIRST — it's\n"
+        "      the auto-generated search protocol for this specific\n"
+        "      knowledge base (summary, file index, keyword index,\n"
+        "      search guide tailored to the corpus language).\n"
+        "   2. Read <output_dir>/index.json for the file inventory\n"
+        "      (paths, formats, sections, languages, page counts).\n"
+        "   3. Use your native Grep on <output_dir>/sources/*.md to find\n"
+        "      matches. Expand keywords with synonyms — the SKILL.md\n"
+        "      protocol explicitly warns 'Grep miss ≠ not written'.\n"
+        "   4. Use your native Read on the specific source file (target\n"
+        "      a line range when the file is large).\n"
         "\n"
         "C) User wants a cleaned / human-readable version:\n"
         "   refine(files, skill='refine_default')  (or 'refine_faithful'\n"
         "   when the user's domain is legal / contractual / compliance)\n"
-        "   read_source(file, dir, folder='readable') -> fetch polished\n"
+        "   Then native Read on <output_dir>/readable/<skill>/<file>.md.\n"
         "\n"
         "IMPORTANT HABITS\n"
         "- ALWAYS `inspect` first for unknown or large inputs. Going\n"
@@ -332,8 +341,9 @@ def refine(
     - ONLY when the user explicitly wants human-readable output (e.g.
       "clean this up for publishing", "produce a readable summary").
     - Do NOT call as part of a routine RAG pipeline: raw `sources/*.md`
-      are already what `search_knowledge` / `read_source` / downstream
-      chunk consumers want. Refine is a SEPARATE, optional human track.
+      (consumed via your native Grep / Read tools) and downstream chunk
+      consumers want the unmodified parser output. Refine is a SEPARATE,
+      optional human track.
     - Do NOT refine large files blindly: the LLM call cost scales with
       input tokens. The tool auto-skips files beyond
       refine.max_input_tokens (default 8000) — check `skipped` in the
@@ -350,7 +360,8 @@ def refine(
     TYPICAL WORKFLOW
         # User: "clean up the contract doc for sharing"
         refine(["./kb/sources/contract.md"], skill="refine_faithful")
-        # Then use read_source(..., folder="readable") to fetch result.
+        # Then Read ./kb/readable/faithful/contract.md with your native
+        # Read tool to fetch the polished result.
 
     Args:
         files: Markdown file paths. If a file lives in `.../sources/`,
@@ -389,273 +400,21 @@ def refine(
 
 
 # ---------------------------------------------------------------------------
-# Tool: search_knowledge
+# NOTE: search_knowledge / list_knowledge / read_source were removed.
+#
+# Rationale: DocIngest is a preprocessing engine, not a retrieval engine.
+# Those three tools were thin wrappers around `re.search` + `read_text`
+# that any agent's native Grep / Read / Glob can do better — and they
+# misled agents into thinking DocIngest "owns" the search surface.
+#
+# To explore a processed knowledge base, use your native tools on the
+# on-disk artefacts:
+#   - <output_dir>/knowledge_search.SKILL.md  — auto-generated search
+#     protocol (summary, file index, keyword index, search guide)
+#   - <output_dir>/index.json                 — file inventory
+#   - <output_dir>/sources/*.md               — clean source markdown
+#   - <output_dir>/chunks.jsonl               — chunks for RAG
 # ---------------------------------------------------------------------------
-
-@mcp.tool
-def search_knowledge(
-    query: str,
-    knowledge_dir: str = "./knowledge",
-    max_results: int = 10,
-) -> dict[str, Any]:
-    """
-    Keyword search over a processed knowledge base (grep on sources/*.md).
-
-    Case-insensitive literal match across every source Markdown file in
-    the knowledge base. Returns matched lines plus 1 line of context
-    before / after. Also surfaces the knowledge_map summary so you get
-    a quick overview of what's in the base.
-
-    WHEN TO USE
-    - Call this when the user asks about CONTENT inside documents
-      ("find where the contract mentions X", "documents containing Y").
-    - Call `list_knowledge` FIRST when you need to know what's in the
-      base — search_knowledge is for finding content, not for browsing.
-    - This is KEYWORD search (literal regex-escaped substring). For
-      semantic / conceptual queries, this tool is NOT enough — but
-      DocIngest is a preprocessing library, not a RAG engine, so there
-      is no semantic search tool here. If the user needs semantic
-      matching, tell them the chunks in chunks.jsonl are meant for
-      downstream vector search in their RAG stack.
-
-    TYPICAL WORKFLOW
-        # User: "Which doc talks about 解約手順?"
-        r = search_knowledge("解約手順", "./knowledge/pwc")
-        # r["matches"] lists files + line numbers + 1-line context
-        # Then drill in:
-        read_source(r["matches"][0]["file"], "./knowledge/pwc")
-
-    INTERPRETING THE RESULT
-    - `knowledge_map_summary` — populated when the base was built with
-      `knowledge_map.enabled=true` (default). Read this first for a
-      one-paragraph overview before diving into matches.
-    - `matches` — ordered by file name. Each entry has `file`, `line`
-      (1-based), `context` (up to 3 lines including the match).
-    - `total_matches` — capped at max_results; if equal to max_results,
-      there may be more matches not shown.
-
-    Args:
-        query: Literal search string. Case-insensitive. Regex special
-            characters are escaped automatically — you cannot pass regex.
-            Multi-word queries match the exact phrase, not individual words.
-        knowledge_dir: Path to the knowledge base root (the directory
-            that contains `sources/` and `index.json`). Default "./knowledge".
-        max_results: Hard cap on returned matches. Default 10 keeps the
-            response small for LLM context. Raise to 30-50 for broader
-            surveys, but note total_matches == max_results usually means
-            "refine your query" rather than "ingest all of these".
-
-    Returns:
-        dict with keys:
-            query                  — echoed input
-            matches                — list of {file, line, context}
-            total_matches          — count (<= max_results)
-            knowledge_map_summary  — str or None
-            stats                  — dict with file / chunk / token counts
-                                     (from knowledge_map.yaml, or absent)
-    """
-    import re
-
-    kb_dir = Path(knowledge_dir)
-    results: dict[str, Any] = {"query": query, "matches": [], "knowledge_map_summary": None}
-
-    # Load knowledge map summary if available
-    km_path = kb_dir / "knowledge_map.yaml"
-    if km_path.exists():
-        try:
-            import yaml
-            km = yaml.safe_load(km_path.read_text(encoding="utf-8"))
-            results["knowledge_map_summary"] = km.get("summary")
-            results["stats"] = km.get("stats")
-        except Exception:
-            pass
-
-    # Grep sources/*.md for query
-    sources_dir = kb_dir / "sources"
-    if not sources_dir.exists():
-        return results
-
-    matches: list[dict[str, Any]] = []
-    pattern = re.compile(re.escape(query), re.IGNORECASE)
-
-    for md_file in sorted(sources_dir.glob("*.md")):
-        try:
-            lines = md_file.read_text(encoding="utf-8").split("\n")
-            for line_no, line in enumerate(lines, 1):
-                if pattern.search(line):
-                    # Context: line before + match + line after
-                    start = max(0, line_no - 2)
-                    end = min(len(lines), line_no + 1)
-                    context = "\n".join(lines[start:end])
-                    matches.append({
-                        "file": md_file.name,
-                        "line": line_no,
-                        "context": context,
-                    })
-                    if len(matches) >= max_results:
-                        break
-        except Exception:
-            continue
-        if len(matches) >= max_results:
-            break
-
-    results["matches"] = matches
-    results["total_matches"] = len(matches)
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Tool: list_knowledge
-# ---------------------------------------------------------------------------
-
-@mcp.tool
-def list_knowledge(
-    knowledge_dir: str = "./knowledge",
-) -> dict[str, Any]:
-    """
-    Inventory of a processed knowledge base — returns raw index.json.
-
-    WHEN TO USE
-    - Call this FIRST when starting work with an unfamiliar knowledge
-      base (e.g. the user points at a directory and says "look at these
-      docs"). You'll learn what files are in it, their formats / languages
-      / sizes, and their section structure, all in one call.
-    - Call AFTER `run` to confirm what landed.
-    - Prefer `search_knowledge` when the user already knows what they
-      want (a keyword, a filename) — `list_knowledge` is for surveying,
-      not for finding.
-
-    WHAT THE RESULT CONTAINS
-    - `version`, `processed_at` — schema version and when the base was built.
-    - `files` — list of file entries. Each entry includes:
-        path             — relative .md path under sources/
-        original_file    — the input filename that produced it
-        format           — "pdf" / "pptx" / "docx" / "xlsx" / ...
-        title            — extracted title (usually filename stem)
-        language         — auto-detected: ja / zh / en / ko / unknown
-        pages            — page count (for paginated formats)
-        chunks_count     — how many chunks this file produced
-        tokens_estimated — CJK-aware token estimate
-        sections         — section headings extracted from the doc
-        element_boxes    — PDF bounding boxes per page (only for PDFs,
-                           useful for citation / highlighting in RAG UIs)
-
-    TYPICAL WORKFLOW
-        info = list_knowledge("./knowledge/pwc")
-        # Scan info["files"] — note format distribution, languages,
-        # total token volume. Use sections to hint search queries.
-        # Then: search_knowledge("...", "./knowledge/pwc")
-
-    HANDLING ERRORS
-    Returns {"error": "..."} when the knowledge base doesn't exist
-    (`run` not called yet) or index.json is corrupt. Agents should tell
-    the user to run `run` first when this happens.
-
-    Args:
-        knowledge_dir: Path to the knowledge base root. Default "./knowledge".
-
-    Returns:
-        dict — either full index.json content, or {"error": "..."}.
-    """
-    index_path = Path(knowledge_dir) / "index.json"
-    if not index_path.exists():
-        return {"error": f"No index.json found at {index_path}. Run 'run' first."}
-
-    try:
-        return json.loads(index_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        return {"error": f"Failed to read index.json: {e}"}
-
-
-# ---------------------------------------------------------------------------
-# Tool: read_source
-# ---------------------------------------------------------------------------
-
-@mcp.tool
-def read_source(
-    file_name: str,
-    knowledge_dir: str = "./knowledge",
-    folder: str = "sources",
-    max_lines: int | None = None,
-) -> dict[str, Any]:
-    """
-    Read a full Markdown file from a processed knowledge base.
-
-    WHEN TO USE
-    - After `search_knowledge` or `list_knowledge` gives you a file name
-      and you need the full content to answer the user.
-    - For LARGE files, ALWAYS pass `max_lines` first (e.g. max_lines=200)
-      to peek at the beginning without blowing your context window.
-      Follow up with targeted reads if needed.
-    - Do NOT use this to browse — call `list_knowledge` when you just
-      want to know what files exist.
-
-    FOLDER CHOICE
-    - `folder="sources"` (default) — raw parsed Markdown. This is the
-      ground truth used by search_knowledge and by downstream RAG.
-    - `folder="readable"` — AI-refined versions produced by the `refine`
-      tool. Use when the user wants the polished / human-friendly
-      version. Only exists if `refine` was called previously.
-      Files live under `readable/<skill_short>/` (e.g. readable/default/,
-      readable/faithful/). Pass `folder="readable/default"` to target a
-      specific skill.
-
-    TRUNCATION BEHAVIOUR
-    When max_lines is set and the file is longer, content is truncated
-    from the top (first N lines kept). The `truncated` flag is True and
-    `total_lines` reports the full file size so you can decide whether
-    to read more or change strategy (e.g. ask user what section they want).
-
-    TYPICAL WORKFLOW
-        # User asked about the contract's cancellation terms:
-        hits = search_knowledge("解約", "./kb")
-        # hits["matches"][0]["file"] = "contract.md", line = 42
-        # Peek at the file around that region:
-        r = read_source("contract.md", "./kb", max_lines=60)
-        # r["content"] has the first 60 lines; decide next action.
-
-    Args:
-        file_name: Filename (e.g. "report.md"). NOT a full path — just
-            the name as returned by list_knowledge / search_knowledge.
-        knowledge_dir: Path to the knowledge base root. Default "./knowledge".
-        folder: Which subfolder to read from. "sources" (default) or
-            "readable" or "readable/<skill>". See above.
-        max_lines: Read only the first N lines. None = full file
-            (dangerous for huge files). Recommended: pass 200 for a
-            peek; increase as needed.
-
-    Returns:
-        dict with keys:
-            file         — echoed file name
-            folder       — echoed folder
-            content      — Markdown text (possibly truncated)
-            total_lines  — full line count of the file
-            truncated    — bool, True if max_lines cut it off
-        OR {"error": "..."} on file not found / read failure.
-    """
-    source_path = Path(knowledge_dir) / folder / file_name
-    if not source_path.exists():
-        return {"error": f"File not found: {source_path}"}
-
-    try:
-        text = source_path.read_text(encoding="utf-8")
-        lines = text.split("\n")
-        total_lines = len(lines)
-        truncated = False
-
-        if max_lines is not None and total_lines > max_lines:
-            text = "\n".join(lines[:max_lines])
-            truncated = True
-
-        return {
-            "file": file_name,
-            "folder": folder,
-            "content": text,
-            "total_lines": total_lines,
-            "truncated": truncated,
-        }
-    except Exception as e:
-        return {"error": f"Failed to read {file_name}: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -735,7 +494,9 @@ if _GRAPH_AVAILABLE:
           ("themes / trends / connections across the corpus") that
           ordinary RAG can't answer well.
         - SKIP when the user only needs single-document or single-fact
-          retrieval — `search_knowledge` is cheaper and faster.
+          retrieval — your native Grep on sources/*.md is cheaper and
+          faster (start from knowledge_search.SKILL.md for the keyword
+          index).
 
         ARGS
         - knowledge_dir: same path you passed as output_dir to `run`.
@@ -799,9 +560,9 @@ if _GRAPH_AVAILABLE:
           multi-hop reasoning, "what are the main themes", "how is X
           connected to Y across documents". Reach for this AFTER the
           knowledge_dir has been graph-built (`build_graph`).
-        - SKIP for single-document fact lookup — `read_source` /
-          `search_knowledge` are simpler and don't risk LLM hallucination
-          atop the graph.
+        - SKIP for single-document fact lookup — your native Read /
+          Grep on sources/*.md is simpler and doesn't risk LLM
+          hallucination atop the graph.
 
         ARGS
         - question: natural-language query.

@@ -238,13 +238,12 @@ python -m docingest.mcp_server --transport sse    # SSE (web clients)
 | `inspect` | Pre-flight check (size, pages, cost estimate) | `docingest.inspect()` |
 | `run` | Process documents → knowledge base | `docingest.ingest()` |
 | `refine` | AI-powered Markdown cleanup | `docingest.refine()` |
-| `search_knowledge` | Keyword search on processed knowledge base | grep on `sources/*.md` |
-| `list_knowledge` | List knowledge base contents (files, stats) | reads `index.json` |
-| `read_source` | Read full content of a source Markdown file | reads `sources/*.md` |
 | `build_graph` | Build / extend knowledge graph (opt-in, requires `[graph]`) | `docingest.graph.build()` |
 | `query_graph` | Query the graph (local / global / hybrid / mix / naive) | `docingest.graph.query()` |
 | `graph_status` | Inspect graph build state + entity / relation / community counts | `docingest.graph.status()` |
 | `enrich_chunks` | Replay graph entities into `chunks_enriched.jsonl` so traditional vector RAG also benefits | `docingest.graph.enrich_chunks()` |
+
+Browsing / searching / reading the produced knowledge base is **NOT exposed as MCP tools by design** — DocIngest is a preprocessing engine, not a retrieval engine. Use your agent's native Grep / Read / Glob on the on-disk artefacts (`sources/*.md`, `index.json`, `chunks.jsonl`). Each knowledge base ships an auto-generated `knowledge_search.SKILL.md` — Read it once at the start of a session and you have the corpus's summary, file index, keyword index, and a language-routed search protocol.
 
 The four graph tools are registered **only when `lightrag-hku` is installed** (`pip install -e ".[graph]"`); without the extras they don't appear in the tool listing and the rest of the server is unaffected.
 
@@ -292,13 +291,16 @@ MCP tools appear in Copilot Agent mode (Ctrl+Alt+I).
 
 **Typical Agent workflow:**
 ```
-1. inspect(["./new_docs/"])                      → size / pages / cost estimate
-2. run(["./new_docs/"])                          → incremental processing
-3. list_knowledge("./knowledge")                 → browse contents
-4. search_knowledge("契約", "./knowledge")        → find by keyword
-5. read_source("contract.md")                    → read full file
-6. refine(["./knowledge/sources/contract.md"])   → optional AI cleanup
+1. inspect(["./new_docs/"])                      → size / pages / cost estimate (MCP tool)
+2. run(["./new_docs/"])                          → incremental processing      (MCP tool)
+3. Read  ./knowledge/knowledge_search.SKILL.md   → summary + search protocol   (native Read)
+4. Read  ./knowledge/index.json                  → file inventory              (native Read)
+5. Grep  "契約" ./knowledge/sources/             → find by keyword             (native Grep)
+6. Read  ./knowledge/sources/contract.md         → read full file              (native Read)
+7. refine(["./knowledge/sources/contract.md"])   → optional AI cleanup         (MCP tool)
 ```
+
+Steps 3-6 use the agent's own Grep / Read tools — DocIngest deliberately does not wrap them, so each agent (Claude Code / Cursor / Codex / Copilot / ...) gets to use the file-exploration tooling it already has, with whatever flags / context / output formatting it does best.
 
 **Config overrides from Agent** — override any config path per call without touching files. Two equivalent forms, mix freely:
 
