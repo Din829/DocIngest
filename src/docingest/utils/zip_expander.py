@@ -87,14 +87,17 @@ def is_zip_file(path: Path) -> bool:
         return False
 
 
-# Extensions that are structurally zips but should NOT be expanded here.
-# DocIngest's Docling parser handles these directly and has format-specific
-# enrichment (OMML preprocess, chart extraction, xlsx denoising). Expanding
-# them would break that path.
+# Extensions that should NOT be expanded here even if is_zipfile() reports true.
+# Most are structurally OOXML zips with their own parser path; .xls is OLE not
+# zip, but some legacy Excel files embed a full OOXML package inside the OLE
+# container — is_zipfile() then matches the embedded EOCD and misclassifies
+# the whole .xls as a zip. The xls → xlsx auto-convert in pipeline.py handles
+# .xls properly upstream, so skipping it here closes off the misroute.
 _ZIPLIKE_NOT_EXPANDABLE = {
     ".docx", ".docm", ".dotx", ".dotm",
     ".pptx", ".pptm", ".ppsx", ".ppsm",
     ".xlsx", ".xlsm", ".xltx", ".xltm",
+    ".xls",   # legacy BIFF; see comment above
     ".odt", ".ods", ".odp",
     ".epub",  # zip-based but handled by its own parser (if enabled)
     ".jar",   # java archives

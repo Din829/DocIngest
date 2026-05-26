@@ -73,6 +73,7 @@ run_pipeline (src/docingest/pipeline.py)
 
 | Phase | 做什么 | 实际入口 |
 |---|---|---|
+| **0.5 Legacy format convert** | `.xls` → `.xlsx`（LibreOffice），失败降级；产物落 `.cache/_xls_convert/<sha256>.xlsx`，后续 Phase 全部对 .xlsx 操作 | `_maybe_convert_xls()` |
 | **1.0 pre_parse hook** | 改写原文件内容（如 DOCX OMML → LaTeX） | `run_pre_parse_hooks()` |
 | **1 Parse** | Docling / Media / Text 解析为 markdown + pages | `parser.parse()` |
 | **1.1 Garbled fallback** | 检测 `glyph<` 乱码 → pymupdf 重抽文本 | `_detect_garbled` + `_pymupdf_fallback` |
@@ -189,6 +190,7 @@ DocIngest/
 | 想看什么 | 去哪儿 |
 |---|---|
 | 整体流程骨架 | `pipeline.py` `run_pipeline` + `process_single_file` |
+| .xls → .xlsx 自动转换 (Phase 0.5) | `pipeline.py::_maybe_convert_xls` |
 | hook 注册机制 | `hooks/__init__.py` |
 | 现有 hook 参考 | `hooks/docx_omml.py` (pre_parse) / `hooks/pptx_chart.py` (post_parse) / `hooks/file_metadata.py` (pre_write) |
 | Parser 接口 | `parsers/base.py` |

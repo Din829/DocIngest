@@ -570,6 +570,10 @@ input files / dirs / URLs / ZIPs
 discover_files  (ZIP expansion, yt-dlp for URLs)
       │
       ▼
+Phase 0.5: legacy .xls → .xlsx via LibreOffice
+            (opt-out: parsing.xls.auto_convert_to_xlsx)
+      │
+      ▼
 partition by incremental cache  (skip unchanged files)
       │
       ▼
@@ -613,6 +617,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rati
 - **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists) and per-type `on_overflow` strategy — oversized Markdown tables are split at data-row boundaries with the header repeated in every sub-chunk (2026 industry standard, handles Docling's merged-cell expansion). Single-pass heading merge (prelude + orphan-heading + small-section policies) produces zero-fragment chunks with the deepest-available title_path. Adjacent byte-identical chunks auto-deduplicated. All behaviour is config-driven — every knob in `chunking.heading.*` and `chunking.protection.*`.
 - **Excel via openpyxl (default)** — xlsx is rendered by `openpyxl` instead of Docling: every sheet's body lives under its own `## SheetName` heading (so chunk `title_path` always points at the right sheet), merged cells stay anchor-only (no N×N value duplication), entirely-empty columns are pruned out of wide layouts. Embedded pictures pasted into cells (PNG/JPEG/GIF/BMP/TIFF/WebP **and** EMF/WMF — read directly from the xlsx OOXML structure, bypassing openpyxl's silent EMF drop) are anchored to their actual row with a `<!-- image: <filename> -->` marker so Vision triage can pick them up and downstream RAG / Agentic Search can locate them. Falls back to Docling automatically if openpyxl is unavailable or the workbook can't open. Disable via `parsing.xlsx.use_openpyxl_renderer: false`.
 - **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction.
+- **Legacy `.xls` support** — `.xls` (BIFF) is auto-converted to `.xlsx` via LibreOffice as Phase 0.5, then routed through the full xlsx path (openpyxl renderer + Vision + chunking). The original `.xls` filename / mimetype / mtime are preserved in `metadata.lineage.original_input`, and a `format_convert` entry is recorded in `metadata.lineage.transformations`. Conversion result is cached at `.cache/_xls_convert/<sha256>.xlsx` so the same file converts exactly once per output dir. LibreOffice missing → warning + degrades to TextParser fallback (the pipeline never raises). Disable via `parsing.xls.auto_convert_to_xlsx: false`.
 - **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
 - **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Eight-layer defence for damaged pages: `glyph<` / `&lt;` CID markers, U+FFFD ratio, complex-table density, CJK mixed-script anomaly, **language-script consistency** (new) — catches CMap failures that produce CLEAN but WRONG Unicode (e.g. Bengali/Thai/Tibetan chars on a Japanese-declared document; the other checks miss this because the output is legal Unicode). Whitelist per language (ja/zh/en/ko by default), add a language = edit `parsing.vision.triage.language_script_check.expected_scripts` — no code change. Default ON (`parsing.vision.triage.enabled`).

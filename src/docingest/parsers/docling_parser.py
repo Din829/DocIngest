@@ -160,8 +160,11 @@ class DoclingParser(BaseParser):
         # every sheet's body is guaranteed to live under its own heading.
         # All other formats keep going through Docling unchanged.
         # Config knob (default ON): parsing.xlsx.use_openpyxl_renderer.
+        # .xls (legacy BIFF) is handled upstream by pipeline.py's Phase 0.5
+        # auto-convert to .xlsx, so by the time we get here the suffix is
+        # always .xlsx — no need to test for ".xls" again.
         if (
-            file_path.suffix.lower() in (".xlsx", ".xls")
+            file_path.suffix.lower() == ".xlsx"
             and get_nested(self.config, "parsing.xlsx.use_openpyxl_renderer", True)
         ):
             xlsx_result = self._parse_xlsx_via_openpyxl(file_path, override_stream)
@@ -333,11 +336,27 @@ class DoclingParser(BaseParser):
 
         Works for any format:
           - Excel: "sheet: Day5" → "Day5"
-          - PPT: "slide-0" → "Slide 1"
+          - PPT: "slide-0" → "Slide 1: <real title>"  (resolved from first text child)
           - PDF: may have chapter names
           - Others: whatever Docling provides
 
-        Returns list of names aligned with pagebreak sections.
+        Internal Docling group names (`slide-0`, `list`, `rich_cell_group_1_0_0`, …)
+        carry no semantic value to a downstream RAG / Agent: they would render as
+        `## slide-0` headings that bury the real title (which usually appears as a
+        bold `#` line inside the section). For groups whose name is a Docling
+        internal placeholder, we try to resolve a real title from the first
+        meaningful text child; if none is available, we emit an empty name so the
+        caller (`_inject_section_names`) drops the heading entirely instead of
+        polluting the output with `## list`.
+
+        Detection of "internal placeholder" is purely structural (lowercase
+        ASCII + digits + `-_` only) so it works regardless of language and
+        does NOT block any real business heading like `Day5`, `Q1 2026`, or
+        Japanese / Chinese titles.
+
+        Returns list of names aligned with pagebreak sections. Empty strings
+        in the list signal "no usable name — caller should skip injecting a
+        heading here".
         """
         try:
             d = doc.export_to_dict()
@@ -349,16 +368,101 @@ class DoclingParser(BaseParser):
 
         for g in groups:
             raw_name = g.get("name", "")
-            # Strip common prefixes (Docling convention)
+            # Sheet names: keep the existing strip.
             if raw_name.startswith("sheet: "):
                 names.append(raw_name[7:])
-            elif raw_name.startswith("slide-"):
-                # "slide-0" → keep as-is or use children's first text
-                names.append(raw_name)
-            else:
-                names.append(raw_name)
+                continue
+
+            # Docling internal placeholder name → try to recover a real title
+            # from the group's children. Returns "" if nothing usable found,
+            # which tells the caller to skip this section's heading.
+            if DoclingParser._looks_like_internal_group_name(raw_name):
+                real_title = DoclingParser._first_text_from_children(g, d)
+                names.append(real_title)  # may be ""
+                continue
+
+            # Real business name (CJK / spaces / mixed case) — keep as-is.
+            names.append(raw_name)
 
         return names
+
+    @staticmethod
+    def _looks_like_internal_group_name(name: str) -> bool:
+        """
+        Heuristic: does this group name look like a Docling-generated
+        placeholder rather than a real business label?
+
+        Docling's auto-generated names follow conventions like `slide-0`,
+        `list`, `rich_cell_group_1_0_0`, `inline`, `key_value_region`, etc.
+        They are ALL lowercase ASCII alphanumerics with `-` / `_` separators.
+        A real business label (any sheet/section name a human typed) almost
+        always has at least one of: a CJK character, a space, an uppercase
+        letter, or punctuation outside `-_`.
+
+        Returns True when we are confident the name is internal junk.
+        Returns False (= keep as-is) on any ambiguity — never destroys a
+        real name.
+        """
+        if not name:
+            return False  # empty name → caller already handles
+        # Real names usually contain a space, CJK, or mixed case → bail out.
+        if any(ch.isspace() or ord(ch) > 127 or ch.isupper() for ch in name):
+            return False
+        # All-lowercase ASCII alphanumeric + - _ → looks generated.
+        return all(ch.isalnum() or ch in "-_" for ch in name)
+
+    @staticmethod
+    def _first_text_from_children(group: dict, doc_dict: dict, _depth: int = 0) -> str:
+        """
+        Walk a Docling group's children and return the first meaningful text
+        we find, recursing into nested groups when needed.
+
+        Each child is a `{'$ref': '#/texts/N'}` or `{'$ref': '#/groups/M'}`
+        reference. We resolve `texts` directly and recurse one level into
+        sub-groups (depth-capped to keep this O(N) and crash-proof on
+        circular references — Docling shouldn't produce cycles, but
+        defensive depth limit costs nothing).
+
+        Returns the stripped text (truncated to a reasonable heading length)
+        or "" when no usable text can be found.
+        """
+        if _depth > 3:
+            return ""
+        for child in group.get("children", []):
+            if not isinstance(child, dict):
+                continue
+            ref = child.get("$ref") or child.get("cref", "")
+            if not isinstance(ref, str) or "/" not in ref:
+                continue
+            # `#/texts/0` → ('texts', 0)
+            parts = ref.lstrip("#/").split("/")
+            if len(parts) != 2:
+                continue
+            collection, raw_idx = parts
+            try:
+                idx = int(raw_idx)
+            except ValueError:
+                continue
+
+            if collection == "texts":
+                text_node = (doc_dict.get("texts") or [])
+                if 0 <= idx < len(text_node):
+                    candidate = (text_node[idx].get("text") or "").strip()
+                    if candidate:
+                        # Heading-length cap: titles rarely exceed ~120 chars;
+                        # anything longer is almost certainly body text that
+                        # happens to be the first child. Better to truncate
+                        # than to dump a paragraph into a `## …` heading.
+                        return candidate[:120]
+            elif collection == "groups":
+                sub_groups = doc_dict.get("groups") or []
+                if 0 <= idx < len(sub_groups):
+                    nested = DoclingParser._first_text_from_children(
+                        sub_groups[idx], doc_dict, _depth=_depth + 1
+                    )
+                    if nested:
+                        return nested
+        return ""
 
     @staticmethod
     def _inject_section_names(doc, markdown: str) -> str:
@@ -371,14 +475,25 @@ class DoclingParser(BaseParser):
         Only injects if:
           1. Document has groups with meaningful names
           2. Markdown has pagebreaks matching group count
+
+        Skip-injection guard: when the group name we'd inject is byte-identical
+        (after strip) to a heading Docling already wrote at the top of the
+        section, we omit our injection to avoid `## Title` immediately followed
+        by `# Title`. We compare to the first stripped non-blank line of the
+        section and require an EXACT match (modulo leading `#` markers and
+        surrounding whitespace) — no fuzzy match, so a real distinct heading
+        like `## Agenda Items` next to `# Agenda` is preserved.
         """
         names = DoclingParser._extract_group_names(doc)
         if not names:
             return markdown
 
         if PAGEBREAK_MARKER not in markdown:
-            # No pagebreaks — inject heading at top if there's a name
+            # No pagebreaks — inject heading at top if there's a name AND
+            # it's not already the first heading line of the markdown.
             if names and names[0]:
+                if DoclingParser._section_already_has_heading(markdown, names[0]):
+                    return markdown
                 return f"## {names[0]}\n\n{markdown}"
             return markdown
 
@@ -391,12 +506,46 @@ class DoclingParser(BaseParser):
             if not name:
                 continue
             section = sections[i].strip()
+            # Skip injection when Docling already emitted this exact heading
+            # at the section's top — happens when the group's first text
+            # child IS the slide / section title (we resolved a real title
+            # from children, but Docling also renders that same text as a
+            # body `#`/`##` line right below the pagebreak).
+            if section and DoclingParser._section_already_has_heading(section, name):
+                continue
             if section:
                 sections[i] = f"\n## {name}\n\n{section}\n"
             else:
                 sections[i] = f"\n## {name}\n"
 
         return PAGEBREAK_MARKER.join(sections)
+
+    @staticmethod
+    def _section_already_has_heading(section: str, name: str) -> bool:
+        """
+        True iff the first non-blank line of `section` is a markdown heading
+        whose visible text exactly equals `name` (both stripped).
+
+        Strict exact-match by design — `## X` next to a real different
+        heading `# Y` must still get our injection. Only kills the obvious
+        `## Title` / `# Title` duplication case where the same string
+        appears verbatim twice in a row.
+        """
+        target = name.strip()
+        if not target:
+            return False
+        for raw in section.split("\n"):
+            line = raw.strip()
+            if not line:
+                continue
+            # Only the FIRST non-blank line matters — once we hit non-heading
+            # content, the section clearly doesn't start with this heading.
+            if not line.startswith("#"):
+                return False
+            # Strip leading `#`s and one optional space.
+            stripped = line.lstrip("#").lstrip()
+            return stripped == target
+        return False
 
     def _extract_metadata(self, doc, file_path: Path) -> dict[str, Any]:
         """Extract document metadata from Docling result."""
@@ -510,7 +659,8 @@ class DoclingParser(BaseParser):
 
         # Extract embedded images from xlsx zip (xl/media/)
         xlsx_denoise = get_nested(self.config, "parsing.xlsx.denoising", {})
-        if xlsx_denoise.get("extract_images", True) and file_path.suffix.lower() in (".xlsx", ".xls"):
+        # .xls is converted to .xlsx upstream (pipeline.py Phase 0.5).
+        if xlsx_denoise.get("extract_images", True) and file_path.suffix.lower() == ".xlsx":
             embedded = self._extract_xlsx_images(file_path, assets_dir)
             if embedded:
                 parse_meta = getattr(self, "_last_parse_metadata", {})

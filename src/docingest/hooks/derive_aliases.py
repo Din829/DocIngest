@@ -51,6 +51,11 @@ _DEFAULT_GARBAGE: list[str] = [
     r"^microsoft word - ",
     r"^slide\d+$",
     r"^\s*$",
+    # 64-char hex — sha256 / md5 etc. used as internal cache filenames
+    # (e.g. pipeline.py Phase 0.5 .xls→.xlsx cache stems). Real user file
+    # names never look like this; suppressing it stops the converted-file
+    # stem from leaking into aliases.
+    r"^[0-9a-f]{64}$",
 ]
 
 _DEFAULT_TEMP: list[str] = [

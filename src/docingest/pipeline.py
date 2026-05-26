@@ -601,6 +601,96 @@ def _downscale_image(image_path: str, max_pixels: int) -> None:
         _pipeline_logger.debug(f"Image downscale failed: {e}")
 
 
+def _maybe_convert_xls(
+    file_path: Path,
+    config: dict[str, Any],
+    output_dir: Path,
+) -> tuple[Path, dict[str, Any] | None]:
+    """
+    Legacy .xls (BIFF) → .xlsx via LibreOffice, so the rest of the pipeline
+    can use the full xlsx path (openpyxl renderer + Vision + chunking).
+
+    Returns (effective_path, transformation_record):
+      - non-.xls or disabled → (file_path, None) untouched
+      - LibreOffice missing  → (file_path, None) + warning, caller falls
+                                through to TextParser
+      - conversion failure   → (file_path, None) + warning, same fallback
+      - success              → (cached_xlsx_path, {"step": "format_convert", ...})
+
+    Cache: {output_dir}/.cache/_xls_convert/<sha256_of_original>.xlsx
+    Keyed on the original .xls bytes so the same file is converted exactly
+    once per output directory across runs.
+    """
+    if file_path.suffix.lower() != ".xls":
+        return file_path, None
+    if not get_nested(config, "parsing.xls.auto_convert_to_xlsx", True):
+        return file_path, None
+
+    import hashlib
+    import shutil
+    import subprocess
+    import tempfile
+    from .utils.binary_finder import find_binary
+
+    soffice = find_binary("soffice", config)
+    if not soffice:
+        _pipeline_logger.warning(
+            f".xls input {file_path.name}: LibreOffice not found, cannot "
+            f"convert to .xlsx — will fall through to TextParser "
+            f"(likely gibberish). Install LibreOffice or set "
+            f"parsing.xls.auto_convert_to_xlsx: false to silence this."
+        )
+        return file_path, None
+
+    try:
+        # Stream-hash the source to avoid loading huge .xls into memory
+        h = hashlib.sha256()
+        with file_path.open("rb") as f:
+            for block in iter(lambda: f.read(65536), b""):
+                h.update(block)
+        digest = h.hexdigest()
+    except OSError as e:
+        _pipeline_logger.warning(
+            f".xls input {file_path.name}: cannot read for hashing ({e}) — "
+            f"skipping conversion"
+        )
+        return file_path, None
+
+    cache_dir = output_dir / ".cache" / "_xls_convert"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached_xlsx = cache_dir / f"{digest}.xlsx"
+
+    if not cached_xlsx.exists():
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                proc = subprocess.run(
+                    [soffice, "--headless", "--convert-to", "xlsx",
+                     "--outdir", tmpdir, str(file_path)],
+                    capture_output=True, timeout=180,
+                )
+                produced = list(Path(tmpdir).glob("*.xlsx"))
+                if proc.returncode != 0 or not produced:
+                    _pipeline_logger.warning(
+                        f".xls → .xlsx conversion failed for "
+                        f"{file_path.name} (exit={proc.returncode}): "
+                        f"{proc.stderr.decode('utf-8', errors='replace')[:200]}"
+                    )
+                    return file_path, None
+                shutil.move(str(produced[0]), cached_xlsx)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            _pipeline_logger.warning(
+                f".xls → .xlsx conversion error for {file_path.name}: {e}"
+            )
+            return file_path, None
+
+    return cached_xlsx, {
+        "step": "format_convert",
+        "from": "xls",
+        "to": "xlsx",
+        "tool": "libreoffice",
+    }
+
+
 def _generate_page_images_via_libreoffice(
     file_path: Path,
     parse_result,
@@ -685,8 +775,24 @@ def _generate_page_images_via_libreoffice(
                         text="",
                         image_path=str(out),
                     ))
-            except ImportError:
-                # pdf2image unavailable → try Docling PDF re-parse
+            except Exception as e:
+                # pdf2image unavailable (ImportError) OR pdf2image present but
+                # its runtime deps missing — most commonly `PDFInfoNotInstalledError`
+                # when the user has `pdf2image` (a pure-Python wrapper) but no
+                # `poppler` system binary. Earlier this branch caught only
+                # ImportError, so a poppler-less machine silently produced zero
+                # page images and Vision was never invoked. Widening to Exception
+                # routes ALL pdf2image failure modes to the Docling fallback
+                # below — Docling renders PDF pages itself (no poppler needed),
+                # so as long as `docling` is installed (it's a core dep) Vision
+                # still gets its page images on machines without poppler.
+                _pipeline_logger.warning(
+                    f"pdf2image failed ({type(e).__name__}: {e}) — "
+                    f"falling back to Docling PDF re-parse for page images. "
+                    f"To use the faster pdf2image path, install poppler "
+                    f"(Windows: `winget install oschwartz10612.Poppler`, "
+                    f"macOS: `brew install poppler`, Linux: `apt install poppler-utils`)."
+                )
                 try:
                     from docling.document_converter import DocumentConverter, PdfFormatOption
                     from docling.datamodel.pipeline_options import PdfPipelineOptions
@@ -715,8 +821,13 @@ def _generate_page_images_via_libreoffice(
                             text="",
                             image_path=str(out),
                         ))
-                except Exception:
-                    pass
+                except Exception as e2:
+                    _pipeline_logger.warning(
+                        f"Docling PDF re-parse fallback also failed "
+                        f"({type(e2).__name__}: {e2}) — Vision will receive "
+                        f"no page images for {file_path.name}, so Vision "
+                        f"enrichment is effectively disabled for this file."
+                    )
 
             # Apply results
             if pages_data:
@@ -739,7 +850,14 @@ def _generate_page_images_via_libreoffice(
                 warnings.append(warn_msg)
 
     except Exception as e:
-        _pipeline_logger.debug(f"{format_label} page image generation failed: {e}")
+        # Surface as WARNING (was DEBUG) — page-image generation failure
+        # silently disables Vision for the file, which is a quality regression
+        # users need to see in the default log, not just when -v is on.
+        _pipeline_logger.warning(
+            f"{format_label} page image generation failed "
+            f"({type(e).__name__}: {e}) — Vision enrichment will be skipped "
+            f"for {file_path.name}."
+        )
 
 
 def _ensure_excel_page_images(
@@ -1511,6 +1629,17 @@ def process_single_file(
     """
     result = FileResult(original_file=str(file_path))
 
+    # --- Phase 0.5: Legacy format convert (.xls → .xlsx via LibreOffice) ---
+    # When this fires, `file_path` is rebound to the cached .xlsx so every
+    # downstream Phase (hooks / parser / page-image / metadata) flows
+    # through the xlsx path unchanged. The ORIGINAL .xls path is held in
+    # `result.original_file` (set above) and reused for lineage below, so
+    # `metadata.lineage.original_input` still points at the user's input.
+    xls_convert_record: dict[str, Any] | None = None
+    file_path, xls_convert_record = _maybe_convert_xls(
+        file_path, config, output_dir,
+    )
+
     # --- Phase 1.0: Pre-parse hooks (e.g. DOCX OMML → LaTeX preprocessing) ---
     # Hooks can return a BytesIO stream that replaces the file content before
     # Docling sees it. None means "use original file". Hooks never raise —
@@ -1562,9 +1691,13 @@ def process_single_file(
 
     result.format = parse_result.metadata.get("format", "unknown")
 
-    # Lineage record — pre_parse hook (if one was triggered) comes FIRST
-    # in the provenance trail because it ran BEFORE the parser saw the
-    # file. Parser transformation follows.
+    # Lineage record — provenance order is the order things ran:
+    #   format_convert (Phase 0.5) → pre_parse hook (Phase 1.0) → parser.
+    # xls_convert_record is prepended so the lineage trail starts at the
+    # user's original .xls input, then shows the conversion, then the
+    # rest of the pipeline operating on the converted .xlsx.
+    if xls_convert_record is not None:
+        parse_result.transformations.insert(0, xls_convert_record)
     if pre_parse_hook_name:
         parse_result.transformations.append({
             "step": "hook",
@@ -1579,6 +1712,14 @@ def process_single_file(
         "name": parser.__class__.__name__,
         "format": result.format,
     })
+
+    # Phase 0.5 aftermath: when a .xls was auto-converted upstream, the parser
+    # saw the cached file (stem = sha256). Restore the user's original stem
+    # so derived metadata (frontmatter title, derive_aliases_hook output)
+    # reflects the input file. Done BEFORE Phase 1.6 pre_write hooks so
+    # derive_aliases_hook reads the corrected title and produces clean aliases.
+    if xls_convert_record is not None:
+        parse_result.metadata["title"] = Path(result.original_file).stem
 
     # --- Phase 1.1: Garbled text detection + pymupdf fallback ---
     if parse_result.markdown and _detect_garbled(parse_result.markdown):
@@ -1653,9 +1794,11 @@ def process_single_file(
     parse_result.markdown = _dedup_vision(parse_result.markdown, config)
 
     # --- Phase 2: Write Markdown + assets ---
+    # original_file determines the sources/*.md filename — must be the
+    # user's input, not the Phase-0.5-converted xlsx in .cache/.
     output_path = write_markdown(
         parse_result=parse_result,
-        original_file=file_path,
+        original_file=Path(result.original_file),
         output_dir=output_dir,
         config=config,
         existing_names=existing_names,
@@ -1671,7 +1814,7 @@ def process_single_file(
     if md_size_mb > max_size:
         import logging
         logging.getLogger(__name__).warning(
-            f"Large document: {file_path.name} → {md_size_mb:.1f}MB Markdown "
+            f"Large document: {Path(result.original_file).name} → {md_size_mb:.1f}MB Markdown "
             f"(~{result.tokens_estimated:,} tokens). Chunking may be slow."
         )
 
@@ -1756,9 +1899,13 @@ def process_single_file(
             k: v for k, v in parse_result.metadata.items()
             if k not in _CHUNK_METADATA_BLACKLIST
         }
+        # original_file and last_modified MUST reflect the user's input,
+        # not the Phase-0.5 converted .xlsx in .cache/ (which has a stem
+        # like "<sha256>" and an mtime equal to the conversion moment).
+        original_path = Path(result.original_file)
         doc_metadata = {
             "source": result.output_path,
-            "original_file": str(file_path.name),
+            "original_file": str(original_path.name),
             "format": result.format,
             **parse_meta_for_chunks,
         }
@@ -1769,7 +1916,7 @@ def process_single_file(
 
         # Enrich metadata: file modification time
         try:
-            mtime = file_path.stat().st_mtime
+            mtime = original_path.stat().st_mtime
             import datetime
             doc_metadata["last_modified"] = datetime.datetime.fromtimestamp(
                 mtime
@@ -1814,10 +1961,14 @@ def process_single_file(
         # title_path / chunk_index). Copy on write so post-processing
         # anywhere else can't mutate one chunk's lineage into another's.
         if chunks:
+            # original_file MUST be the user's input path (not the working
+            # path), so that for Phase-0.5-converted .xls files the lineage
+            # records "画面遷移図.xls" rather than the internal cached
+            # ".cache/_xls_convert/<sha>.xlsx".
             lineage = _build_chunk_lineage(
                 parse_result=parse_result,
                 chunker=chunker,
-                original_file=file_path,
+                original_file=Path(result.original_file),
                 source_md_rel=result.output_path,
             )
             for chunk in chunks:

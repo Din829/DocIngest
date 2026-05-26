@@ -334,6 +334,15 @@ parsing:
     download_dir: "_media"                 # relative to output.dir/.cache/
     yt_dlp_extra_args: []                  # additional yt-dlp flags (advanced)
 
+  # Legacy .xls (BIFF) — converted to .xlsx via LibreOffice before the
+  # rest of the pipeline sees the file. Once converted it goes through
+  # the full xlsx path (openpyxl renderer + Vision + chunking) with the
+  # original .xls filename / mimetype / binary_hash preserved in
+  # metadata.lineage.original_input. LibreOffice missing → degrades to
+  # TextParser fallback (gibberish, but pipeline never raises).
+  xls:
+    auto_convert_to_xlsx: true
+
   # Excel-specific
   xlsx:
     row_to_text: true         # convert rows to natural language sentences
@@ -472,6 +481,11 @@ output:
         - "^microsoft word - "
         - "^slide\\d+$"
         - "^\\s*$"
+        # 64-char hex — sha256 / md5 used as internal cache filenames
+        # (e.g. pipeline.py Phase 0.5 .xls→.xlsx cache stem). Real file
+        # names never look like this; suppresses cache-stem leakage into
+        # aliases when downstream hooks read file_path.stem.
+        - "^[0-9a-f]{64}$"
       # Temp filename markers — match → candidate is DEMOTED (kept only
       # when it would otherwise leave the alias list empty / undersized).
       # These are version markers and copy artefacts that real documents

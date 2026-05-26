@@ -160,6 +160,9 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.xlsx.use_openpyxl_renderer",  # switches xlsx parser engine —
                                            # flipping it changes the markdown
                                            # produced for the same file
+    "parsing.xls.auto_convert_to_xlsx",    # flipping decides whether a .xls
+                                           # goes through the full xlsx path
+                                           # or falls through to TextParser
     "output.markdown.include_metadata_header",
     "output.dedup.enabled",                # Vision/Docling dedup toggle —
                                            # disabling it keeps both versions in sources/*.md
