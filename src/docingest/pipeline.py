@@ -2440,6 +2440,13 @@ def run_pipeline(
 
     pipeline_result.elapsed_ms = int((time.monotonic() - t_start) * 1000)
 
+    # Collect LLM API token usage BEFORE the run-log write so the header's
+    # LLM-cost tail (e.g. "LLM: 14 calls / 48,230 tok") reflects this run.
+    # Earlier ordering wrote the log first and the tail was always empty.
+    from .models.token_tracker import token_tracker
+    pipeline_result.token_usage = token_tracker.summary()
+    token_tracker.reset()
+
     # Run log: append-only timeline across runs. Independent of errors.json
     # and quality_report.json (single-run snapshots overwritten each run) —
     # log.md accumulates one section per run so users can see what changed
@@ -2457,10 +2464,5 @@ def run_pipeline(
             )
         except Exception as e:
             _pipeline_logger.warning(f"Run log append failed: {e}")
-
-    # Collect LLM API token usage
-    from .models.token_tracker import token_tracker
-    pipeline_result.token_usage = token_tracker.summary()
-    token_tracker.reset()
 
     return pipeline_result

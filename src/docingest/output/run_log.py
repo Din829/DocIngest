@@ -105,6 +105,12 @@ def _build_section(
     """Render the Markdown block for one run (trailing newline included)."""
     timestamp = datetime.now().isoformat(timespec="seconds").replace("T", " ")
 
+    # Special path 1: safety abort — the run was refused before any file was
+    # processed. Surface this loudly so a "log says nothing" reading is wrong:
+    # the run DID happen, it was DENIED.
+    if pipeline_result.safety.get("aborted"):
+        return _build_aborted_section(pipeline_result, timestamp)
+
     # Group by status. Unknown/empty status falls under "cached" (safest:
     # legacy callers that didn't tag a status probably reused outputs).
     by_status: dict[str, list["FileResult"]] = {
@@ -115,11 +121,33 @@ def _build_section(
         by_status[bucket].append(fr)
 
     total = pipeline_result.total_files
+    processed = sum(len(v) for v in by_status.values())  # files actually visited
     summary = _summary_phrase(by_status, force_rebuild)
 
-    header_suffix = " (forced)" if force_rebuild else ""
+    # Special path 2: interrupted — Ctrl+C between files. The header SHOUTS
+    # because the resulting knowledge base is partial; downstream RAG / agents
+    # need to know "this isn't the full ingestion" without reading the body.
+    if pipeline_result.interrupted:
+        header_prefix = "INTERRUPTED"
+        # When interrupted, total_files = planned, processed = how far we got.
+        # The 'after N/M' phrasing makes the partial state obvious in greps.
+        count_phrase = f"after {processed}/{total} files"
+    else:
+        header_prefix = "run" + (" (forced)" if force_rebuild else "")
+        count_phrase = f"{total} files"
+
+    # Header tail: elapsed + LLM usage are otherwise only visible in the
+    # terminal output of THIS run — once you close the terminal, gone.
+    # Persisting them in log.md makes "what did that run cost?" greppable
+    # weeks later.
+    tail_bits = [_format_elapsed(pipeline_result.elapsed_ms)]
+    llm_phrase = _format_llm_summary(pipeline_result.token_usage)
+    if llm_phrase:
+        tail_bits.append(llm_phrase)
+    tail = " | ".join(tail_bits)
+
     lines = [
-        f"## [{timestamp}] run{header_suffix} | {total} files ({summary})",
+        f"## [{timestamp}] {header_prefix} | {count_phrase} ({summary}) | {tail}",
         "",
     ]
 
@@ -135,6 +163,54 @@ def _build_section(
         lines.extend(body_rows)
         lines.append("")
     # else: empty body (no-change run) — header alone is the record.
+
+    return "\n".join(lines) + "\n"
+
+
+def _build_aborted_section(
+    pipeline_result: "PipelineResult", timestamp: str,
+) -> str:
+    """
+    Render the section for a safety-aborted run.
+
+    These runs processed ZERO files (Phase 0 refused), so the regular
+    `added / cached / failed` framing doesn't apply. We surface the
+    violation summary so the user can see, weeks later, exactly which
+    files / metrics tripped the budget gate without re-running inspect.
+    """
+    safety = pipeline_result.safety
+    summary = safety.get("summary") or {}
+    violations = safety.get("violations") or []
+    mode = safety.get("mode", "strict")
+
+    # Header summary numbers come from the Phase 0 summary, NOT from
+    # pipeline_result.total_files (which can be 0 here).
+    total_files = summary.get("total_files", len(violations))
+    total_pages = summary.get("total_pages")
+    cost = summary.get("total_est_cost_usd")
+    tail_bits: list[str] = []
+    if total_pages is not None:
+        tail_bits.append(f"{total_pages} pages")
+    if cost is not None:
+        tail_bits.append(f"~${cost:.2f}")
+    tail = " | " + " | ".join(tail_bits) if tail_bits else ""
+
+    lines = [
+        f"## [{timestamp}] ABORTED BY SAFETY ({mode}) | "
+        f"{total_files} files refused | {len(violations)} violations{tail}",
+        "",
+    ]
+
+    # Body: one bullet per violating file with the specific reasons.
+    # Keep each reason terse (Phase 0 already formats them concisely).
+    for v in violations[:50]:  # cap for log hygiene on huge batches
+        name = Path(v.get("file", "?")).name
+        reasons = v.get("reasons") or []
+        reason_text = "; ".join(str(r) for r in reasons) if reasons else "exceeded budget"
+        lines.append(f"- refused: {name} — {reason_text}")
+    if len(violations) > 50:
+        lines.append(f"- ... and {len(violations) - 50} more violations")
+    lines.append("")
 
     return "\n".join(lines) + "\n"
 
@@ -181,7 +257,12 @@ def _format_file_line(status: str, fr: "FileResult") -> str:
         # Trim error to one line, cap at 160 chars so a rogue stack trace
         # doesn't blow up the log width.
         err_short = (fr.error or "unknown error").split("\n", 1)[0][:160]
-        return f"- failed: {name} — {err_short}"
+        # Tag the error class so downstream readers (humans, agents, log
+        # parsers) can branch without grepping the message — "[timeout]"
+        # means "retry might work", "[parse_error]" means "tune config or
+        # accept loss". Empty error_type stays untagged (legacy callers).
+        tag = f" [{fr.error_type}]" if fr.error_type else ""
+        return f"- failed{tag}: {name} — {err_short}"
 
     chunks_str = (
         f"{fr.chunks_count} chunks"
@@ -193,3 +274,46 @@ def _format_file_line(status: str, fr: "FileResult") -> str:
         return f"- updated: {name} ({fr.cache_reason}) → {chunks_str}"
 
     return f"- {status}: {name} → {chunks_str}"
+
+
+# ---------------------------------------------------------------------------
+# Header tail helpers — elapsed time + LLM token usage
+#
+# These two numbers are otherwise only visible in the terminal of the run
+# that produced them. Persisting compact forms in log.md lets "how long did
+# that run take / how much LLM did it burn?" stay greppable across history.
+# ---------------------------------------------------------------------------
+
+def _format_elapsed(elapsed_ms: int) -> str:
+    """
+    Render elapsed time compactly: sub-minute → '47.5s', minutes → '2m13s'.
+    Returns '0s' for None / 0 (rare, but a no-op run can land here).
+    """
+    if not elapsed_ms:
+        return "0s"
+    total_seconds = elapsed_ms / 1000.0
+    if total_seconds < 60:
+        return f"{total_seconds:.1f}s"
+    minutes = int(total_seconds // 60)
+    seconds = int(total_seconds % 60)
+    return f"{minutes}m{seconds:02d}s"
+
+
+def _format_llm_summary(token_usage: dict) -> str:
+    """
+    Render the LLM-call summary tail, e.g. 'LLM: 1 call / 2607 tok'.
+
+    Returns '' when no LLM was called (the most common case — Vision triage
+    plus knowledge_map disabled). When some calls happened, surface BOTH the
+    call count and total tokens because cost is roughly proportional to both
+    and one number alone can mislead (1 tiny call vs 1 huge call look the
+    same on just 'calls').
+    """
+    if not token_usage:
+        return ""
+    calls = token_usage.get("total_calls", 0)
+    if not calls:
+        return ""
+    total = token_usage.get("total_tokens", 0)
+    call_word = "call" if calls == 1 else "calls"
+    return f"LLM: {calls} {call_word} / {total:,} tok"
