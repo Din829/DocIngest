@@ -163,6 +163,45 @@ result = docingest.ingest(
     audio=docingest.DashScopeProvider(api_key="..."),
 )
 
+# Cloud LLM providers — same shape, only the Provider class changes.
+# (Required fields vary by cloud; unset optional fields fall back to
+# ambient credentials — container IAM role / workload identity / etc.)
+
+# Azure OpenAI: deployment-based routing
+result = docingest.ingest(
+    "./docs/", output="./kb/",
+    vision=docingest.AzureOpenAIProvider(
+        model="my-gpt4-deployment",                # Azure deployment name, NOT a model id
+        api_base="https://my-resource.openai.azure.com/",
+        api_version="2024-08-01-preview",
+        api_key="...",                              # or set AZURE_API_KEY
+    ),
+)
+
+# AWS Bedrock: minimal form relies on ambient creds (IAM role on
+# EC2/ECS/EKS, or AWS_* env vars set externally)
+result = docingest.ingest(
+    "./docs/", output="./kb/",
+    vision=docingest.BedrockProvider(
+        model="anthropic.claude-sonnet-4-20250514-v1:0",
+        # aws_access_key_id / aws_secret_access_key / aws_region_name
+        # are all optional — pass them only when not using ambient auth.
+    ),
+)
+
+# Google Vertex AI: project + location mandatory, credentials optional
+# (falls back to GOOGLE_APPLICATION_CREDENTIALS env / gcloud ADC /
+# GKE workload identity if omitted)
+result = docingest.ingest(
+    "./docs/", output="./kb/",
+    vision=docingest.VertexAIProvider(
+        model="gemini-2.5-pro",
+        vertex_project="my-gcp-project",
+        vertex_location="us-central1",
+        # vertex_credentials="/path/to/sa.json"   # optional
+    ),
+)
+
 # Any config/default.yaml value can be overridden per call (flat dot-path
 # form OR nested dict, both work — mix freely)
 result = docingest.ingest(

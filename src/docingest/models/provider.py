@@ -124,52 +124,123 @@ def _resolve_model_name(provider: str, model: str) -> str:
     Convert (provider, model) to litellm's model string format.
 
     litellm uses prefixed model names for non-OpenAI providers:
-      - google: "gemini/gemini-3-flash"
+      - google: "gemini/gemini-3-flash" (Gemini API direct)
       - anthropic: "anthropic/claude-sonnet-4-20250514"
+      - azure: "azure/<deployment_name>" — `model` is an Azure deployment
+        name, not a raw model id (see AzureOpenAIProvider docstring)
+      - bedrock: "bedrock/<aws_model_id>" — e.g. anthropic.claude-...-v1:0
+      - vertex_ai: "vertex_ai/<model_id>" — distinct from "google" which
+        uses the public Gemini API (Vertex is GCP-hosted, IAM-controlled)
       - openai: "gpt-5.4-mini" (no prefix needed)
+
+    The "vertex" alias previously routed to "gemini/" — that was incorrect
+    semantically (Vertex != public Gemini API) but harmless because no
+    Vertex provider class existed. Now "vertex_ai" is the canonical alias.
+    Old configs using `provider: "vertex"` still route to "gemini/" for
+    backwards compatibility (they couldn't have been calling Vertex anyway).
     """
     provider_lower = provider.lower()
     if provider_lower in ("google", "gemini", "vertex"):
         return f"gemini/{model}" if not model.startswith("gemini/") else model
     if provider_lower in ("anthropic", "claude"):
         return f"anthropic/{model}" if not model.startswith("anthropic/") else model
+    if provider_lower == "azure":
+        return f"azure/{model}" if not model.startswith("azure/") else model
+    if provider_lower == "bedrock":
+        return f"bedrock/{model}" if not model.startswith("bedrock/") else model
+    if provider_lower == "vertex_ai":
+        return f"vertex_ai/{model}" if not model.startswith("vertex_ai/") else model
     # OpenAI and others: use model name directly
     return model
 
 
-# Provider → canonical env var name. Used when a caller passes a plaintext
-# api_key without also specifying api_key_env (the common case when a
-# downstream library injects credentials via the Provider class instead of
-# editing .env). Kept in sync with the providers DocIngest's config supports;
-# unknown providers fall through and require an explicit api_key_env.
+# Provider → canonical env var name for the primary `api_key` field.
+# Used when a caller passes a plaintext api_key without also specifying
+# api_key_env (the common case when a downstream library injects credentials
+# via the Provider class instead of editing .env). Kept in sync with the
+# providers DocIngest's config supports; unknown providers fall through and
+# require an explicit api_key_env.
+#
+# Bedrock's "api_key" is a bearer token (litellm reads it from
+# AWS_BEARER_TOKEN_BEDROCK). Vertex AI has no api_key concept — auth is via
+# service-account JSON, handled below in _PROVIDER_EXTRA_ENV_MAP.
 _PROVIDER_TO_ENV_KEY = {
     "google": "GEMINI_API_KEY",
     "gemini": "GEMINI_API_KEY",
-    "vertex": "GEMINI_API_KEY",
+    "vertex": "GEMINI_API_KEY",        # legacy alias; vertex_ai (below) is the new one
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "claude": "ANTHROPIC_API_KEY",
     "dashscope": "DASHSCOPE_API_KEY",
+    "azure": "AZURE_API_KEY",          # litellm's standard, NOT AZURE_OPENAI_API_KEY
+    "bedrock": "AWS_BEARER_TOKEN_BEDROCK",  # only used if caller picks bearer-token auth
+}
+
+# Cloud-provider extra fields → env vars they need to land in for litellm
+# to find them. Data-driven so adding a new cloud is one entry, not a code
+# branch in _set_api_key. Field names are the keys downstream Provider
+# classes put into model_config (see to_model_config in providers.py);
+# env var names follow litellm's own contract (verified against
+# https://docs.litellm.ai/docs/providers/<provider>).
+_PROVIDER_EXTRA_ENV_MAP: dict[str, dict[str, str]] = {
+    "azure": {
+        "api_base": "AZURE_API_BASE",
+        "api_version": "AZURE_API_VERSION",
+    },
+    "bedrock": {
+        "aws_access_key_id": "AWS_ACCESS_KEY_ID",
+        "aws_secret_access_key": "AWS_SECRET_ACCESS_KEY",
+        "aws_region_name": "AWS_REGION_NAME",
+        "aws_session_token": "AWS_SESSION_TOKEN",
+        "aws_profile_name": "AWS_PROFILE",
+    },
+    "vertex_ai": {
+        "vertex_project": "VERTEXAI_PROJECT",
+        "vertex_location": "VERTEXAI_LOCATION",
+        # vertex_credentials accepts a filepath OR a JSON string; litellm
+        # reads GOOGLE_APPLICATION_CREDENTIALS for the filepath form, which
+        # is what most callers want. A JSON-string credential bypasses this
+        # path and must be passed via litellm function args — out of scope
+        # for the env-mirror approach used here.
+        "vertex_credentials": "GOOGLE_APPLICATION_CREDENTIALS",
+    },
 }
 
 
 def _set_api_key(model_config: dict[str, Any]) -> None:
     """
-    Resolve the API key for this model entry.
+    Mirror the model entry's credential fields to the env vars litellm reads.
 
-    Priority (first match wins):
-      1. Plaintext `api_key` in model_config — written to the appropriate
-         env var so litellm can pick it up. Lets downstream callers inject
-         credentials via the Provider class without touching .env.
-      2. `api_key_env` pointing at an already-set env var — classic path,
-         untouched for backwards compatibility.
+    Two parallel paths:
 
-    litellm reads standard env vars (GEMINI_API_KEY, OPENAI_API_KEY, etc.)
-    so we only need to ensure the right env var holds the right value
-    before litellm.completion() runs.
+    1. **Primary `api_key`** (first match wins):
+       - Plaintext `api_key` in model_config → written to the env var
+         resolved from ``api_key_env`` OR ``_PROVIDER_TO_ENV_KEY[provider]``.
+       - ``api_key_env`` already populated → no-op (classic path).
+
+    2. **Cloud-provider extras** (e.g. Azure endpoint, AWS region, Vertex
+       project): every field in ``_PROVIDER_EXTRA_ENV_MAP[provider]`` that
+       the caller actually set is mirrored to the matching env var. Empty/
+       missing fields are skipped, so a caller relying on ambient AWS / GCP
+       credentials (container IAM role, gcloud ADC, ~/.aws/config) is not
+       overridden.
+
+    litellm reads standard env vars (GEMINI_API_KEY, OPENAI_API_KEY,
+    AZURE_API_KEY, AWS_ACCESS_KEY_ID, VERTEXAI_PROJECT, ...) so we only
+    need to ensure the right env vars hold the right values before
+    litellm.completion() runs.
     """
     explicit = model_config.get("api_key")
     env_key = model_config.get("api_key_env")
+    provider = str(model_config.get("provider", "")).lower()
+
+    # Mirror provider-specific extra fields. Done unconditionally because
+    # callers using ambient cloud credentials still benefit from having
+    # region / project / location set explicitly.
+    for field_name, env_var in _PROVIDER_EXTRA_ENV_MAP.get(provider, {}).items():
+        value = model_config.get(field_name)
+        if value:
+            os.environ[env_var] = value
 
     if explicit:
         # Target env var: prefer api_key_env when present, otherwise infer
@@ -177,7 +248,6 @@ def _set_api_key(model_config: dict[str, Any]) -> None:
         # the subsequent litellm call will surface a clear auth error.
         target = env_key
         if not target:
-            provider = str(model_config.get("provider", "")).lower()
             target = _PROVIDER_TO_ENV_KEY.get(provider)
         if target:
             os.environ[target] = explicit

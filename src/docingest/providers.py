@@ -134,6 +134,156 @@ class AnthropicProvider(VisionProvider):
     api_key: str | None = None
 
 
+@dataclass
+class AzureOpenAIProvider(VisionProvider):
+    """
+    Azure OpenAI Vision provider.
+
+    Azure routes calls through deployments, not raw model names — the `model`
+    field here holds the deployment name (what you see under "Deployments" in
+    the Azure portal). The underlying GPT-4o / GPT-4o-mini / o-series model
+    is whatever that deployment was provisioned with.
+
+    Three Azure-specific fields beyond the base provider are mandatory:
+      * api_base:     https://<resource>.openai.azure.com/ (no trailing path)
+      * api_version:  e.g. "2024-08-01-preview"; consult Azure docs
+      * api_key:      Azure resource key (or set AZURE_API_KEY env)
+
+    Wire format passed to litellm follows litellm's Azure provider contract
+    (see https://docs.litellm.ai/docs/providers/azure):
+      model="azure/<deployment>", api_base=..., api_version=..., api_key=...
+    """
+    provider: str = "azure"
+    model: str = ""                  # Azure deployment name (NOT a model id)
+    api_key: str | None = None
+    api_base: str | None = None      # https://<resource>.openai.azure.com/
+    api_version: str | None = None   # e.g. "2024-08-01-preview"
+
+    def to_model_config(self) -> dict[str, Any]:
+        """
+        Build the `models.vision` shape with Azure-specific fields preserved.
+
+        Downstream `_set_api_key` reads `api_base` / `api_version` from the
+        primary dict and writes them to AZURE_API_BASE / AZURE_API_VERSION
+        env vars; `_resolve_model_name` reads `provider == "azure"` and
+        produces the `azure/<deployment>` litellm model string.
+        """
+        entry = _build_entry(self.provider, self.model, self.api_key)
+        if self.api_base:
+            entry["api_base"] = self.api_base
+        if self.api_version:
+            entry["api_version"] = self.api_version
+        return {"primary": entry}
+
+
+@dataclass
+class BedrockProvider(VisionProvider):
+    """
+    AWS Bedrock Vision provider.
+
+    Bedrock routes through AWS's regional endpoints. `model` is Bedrock's
+    canonical model id (e.g. ``anthropic.claude-3-sonnet-20240229-v1:0``
+    or ``us.anthropic.claude-sonnet-4-20250514-v1:0`` for cross-region
+    inference profiles). The ``bedrock/`` prefix is added downstream by
+    ``_resolve_model_name``; do NOT include it here.
+
+    Authentication is flexible — pick ONE path:
+
+      * Static credentials: pass ``aws_access_key_id`` + ``aws_secret_access_key``
+        (+ ``aws_region_name``). Optional ``aws_session_token`` for STS.
+      * Named profile: pass ``aws_profile_name`` (resolved from ~/.aws/config).
+      * Bearer token: pass ``api_key`` (mapped to AWS_BEARER_TOKEN_BEDROCK env).
+      * IAM role inheritance: pass none of the above — boto3 picks up the
+        container/EC2 instance role automatically.
+
+    Wire format follows litellm's Bedrock contract
+    (see https://docs.litellm.ai/docs/providers/bedrock):
+      model="bedrock/<model_id>", aws_access_key_id=..., aws_region_name=..., ...
+
+    All AWS_* env vars litellm understands are honoured by the underlying
+    boto3 client when set externally — this Provider class only writes
+    fields that were explicitly passed.
+    """
+    provider: str = "bedrock"
+    model: str = ""                          # e.g. "anthropic.claude-3-sonnet-20240229-v1:0"
+    api_key: str | None = None               # bearer token (AWS_BEARER_TOKEN_BEDROCK)
+    aws_access_key_id: str | None = None
+    aws_secret_access_key: str | None = None
+    aws_region_name: str | None = None       # e.g. "us-east-1"
+    aws_session_token: str | None = None     # STS temporary credentials
+    aws_profile_name: str | None = None      # named profile from ~/.aws/config
+
+    def to_model_config(self) -> dict[str, Any]:
+        """
+        Build the `models.vision` shape with Bedrock-specific fields preserved.
+
+        Only fields that the caller actually set are emitted — this lets
+        a caller relying on container IAM role / external env vars pass
+        just ``BedrockProvider(model="...")`` without polluting env with
+        empty strings downstream.
+        """
+        entry = _build_entry(self.provider, self.model, self.api_key)
+        for field_name in (
+            "aws_access_key_id",
+            "aws_secret_access_key",
+            "aws_region_name",
+            "aws_session_token",
+            "aws_profile_name",
+        ):
+            value = getattr(self, field_name)
+            if value:
+                entry[field_name] = value
+        return {"primary": entry}
+
+
+@dataclass
+class VertexAIProvider(VisionProvider):
+    """
+    Google Vertex AI Vision provider.
+
+    Vertex routes through Google Cloud regional endpoints. `model` is the
+    Vertex model id (e.g. ``gemini-2.5-pro``, ``gemini-1.5-flash``). The
+    ``vertex_ai/`` prefix is added downstream by ``_resolve_model_name``;
+    do NOT include it here.
+
+    Two fields are MANDATORY (per litellm's Vertex contract):
+      * vertex_project:  GCP project id, e.g. "my-gcp-project"
+      * vertex_location: region, e.g. "us-central1"
+
+    Authentication:
+      * vertex_credentials (optional): service-account JSON FILE PATH or
+        a raw JSON STRING. When omitted, litellm falls through to the
+        standard ``GOOGLE_APPLICATION_CREDENTIALS`` env var, or to gcloud
+        ADC (workload identity / metadata server in GCP).
+      * ``api_key`` is NOT used by Vertex — leave it None. Setting it has
+        no effect (kept on the dataclass for VisionProvider base compat).
+
+    Wire format follows litellm's Vertex contract
+    (see https://docs.litellm.ai/docs/providers/vertex):
+      model="vertex_ai/<model_id>", vertex_project=..., vertex_location=...,
+      vertex_credentials=...
+    """
+    provider: str = "vertex_ai"
+    model: str = ""                          # e.g. "gemini-2.5-pro"
+    api_key: str | None = None               # unused by Vertex (kept for base compat)
+    vertex_project: str | None = None
+    vertex_location: str | None = None
+    vertex_credentials: str | None = None    # service account JSON file path OR JSON string
+
+    def to_model_config(self) -> dict[str, Any]:
+        """
+        Build the `models.vision` shape with Vertex-specific fields preserved.
+
+        Empty optional fields are omitted (same rationale as BedrockProvider).
+        """
+        entry = _build_entry(self.provider, self.model, self.api_key)
+        for field_name in ("vertex_project", "vertex_location", "vertex_credentials"):
+            value = getattr(self, field_name)
+            if value:
+                entry[field_name] = value
+        return {"primary": entry}
+
+
 # ---------------------------------------------------------------------------
 # Concrete Audio providers
 # ---------------------------------------------------------------------------

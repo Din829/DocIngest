@@ -349,6 +349,13 @@ def inspect_files(
 
     Expands directories recursively (same logic as pipeline.discover_files).
     Returns list of inspection results, one per file.
+
+    Invalid inputs (missing paths, failed URL resolution) are returned as
+    inspection entries with ``format="invalid"`` and ``error_reason``/
+    ``error_detail`` fields — same channel as valid inspections so callers
+    can iterate uniformly. Catching these before `ingest()` is exactly what
+    inspect is for: a typo / cross-container mistake / broken URL should
+    surface here, not as a silent zero-result run later.
     """
     from .pipeline import discover_files
 
@@ -356,5 +363,25 @@ def inspect_files(
         from .config import load_config
         config = load_config()
 
-    files = discover_files([Path(p) if isinstance(p, str) else p for p in input_paths], config)
-    return [inspect_single(f, config) for f in files]
+    # discover_files returns (valid, invalid). Both feed into the returned
+    # list so inspect output covers everything the caller asked about.
+    files, invalid_inputs = discover_files(
+        [Path(p) if isinstance(p, str) else p for p in input_paths],
+        config,
+    )
+
+    results: list[dict[str, Any]] = [inspect_single(f, config) for f in files]
+    for inv in invalid_inputs:
+        results.append({
+            "name": Path(inv.input).name if inv.input else inv.input,
+            "path": inv.input,
+            "format": "invalid",
+            "error_reason": inv.reason,
+            "error_detail": inv.detail,
+            "recommendation": (
+                f"Input cannot be processed ({inv.reason}). "
+                f"Fix this before calling ingest() — otherwise it surfaces "
+                f"as a silent failed=1 entry in result.stats['errors']."
+            ),
+        })
+    return results

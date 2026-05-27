@@ -30,15 +30,104 @@ logger = logging.getLogger(__name__)
 # OCR engine mapping: our config name → Docling option class
 # ---------------------------------------------------------------------------
 
+def _resolve_rapidocr_paths(config: dict[str, Any]) -> dict[str, str] | None:
+    """
+    Resolve the user-configured RapidOCR model paths.
+
+    Returns:
+        - dict with all three (det/cls/rec) populated when all three paths
+          are set and the files exist on disk
+        - None when no paths are configured (caller falls back to RapidOCR's
+          default download location, the historical behaviour)
+
+    Raises:
+        ValueError when paths are PARTIALLY configured (one or two set,
+        others null/empty) — silent partial config is the kind of bug that
+        manifests as cryptic "Permission denied" at runtime weeks later.
+        Failing loud at construction time is the right call.
+        ValueError when paths are set but the files don't exist on disk.
+
+    Config shape (under parsing.ocr.rapidocr_model_paths):
+        det: <absolute path to det .onnx>
+        cls: <absolute path to cls .onnx>
+        rec: <absolute path to rec .onnx>
+    """
+    paths_cfg = get_nested(config, "parsing.ocr.rapidocr_model_paths", {}) or {}
+    raw = {
+        "det": paths_cfg.get("det"),
+        "cls": paths_cfg.get("cls"),
+        "rec": paths_cfg.get("rec"),
+    }
+    # Treat empty strings the same as null — both mean "not configured".
+    configured = {k: v for k, v in raw.items() if v}
+
+    if not configured:
+        return None
+
+    if len(configured) < 3:
+        missing = [k for k in ("det", "cls", "rec") if k not in configured]
+        raise ValueError(
+            f"parsing.ocr.rapidocr_model_paths is partially configured "
+            f"(missing: {missing}). All three paths (det/cls/rec) must be "
+            f"set together, or all three left null. Partial config would "
+            f"silently fall back to RapidOCR's default location and likely "
+            f"fail with Permission denied in non-root containers."
+        )
+
+    from pathlib import Path as _Path
+    missing_files = [
+        f"{k}={v}" for k, v in configured.items() if not _Path(v).is_file()
+    ]
+    if missing_files:
+        raise ValueError(
+            f"parsing.ocr.rapidocr_model_paths points at file(s) that don't "
+            f"exist: {missing_files}. Run `rapidocr download_models` in your "
+            f"Dockerfile / build step and verify the resulting .onnx paths."
+        )
+
+    return configured
+
+
 def _build_ocr_options(config: dict[str, Any]):
     """
     Build Docling OCR options from our config.
 
-    Returns None if OCR should use Docling defaults.
+    Two paths:
+      1. If parsing.ocr.rapidocr_model_paths is set (all three), we force
+         RapidOCR with explicit model paths regardless of engine="auto" —
+         the user's intent is unambiguous (they downloaded models, they
+         want RapidOCR to use them). Without this, docling's auto-pick
+         might land on EasyOCR/Tesseract and silently ignore the paths.
+      2. Otherwise, respect engine= as before. engine="auto" returns None
+         (let Docling decide); explicit engines build the matching options.
+
+    Returns None when no special handling is needed (engine="auto" with no
+    custom paths). Raises ValueError on misconfigured paths — see
+    _resolve_rapidocr_paths for details.
     """
     ocr_cfg = get_nested(config, "parsing.ocr", {})
     engine = ocr_cfg.get("engine", "auto")
     languages = ocr_cfg.get("languages", ["eng"])
+
+    # Custom RapidOCR model paths override engine= because their presence is
+    # the strongest signal of intent ("I pre-downloaded models, use them").
+    custom_rapidocr = _resolve_rapidocr_paths(config)
+    if custom_rapidocr is not None:
+        try:
+            from docling.datamodel.pipeline_options import RapidOcrOptions
+            return RapidOcrOptions(
+                det_model_path=custom_rapidocr["det"],
+                cls_model_path=custom_rapidocr["cls"],
+                rec_model_path=custom_rapidocr["rec"],
+            )
+        except ImportError as e:
+            # rapidocr is a docling extras dep — if missing, fail loud
+            # rather than silently dropping the paths the user explicitly
+            # configured.
+            raise ImportError(
+                f"parsing.ocr.rapidocr_model_paths was set but RapidOCR is "
+                f"not installed: {e}. Install with: pip install rapidocr"
+            ) from e
 
     if engine == "auto":
         # Let Docling pick the best available OCR engine

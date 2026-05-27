@@ -39,3 +39,7 @@ errors.json
 
 # Local debug scripts (ad-hoc repro / verification — not part of test suite)
 debug_*.py
+
+# Local-only operator notes (not for upstream — may contain deployment
+# specifics, project-internal references, etc.)
+实际踩雷.md

@@ -102,7 +102,7 @@ Claude / Cursor / Copilot agents talking to DocIngest as a tool.
 
 Stdio is the default transport. For browser-side / web clients, run `python -m docingest.mcp_server --transport sse` and connect over SSE instead.
 
-Tools exposed: `inspect`, `run`, `refine` (and the four optional `build_graph` / `query_graph` / `graph_status` / `enrich_chunks` tools when `[graph]` extras are installed). Every tool docstring spells out WHEN TO USE / TYPICAL WORKFLOW / how to interpret the result — agents read those at startup. The MCP layer is a thin transport wrapper around the same Python facade, so tool behaviour mirrors `docingest.ingest()` exactly.
+Tools exposed: `inspect`, `run`, `refine`. Plus optional graph tools (`build_graph`, `query_graph`, `graph_status`, `enrich_chunks`) when `pip install -e ".[graph]"` extras are installed — without them the four graph tools simply don't appear in the listing. Every tool docstring spells out WHEN TO USE / TYPICAL WORKFLOW / how to interpret the result — agents read those at startup. The MCP layer is a thin transport wrapper around the same Python facade, so tool behaviour mirrors `docingest.ingest()` exactly.
 
 Browsing / searching / reading the produced knowledge base is **deliberately NOT exposed as MCP tools** — DocIngest is a preprocessing engine, not a retrieval engine. Each agent already has Grep / Read / Glob that out-perform any wrapper we could ship, and the auto-generated `<output_dir>/knowledge_search.SKILL.md` gives them the corpus summary, file index, keyword index, and a language-routed search protocol in one Read. This keeps DocIngest as the universal upstream layer — every agent uses its own native tooling on the produced artefacts.
 
@@ -171,13 +171,39 @@ Never log connection strings or full API keys. The library doesn't, and you shou
 
 ### Output whitelist (the biggest perf knob)
 
+`outputs=` controls which downstream **stages** run, and which artefacts
+are read back into `IngestResult`. Two artefacts are always produced —
+they feed the incremental cache and other stages that may still be
+enabled — the rest can be disabled when not needed.
+
 ```python
-docingest.ingest(paths, outputs=["chunks"])         # only chunks.jsonl
-docingest.ingest(paths, outputs=["markdown"])       # only sources/*.md
-docingest.ingest(paths, outputs=None)               # everything (default)
+docingest.ingest(paths, outputs=["chunks"])    # skips knowledge_map / quality_report / run_log
+docingest.ingest(paths, outputs=["markdown"])  # skips chunks / knowledge_map / quality_report / run_log
+docingest.ingest(paths, outputs=None)          # everything (default)
 ```
 
-`outputs` actually disables the relevant pipeline stages (knowledge map generation, quality report, run log) — not just filters the read-back. On large corpora this saves real LLM cost, not just I/O. Pass only what you'll consume.
+| Output | Always written? | What `outputs=` controls when omitted |
+|---|---|---|
+| `sources/*.md` | **Yes** | Reader skipped — but file is still on disk (incremental cache + downstream stages need it) |
+| `index.json` | **Yes** | Reader skipped — file is still on disk (small; required by cache) |
+| `chunks.jsonl` | No | `chunking.enabled=false` → chunker not instantiated, chunks.jsonl not written |
+| `knowledge_map.yaml` | No | `knowledge_map.enabled=false` → Phase 4 skipped, **no LLM call** for the AI summary |
+| `quality_report.json` | No | `quality_report.enabled=false` → marker scan skipped |
+| `log.md` | No | `run_log.enabled=false` → timeline append skipped |
+
+So `outputs=["chunks"]` does **not** mean "only `chunks.jsonl` lands on
+disk" — `sources/*.md` and `index.json` still get written. What it does
+mean: knowledge_map / quality_report / run_log stages don't run, which
+saves the LLM call (knowledge_map AI summary) and a bit of I/O.
+
+On large corpora the real saver is dropping `knowledge_map` (one LLM call
+per run) and `chunks` (chunker CPU time per file). Pass `outputs=` with
+exactly what your consumer reads.
+
+If you genuinely cannot afford `sources/*.md` on disk (e.g. an ephemeral
+tenant directory), run `ingest()` into a `tempfile.mkdtemp()` and
+`shutil.rmtree()` after consuming `result.chunks` / `result.markdown_files`
+in memory. The cache then lives and dies with that temp dir.
 
 ### Error classification
 
@@ -193,6 +219,8 @@ for e in result.stats["errors"]:
 ```
 
 Currently emitted: `""` (success), `timeout`, `parse_error`, `io_error`. Additional values (`chunk_error`, `interrupted`, `unknown`) are reserved for future use — match defensively with a default arm so new types don't break your code. Always branch on this field rather than grepping the `error` string.
+
+`io_error` entries coming from `discover_files` (missing path, failed URL, URL disabled — see [Cross-container handoff](#cross-container--cross-process-file-handoff)) additionally carry a stable `reason` token (`"not_found"` / `"url_failed"` / `"url_disabled"`). `io_error` entries thrown by the parser itself (e.g. file disappeared mid-run) don't have a `reason` — branch on its presence with `e.get("reason")` rather than `e["reason"]`.
 
 ### Graceful interrupt vs hard stop
 
@@ -217,6 +245,234 @@ Phase 0 safety check (`safety.mode`) flags files / runs over budget **before** a
 - `strict` — abort unless the caller passes `acknowledge_large=True` (function parameter on `ingest()` / MCP `run` / CLI `--yes`)
 
 Defaults are tuned for small projects. Raise thresholds in `docingest.yaml` for larger workloads. See `safety:` section in `default.yaml` for every knob.
+
+---
+
+## Deployment
+
+DocIngest is process-local by default. Anything beyond that — containers,
+cloud LLMs, persistent caches, non-root users — is the integrator's job.
+This section captures the patterns that work and the traps that don't,
+without prescribing one Dockerfile to rule them all.
+
+### Image size — decide what you actually need
+
+docling >=2.95 keeps `torch` (and its CUDA wheels) in the `[models-local]`
+extras. That means **what you install controls how big the image gets**:
+
+| You want | Install | Approx. extra size |
+|---|---|---|
+| Vision API does all the OCR/layout (no local fallback) | `pip install docingest` | ~50–80 MB docling base |
+| Local layout/OCR as fallback when Vision is off / fails | `pip install docingest && pip install torch --extra-index-url https://download.pytorch.org/whl/cpu` | ~200 MB CPU torch |
+| GPU-accelerated local inference | `pip install docingest[models-local]` (default CUDA wheels) | ~5–6 GB (only if you actually have a GPU) |
+
+Most cloud-LLM deployments fall in row 1 — Vision handles everything,
+local models are dead weight. Row 2 is the safe middle for offline /
+restricted-egress environments. Row 3 only earns its keep with a GPU
+attached.
+
+A typical slim Dockerfile pattern (illustrative, adapt as needed):
+
+```dockerfile
+FROM python:3.11-slim
+
+# System binaries DocIngest can use when present (all optional)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice ffmpeg exiftool \
+    && rm -rf /var/lib/apt/lists/*
+
+# CPU-only torch (skip entirely for Vision-only deployments)
+RUN pip install --no-cache-dir torch \
+    --extra-index-url https://download.pytorch.org/whl/cpu
+
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir -e .
+COPY src ./src
+```
+
+Multi-stage builds, BuildKit cache mounts, and uv all work — DocIngest
+doesn't care, only the layer ordering does (install deps before copying
+mutable source so rebuilds reuse the pip cache layer).
+
+### Non-root containers — pre-download OCR models
+
+**Problem**: docling's RapidOCR backend downloads `.onnx` model files
+into the rapidocr package directory inside `site-packages`. On a non-root
+container, that directory is read-only → `PermissionError` at first
+PDF parse → silent failure (the file is skipped, not the run).
+
+**Solution**: download models in the build stage, point DocIngest at
+the result.
+
+```dockerfile
+RUN pip install rapidocr  # installs the CLI alongside the library
+RUN rapidocr download_models --config /tmp/rapidocr.yaml \
+    && mv /tmp/rapidocr-models /app/models/rapidocr
+```
+
+```yaml
+# docingest.yaml (project root or mounted)
+parsing:
+  ocr:
+    rapidocr_model_paths:
+      det: /app/models/rapidocr/ch_PP-OCRv4_det_mobile.onnx
+      cls: /app/models/rapidocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx
+      rec: /app/models/rapidocr/ch_PP-OCRv4_rec_mobile.onnx
+```
+
+DocIngest validates these paths at construction time — partial config
+(one path set, others null) raises `ValueError` rather than silently
+falling back to the broken default location. See `default.yaml` for
+the field-level explanation.
+
+### Cache persistence
+
+DocIngest's incremental cache lives at `{output.dir}/{incremental.cache_dir}/`
+by default (so `./kb/.cache/` for `output="./kb/"`). Containers that wipe
+their writable layer on restart lose the cache → next run re-pays every
+Vision API call.
+
+Two patterns:
+
+1. **Mount a persistent volume at `output.dir`** — simplest, keeps
+   everything (sources / chunks / cache) together.
+2. **Override only the cache** when `output.dir` must stay ephemeral:
+   ```bash
+   export DOCINGEST__incremental__cache_dir=/mnt/persistent/docingest-cache
+   ```
+   Absolute paths skip the `output.dir` prefix (per `pathlib.Path /` semantics
+   on POSIX — on Windows this can interact with drive letters; test).
+
+### Cross-container / cross-process file handoff
+
+**Failure mode**: API container writes a file to `/tmp/x.pdf` and puts the
+path on a queue. A worker container picks the message up and calls
+`docingest.ingest("/tmp/x.pdf")`. **Each container has its own `/tmp`** —
+the worker never sees the file. DocIngest reports `failed=1` with
+`error_type="io_error"` and `reason="not_found"` (as of v0.2; older
+versions silently produced `successful=0` with no errors at all, which is
+why this trap existed long enough to bite teams in production).
+
+**Root cause**: Local-FS paths are process-private. Containers, pods,
+serverless functions, and even threads-with-different-cwd can disagree
+about what `/tmp/x.pdf` resolves to.
+
+**Three correct patterns** — pick the one that matches your platform:
+
+1. **Shared volume** (Azure Files, EFS, NFS, hostPath, persistent disk
+   mounted into both pods). Simplest. API writes to the shared mount,
+   payload carries the mount-relative path, worker reads from the same
+   mount. Works for both files and the `output.dir` cache.
+
+2. **Object storage with byte transfer** (S3, Azure Blob, GCS). API
+   uploads bytes, payload carries a blob ID, worker downloads bytes to
+   its own `tempfile.mkdtemp()`, calls `ingest()`, cleans up. Most
+   portable across platforms; the standard pattern.
+
+3. **Pre-signed HTTPS URL** (often called "presigned URL" or "SAS URL").
+   API generates a short-lived signed URL, payload carries the URL,
+   worker passes the URL **directly to** `docingest.ingest([url], ...)` —
+   DocIngest already supports HTTPS inputs via yt-dlp / direct HTTP GET.
+   Most elegant: no temp file on the worker, no extra credential plumbing.
+
+**Don't do**:
+- API writes to its own `/tmp` and puts the local path on a queue.
+- Two workers ingest different files into the same `output_dir` concurrently
+  (no internal locking; aggregates clobber each other).
+
+DocIngest's `inspect()` function will also surface `format="invalid"`
+entries with `error_reason="not_found"` for unresolvable inputs — running
+inspect before ingest is a cheap pre-flight that catches this trap before
+LLM calls start.
+
+### Subprocess isolation (when timeouts matter)
+
+DocIngest links C extensions (docling, pymupdf, onnxruntime). A pure-
+Python `threading` cancellation cannot interrupt them mid-call — a hung
+PDF can hang the whole host process indefinitely.
+
+If your host is a long-lived service and you need a hard wall-clock cap
+beyond `parsing.timeout_sec`, isolate DocIngest in a child process:
+
+```python
+import multiprocessing as mp
+
+def _run(paths, output_dir, conn):
+    import docingest
+    result = docingest.ingest(paths, output=output_dir, outputs=["markdown"])
+    # Send via Pipe, not Queue — Queue's feeder thread can keep the
+    # process alive after the worker returns, breaking is_alive() polling.
+    conn.send({"stats": result.stats, "markdown_files": result.markdown_files})
+
+parent, child = mp.Pipe(duplex=False)
+proc = mp.get_context("spawn").Process(target=_run, args=(paths, out, child))
+proc.start()
+if not parent.poll(timeout=1800):     # 30-min cap
+    proc.kill()
+    raise TimeoutError("DocIngest hung")
+result = parent.recv()
+```
+
+`mp.Pipe(duplex=False)` is deliberate — `mp.Queue` carries a background
+feeder thread that joins on process exit, which can defeat the
+`is_alive()` polling pattern when DocIngest returns a 100KB+ payload.
+
+### Logging
+
+DocIngest writes to standard Python `logging` under the `docingest` and
+`docingest.pipeline` logger names. No handlers are installed by the
+library — attach your own:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+logging.getLogger("docingest").setLevel(logging.INFO)  # or DEBUG
+```
+
+In a subprocess isolation setup, ship logs back to the parent yourself
+(the child's stdout/stderr may be invisible to your container platform):
+capture in a `StringIO` handler, send through the same `Pipe`, replay
+on the parent.
+
+Hook exceptions are caught and downgraded to `warning` level so one bad
+hook can't break the pipeline. Set the logger to `DEBUG` to see the full
+tracebacks during integration work; switch back to `INFO` in prod.
+
+### Cloud LLM providers
+
+See [README → Python Library](README.md#python-library) for one-block
+examples of `AzureOpenAIProvider` / `BedrockProvider` / `VertexAIProvider`
+/ `GeminiProvider` / `OpenAIProvider` / `AnthropicProvider`. The Provider
+classes are intentionally thin — they shape a config dict and write the
+relevant env vars before the litellm call. Adding a new cloud is one
+dataclass + one entry in `_PROVIDER_EXTRA_ENV_MAP` (see
+`src/docingest/models/provider.py`).
+
+For a cloud not yet exposed as a Provider class, pass a raw dict:
+
+```python
+docingest.ingest(..., vision={
+    "primary": {"provider": "groq", "model": "...", "api_key": "..."},
+})
+```
+
+Anything litellm understands works.
+
+### Observability checklist
+
+When DocIngest looks like it "did nothing" or "did the wrong thing":
+
+1. `result.stats["successful"] vs ["failed"]` — file-level outcome
+2. `result.stats["errors"]` — per-file `error_type` (matchable, not freeform)
+3. `result.stats["warnings"]` — non-fatal compromises (page cap hit,
+   OCR engine downgraded, ...) — these are the silent-correctness traps
+4. `result.stats["safety"]` — pre-run budget check; `aborted: true` means
+   nothing ran
+5. `result.stats["token_usage"]` — LLM cost breakdown by model
+6. `docingest doctor` — shows which LLM/cost switches are currently ON
+
+`successful == N AND warnings == []` is the invariant for "everything
+finished cleanly".
 
 ---
 

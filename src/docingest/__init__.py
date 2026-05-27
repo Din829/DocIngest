@@ -26,6 +26,9 @@ from .providers import (
     GeminiProvider,
     OpenAIProvider,
     AnthropicProvider,
+    AzureOpenAIProvider,
+    BedrockProvider,
+    VertexAIProvider,
     DashScopeProvider,
     WhisperProvider,
 )
@@ -47,6 +50,9 @@ __all__ = [
     "GeminiProvider",
     "OpenAIProvider",
     "AnthropicProvider",
+    "AzureOpenAIProvider",
+    "BedrockProvider",
+    "VertexAIProvider",
     "DashScopeProvider",
     "WhisperProvider",
     # Metadata

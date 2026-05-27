@@ -93,6 +93,12 @@ class FileResult:
     # (e.g. "config changed", "source markdown missing"). Free-form string
     # surfaced from incremental.is_cache_valid for diagnostic logging.
     cache_reason: str = ""
+    # Per-file non-fatal warnings — collected from parse_result.metadata["warnings"]
+    # (which hooks/phases populate during processing). Distinct from `error`
+    # in that they don't fail the file; instead they signal a quality /
+    # completeness compromise (page cap hit, OCR engine downgraded, ...).
+    # run_pipeline aggregates these into PipelineResult.warnings.
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -126,16 +132,45 @@ class PipelineResult:
     # aborted (bool — only true when strict mode refused to run).
     # Empty dict when safety is off or no violations occurred.
     safety: dict[str, Any] = field(default_factory=dict)
+    # Aggregated non-fatal warnings — situations where the file was processed
+    # successfully but a quality / completeness compromise was made (e.g. page
+    # images capped, OCR engine downgraded, fallback parser used). Distinct
+    # from `errors` (which mark a file as failed) — every entry here lives on
+    # a successful file. Each entry: {"file": str, "kind": str, "message": str}.
+    # Surfaced to callers via result.stats["warnings"] so a `result.successful
+    # == N, warnings == 0` invariant means "everything completed cleanly".
+    warnings: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # File discovery
 # ---------------------------------------------------------------------------
 
+@dataclass
+class InvalidInput:
+    """An input path/URL that could not be resolved to a real file.
+
+    Surfaced through discover_files (and from there into PipelineResult.errors
+    via run_pipeline) so cross-container / typo / wrong-mount scenarios fail
+    loud instead of silently producing zero results.
+
+    Reasons currently emitted:
+      "not_found"      — local path does not exist on this filesystem
+      "url_failed"     — URL resolution returned no media (yt-dlp / HTTP miss)
+      "url_disabled"   — URL input given but parsing.url.enabled=false
+
+    Future reasons may be added; consumers should branch on the string
+    rather than enumerate.
+    """
+    input: str       # the original path / URL the caller passed
+    reason: str      # short stable token (see docstring)
+    detail: str = ""  # optional human-readable context
+
+
 def discover_files(
     input_paths: list[Path | str],
     config: dict[str, Any] | None = None,
-) -> list[Path]:
+) -> tuple[list[Path], list[InvalidInput]]:
     """
     Discover all processable files from input paths.
 
@@ -157,8 +192,24 @@ def discover_files(
             is disabled.
 
     Returns:
-        Flat list of individual file paths (directories + archives + URLs
-        recursively expanded).
+        Tuple ``(valid_files, invalid_inputs)``:
+
+          * ``valid_files``    — flat list of real file paths ready for
+            processing (directories + ZIPs + URLs expanded).
+          * ``invalid_inputs`` — list of InvalidInput describing inputs that
+            could not be resolved (missing files, URL resolution failures,
+            URL given while parsing.url.enabled=false). Each entry has
+            ``input`` (the caller's original string) and ``reason`` (a
+            short stable token). Callers should surface these — silently
+            dropping invalid paths is how the cross-container "successful=0
+            with no errors" failure mode happens.
+
+    Note for callers:
+        Returning invalid inputs alongside valid ones (instead of raising)
+        lets one bad path through a 100-file batch fail gracefully without
+        nuking the rest. run_pipeline transforms each InvalidInput into a
+        FileResult(success=False, error_type="io_error") so it appears in
+        the standard ``result.stats["errors"]`` channel.
     """
     # First pass: separate URLs from filesystem paths. We work with raw
     # strings first because Path("https://...") on Windows mangles the
@@ -166,6 +217,7 @@ def discover_files(
     # if done after Path conversion.
     raw_files: list[Path] = []
     url_inputs: list[str] = []
+    invalid: list[InvalidInput] = []
 
     for p in input_paths:
         # Preserve the original string form for URL detection.
@@ -201,27 +253,63 @@ def discover_files(
                         part.startswith(".") for part in f.parts
                     ):
                         raw_files.append(f)
+            else:
+                # Neither a file nor a directory — almost certainly the
+                # caller's mistake. Most common cause in production: a
+                # cross-container handoff where API writes /tmp and worker
+                # reads /tmp, but the two filesystems are different
+                # (Container Apps pods, K8s pods, separate Docker containers).
+                # Surfacing this as a structured "io_error" entry in
+                # result.errors prevents the silent "successful=0" failure
+                # mode that's hard to diagnose without trace-level logging.
+                invalid.append(InvalidInput(
+                    input=str(p),
+                    reason="not_found",
+                    detail=(
+                        "path is not a file or directory in this process's "
+                        "filesystem (cross-container handoff? wrong mount? "
+                        "typo?)"
+                    ),
+                ))
+                _pipeline_logger.warning(
+                    "Input path not found: %s — see InvalidInput / "
+                    "result.errors entry with reason='not_found'", p
+                )
 
     # Resolve URL inputs → local files (audio + subtitles + metadata).
     # Only when config is available and URL parsing is enabled.
-    if url_inputs and config is not None and get_nested(config, "parsing.url.enabled", True):
-        from .utils.url_resolver import resolve_url
-        for url in url_inputs:
-            resolved = resolve_url(url, config)
-            if resolved:
-                raw_files.extend(resolved)
-                _pipeline_logger.info(
-                    f"URL resolved: {url} → {len(resolved)} file(s)"
-                )
-            else:
-                _pipeline_logger.warning(f"URL resolution failed: {url}")
+    url_enabled = config is None or get_nested(config, "parsing.url.enabled", True)
+    if url_inputs:
+        if not url_enabled:
+            for url in url_inputs:
+                invalid.append(InvalidInput(
+                    input=url,
+                    reason="url_disabled",
+                    detail="parsing.url.enabled is false",
+                ))
+        elif config is not None:
+            from .utils.url_resolver import resolve_url
+            for url in url_inputs:
+                resolved = resolve_url(url, config)
+                if resolved:
+                    raw_files.extend(resolved)
+                    _pipeline_logger.info(
+                        f"URL resolved: {url} → {len(resolved)} file(s)"
+                    )
+                else:
+                    invalid.append(InvalidInput(
+                        input=url,
+                        reason="url_failed",
+                        detail="resolver returned no media (yt-dlp / HTTP)",
+                    ))
+                    _pipeline_logger.warning(f"URL resolution failed: {url}")
 
     # Second pass: expand zip archives when enabled. We run this after
     # the directory walk so zip files found INSIDE an input directory
     # are also expanded, not just zips passed directly on the command
     # line.
     if config is None or not get_nested(config, "parsing.zip.enabled", True):
-        return raw_files
+        return raw_files, invalid
 
     # Lazy import to avoid a hard dependency from non-zip callers and to
     # keep the top of pipeline.py uncluttered.
@@ -247,7 +335,7 @@ def discover_files(
         else:
             expanded.append(f)
 
-    return expanded
+    return expanded, invalid
 
 
 # ---------------------------------------------------------------------------
@@ -1992,6 +2080,14 @@ def process_single_file(
     if eb:
         result.element_boxes = eb
 
+    # Collect non-fatal warnings produced during this file's processing
+    # (page caps, OCR fallbacks, etc.) for run_pipeline to aggregate.
+    # parse_result.metadata["warnings"] is a list[str] written by phases
+    # like _generate_page_images_via_libreoffice.
+    md_warnings = parse_result.metadata.get("warnings")
+    if isinstance(md_warnings, list):
+        result.warnings = [str(w) for w in md_warnings if w]
+
     return result, chunks
 
 
@@ -2149,10 +2245,42 @@ def run_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Discover files (with zip expansion when enabled)
-    files = discover_files(input_paths, config=config)
-    pipeline_result = PipelineResult(total_files=len(files))
+    files, invalid_inputs = discover_files(input_paths, config=config)
+    pipeline_result = PipelineResult(total_files=len(files) + len(invalid_inputs))
+
+    # Surface invalid inputs as standard io_error entries — this is what
+    # turns the silent "successful=0 with no errors" cross-container failure
+    # mode into a visible result.failed=N + result.stats["errors"]
+    # populated outcome. Each invalid path becomes one FileResult so it
+    # shows up in result.files[] and run_log alongside real processing
+    # failures.
+    for inv in invalid_inputs:
+        fr = FileResult(
+            original_file=inv.input,
+            success=False,
+            error=f"{inv.reason}: {inv.detail}" if inv.detail else inv.reason,
+            error_type="io_error",
+            status="failed",
+        )
+        pipeline_result.files.append(fr)
+        pipeline_result.failed += 1
+        pipeline_result.errors.append({
+            "file": inv.input,
+            "error": fr.error,
+            "error_type": "io_error",
+            "reason": inv.reason,
+        })
+
+    # (total_files already covers both valid + invalid above; PipelineResult
+    # was constructed with that count so a batch of [valid.pdf, missing.pdf]
+    # reports total_files=2, failed=1, successful=1 — not the silent
+    # total_files=1 that hid the bug before.)
 
     if not files:
+        # No valid files to process. Still write a brief run log entry below
+        # by falling through normally — but skip the heavy phases. If there
+        # were invalid_inputs we've already populated errors, so callers
+        # see a clear failed > 0 signal.
         pipeline_result.elapsed_ms = int((time.monotonic() - t_start) * 1000)
         return pipeline_result
 
@@ -2446,6 +2574,16 @@ def run_pipeline(
                 file_result.cache_reason = cache_reason
 
             pipeline_result.files.append(file_result)
+
+            # Aggregate per-file warnings into the run-level summary.
+            # Done independent of success — a partially-processed file may
+            # still have surfaced quality warnings worth visible at the
+            # aggregate level (e.g. a docx that hit page cap but didn't fail).
+            for w in file_result.warnings:
+                pipeline_result.warnings.append({
+                    "file": file_path.name,
+                    "message": w,
+                })
 
             if file_result.success:
                 pipeline_result.successful += 1

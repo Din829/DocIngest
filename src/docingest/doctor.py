@@ -35,13 +35,42 @@ def _check_binary(name: str, config: dict[str, Any] | None = None) -> str | None
         return shutil.which(name)
 
 
+# Switches that, when ON, cause at least one extra LLM/Vision API call per
+# pipeline run. Surfaced by `docingest doctor` so users see exactly which
+# config knobs are currently incurring AI cost. Data-driven: adding a new
+# cost-incurring switch is one entry here, no code change needed.
+#
+# Each entry: (config_path, when_on_summary, scope)
+#   scope: "per-page"  — fires N times where N = page count after triage
+#          "per-chunk" — fires once per chunk
+#          "per-run"   — fires once per ingest() call (cheap-ish)
+_COST_SWITCHES: list[tuple[str, str, str]] = [
+    ("parsing.vision.enabled",
+     "Vision API call per page (after triage)", "per-page"),
+    ("knowledge_map.enabled",
+     "Stage 1 keyword extraction (zero cost) + Stage 2 LLM summary "
+     "if ai_summary=true", "per-run"),
+    ("knowledge_map.ai_summary",
+     "LLM-generated knowledge base summary + search guide", "per-run"),
+    ("chunking.enrichment.contextual_summary",
+     "LLM-generated per-chunk summary (rarely needed)", "per-chunk"),
+    ("chunking.ai_assist.enabled",
+     "LLM-assisted chunk boundary refinement on oversized chunks", "per-chunk"),
+    ("metadata.exiftool.enabled",
+     "exiftool subprocess (no LLM cost, but external binary)", "per-file"),
+]
+
+
 def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
     """
     Run full environment check. Returns structured results.
 
     Can be called programmatically (returns dict) or via CLI (prints table).
     """
-    results: dict[str, Any] = {"python": {}, "core": {}, "optional": {}, "tools": {}, "api_keys": {}}
+    results: dict[str, Any] = {
+        "python": {}, "core": {}, "optional": {}, "tools": {}, "api_keys": {},
+        "cost_switches": [],
+    }
 
     # --- Python ---
     results["python"] = {
@@ -144,6 +173,22 @@ def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
             "required": info["required"],
         }
 
+    # --- Cost-incurring switches ---
+    # Surfaces which config knobs WILL trigger LLM/external calls on the next
+    # ingest() run. Reads from the live merged config (default.yaml + project
+    # YAML + env overrides + any CLI overrides the caller passed in), so the
+    # values shown match what an actual run will see.
+    if config is not None:
+        from .config import get_nested
+        for path, when_on, scope in _COST_SWITCHES:
+            value = get_nested(config, path, None)
+            results["cost_switches"].append({
+                "path": path,
+                "enabled": bool(value),
+                "when_on": when_on,
+                "scope": scope,
+            })
+
     return results
 
 
@@ -210,6 +255,21 @@ def print_doctor(results: dict[str, Any]) -> None:
         else:
             table4.add_row(name, info["purpose"], info["required"], "[yellow]not set[/yellow]")
     console.print(table4)
+
+    # Cost-incurring switches — show which knobs WILL trigger LLM / external
+    # calls on the next ingest() run. Helps catch surprises like "Vision is
+    # off but knowledge_map.ai_summary still burns one LLM call per run".
+    switches = results.get("cost_switches") or []
+    if switches:
+        table5 = Table(title="LLM / Cost-incurring Switches")
+        table5.add_column("Config path", style="bold")
+        table5.add_column("State")
+        table5.add_column("Scope", justify="center")
+        table5.add_column("When ON")
+        for sw in switches:
+            state = "[yellow]ON[/yellow]" if sw["enabled"] else "[green]off[/green]"
+            table5.add_row(sw["path"], state, sw["scope"], sw["when_on"])
+        console.print(table5)
 
     # Summary
     core_ok = all(v["ok"] for v in results["core"].values())

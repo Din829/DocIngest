@@ -279,6 +279,31 @@ def _print_results(result) -> None:
 
     console.print(table)
 
+    # Non-fatal warnings — page-cap hits, OCR fallbacks, etc. Files all
+    # processed successfully, but with a quality compromise that's invisible
+    # unless we surface it here. Printed BEFORE safety so the user sees
+    # quality signals before reading the rest of the table.
+    warnings = getattr(result, "warnings", None) or []
+    if warnings:
+        # Group by file so a 50-file batch with the same warning shows once,
+        # not 50 times. Keep at most 5 distinct warning messages per file in
+        # the rendered output — full list stays on result.warnings for
+        # programmatic consumers (Mplat / agents).
+        by_file: dict[str, list[str]] = {}
+        for w in warnings:
+            by_file.setdefault(w["file"], []).append(w["message"])
+        console.print(
+            f"\n[yellow]Warnings:[/yellow] {len(warnings)} non-fatal "
+            f"issue(s) across {len(by_file)} file(s) — content may be incomplete:"
+        )
+        for fname, msgs in list(by_file.items())[:10]:  # cap at 10 files for tidy output
+            console.print(f"  [yellow]•[/yellow] {fname}")
+            for m in msgs[:5]:
+                console.print(f"      {m}")
+        if len(by_file) > 10:
+            console.print(f"  [dim]... and {len(by_file) - 10} more file(s) "
+                          f"(see result.stats['warnings'])[/dim]")
+
     # Safety summary (if Phase 0 ran and found violations). Printed early
     # so users see the abort reason before the rest of the diagnostics.
     safety = getattr(result, "safety", None) or {}

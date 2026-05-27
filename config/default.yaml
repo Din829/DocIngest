@@ -100,6 +100,25 @@ parsing:
     languages: ["eng", "jpn", "chi_sim"]
     force: false              # true: force OCR even on text-layer PDFs
 
+    # Pre-downloaded RapidOCR model paths. When set, all three must be set
+    # together — DocIngest will pass them directly to docling's
+    # RapidOcrOptions(det_model_path=..., cls_model_path=..., rec_model_path=...).
+    # This bypasses RapidOCR's default site-packages download location, which
+    # fails on non-root containers (docling issue #2500). Setting these also
+    # FORCES engine="rapidocr" — otherwise docling's auto-pick might land on
+    # EasyOCR/Tesseract and ignore the paths silently.
+    #
+    # Download the models once in your Dockerfile with:
+    #   rapidocr download_models --config /app/rapidocr.yaml
+    # then point each path here at the resulting .onnx file.
+    #
+    # Default null = use RapidOCR's built-in download location (fine for
+    # local dev / root containers; broken for non-root prod containers).
+    rapidocr_model_paths:
+      det: null               # e.g. "/app/models/rapidocr/ch_PP-OCRv4_det_mobile.onnx"
+      cls: null               # e.g. "/app/models/rapidocr/ch_ppocr_mobile_v2.0_cls_mobile.onnx"
+      rec: null               # e.g. "/app/models/rapidocr/ch_PP-OCRv4_rec_mobile.onnx"
+
   # Language detection
   language_detection: "auto"  # auto | fixed value ("ja", "en", "zh", etc.)
   # auto: detect via character distribution (no AI, fast)

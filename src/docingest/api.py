@@ -116,7 +116,12 @@ class IngestResult:
     """
     Keys:
       total_files, successful, failed, total_chunks, total_tokens,
-      elapsed_ms, errors, quality, token_usage, safety.
+      elapsed_ms, errors, warnings, quality, token_usage, safety,
+      interrupted.
+
+    ``warnings`` and ``interrupted`` are forward-compatible additions —
+    callers built against earlier shapes that don't check them stay
+    correct (warnings defaults to [], interrupted to False).
     """
 
     output_dir: str = ""
@@ -534,6 +539,13 @@ def _pipeline_stats(pipeline_result: Any) -> dict[str, Any]:
         "total_tokens": pipeline_result.total_tokens,
         "elapsed_ms": pipeline_result.elapsed_ms,
         "errors": list(pipeline_result.errors),
+        # Non-fatal per-run warnings — files processed successfully but with a
+        # quality compromise (page cap hit, OCR engine downgraded, ...). The
+        # invariant `successful == N AND not warnings` means everything ran
+        # cleanly. Each entry: {"file": str, "message": str}.
+        # getattr with default keeps old call sites (that built PipelineResult
+        # manually without this field) backwards-compatible.
+        "warnings": list(getattr(pipeline_result, "warnings", []) or []),
         "quality": dict(pipeline_result.quality),
         "token_usage": dict(pipeline_result.token_usage),
         "safety": dict(pipeline_result.safety),
