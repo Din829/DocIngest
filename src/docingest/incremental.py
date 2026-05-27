@@ -133,9 +133,6 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.pdf.table_extraction",
     "parsing.pdf.image_extraction",
     "parsing.pptx.include_notes",
-    "parsing.xlsx.row_to_text",
-    "parsing.xlsx.max_rows",
-    "parsing.xlsx.include_formulas",
     "parsing.xlsx.denoising",
     "parsing.xlsx.extract_connector_data",  # hook: xlsx connector → Vision ground truth
     "parsing.vision.batched_call",          # batched multi-image Vision toggle + thresholds

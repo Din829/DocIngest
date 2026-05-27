@@ -411,10 +411,6 @@ parsing:
 
   # Excel-specific
   xlsx:
-    row_to_text: true         # convert rows to natural language sentences
-    max_rows: 10000
-    include_formulas: false
-
     # AutoShape connector relationship extraction.
     # LibreOffice's xlsx → PDF rendering sometimes drops the terminal point
     # of arrow connectors (xdr:cxnSp), making画面遷移図 / フロー図 visually
