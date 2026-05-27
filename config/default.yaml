@@ -11,7 +11,12 @@ models:
   # Set explicitly because litellm injects max_tokens=4096 by default for both
   # Gemini and Claude when omitted (https://github.com/BerriAI/litellm/issues/8835).
   defaults:
-    max_response_tokens: 32768
+    # Output budget for every LLM call. Set to 65536 (Gemini 3 Flash /
+    # 3.1 Pro hard ceiling per https://ai.google.dev/gemini-api/docs/models).
+    # Gemini's per-request default is only 8192 if maxOutputTokens is omitted,
+    # so we must set this explicitly to unlock the full 64K. GPT-5.4-mini
+    # supports 128K but the fallback chain is capped by the smaller side.
+    max_response_tokens: 65536
     # Retry once when the LLM stops with finish_reason="length" (response cut
     # off by the token limit). Retry doubles the budget up to retry_max_tokens.
     retry_on_truncation: true
@@ -25,9 +30,10 @@ models:
 
   vision:
     # Per-task override; falls through to models.defaults.max_response_tokens
-    # when unset. Kept explicit here because dense PDF pages routinely need
-    # the full 32K budget.
-    max_response_tokens: 32768
+    # when unset. Kept explicit at the provider ceiling (65536 = Gemini 3 Flash
+    # / 3.1 Pro hard limit) so dense PDF / multi-page sheet / 方眼紙 仕様書
+    # Vision calls never hit silent finish_reason="length" truncation.
+    max_response_tokens: 65536
     # Wall-clock cap per Vision call (single page). null = no timeout.
     # Catches hung API calls so as_completed() doesn't wait forever.
     # Independent of litellm's network-level retry — this bounds the
@@ -890,7 +896,11 @@ refine:
   output_dir: "readable"          # output subdirectory inside knowledge/
   model: "chunking_assist"        # reuse models.chunking_assist config
   max_input_tokens: 50000         # skip files larger than this (with warning)
-  max_output_tokens: 8000         # LLM response cap
+  max_output_tokens: 65536        # LLM response cap (raised to provider ceiling —
+                                  # 8000 was a 2024 leftover that truncated long
+                                  # refines silently; refine.py already retries
+                                  # with retry_max_tokens but the first attempt
+                                  # should not waste a call on a too-small budget)
   default_skill: "refine_default" # SKILL file name (without .SKILL.md)
   skills_dir: "skills"            # directory containing .SKILL.md files
 
@@ -1016,8 +1026,12 @@ graph:
       provider: "google"
       model: "gemini-3-flash-preview"
       api_key_env: "GEMINI_API_KEY"
-    max_response_tokens: 8192          # entity extraction returns structured
-                                       # JSON — 8K is plenty for typical chunks
+    max_response_tokens: 65536         # entity extraction returns structured JSON.
+                                       # Raised to provider ceiling — 8K silently
+                                       # truncated dense chunks with many entities,
+                                       # causing partial graph extraction. Larger
+                                       # chunks rarely need >8K but the headroom
+                                       # is free until tokens are actually emitted.
 
   # Embedding model — independent from LLM (different provider OK).
   # Cannot be changed after first build without --force-rebuild: vector

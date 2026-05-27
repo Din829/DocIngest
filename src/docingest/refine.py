@@ -102,8 +102,10 @@ def refine_single(
             frontmatter = md_text[:end + 3]
             content = md_text[end + 3:].strip()
 
-    # Token check
-    max_input = get_nested(config, "refine.max_input_tokens", 8000)
+    # Token check. Fallback aligned with config/default.yaml's refine.max_input_tokens
+    # so a misconfigured deployment matches the documented default instead of
+    # silently skipping files at the old 8000 ceiling.
+    max_input = get_nested(config, "refine.max_input_tokens", 50000)
     tokens_in = BaseChunker.estimate_tokens(content)
     result["tokens_in"] = tokens_in
 
@@ -133,7 +135,11 @@ def refine_single(
     # Call LLM (reuse existing model config)
     model_key = get_nested(config, "refine.model", "chunking_assist")
     model_config = get_nested(config, f"models.{model_key}", {})
-    max_output = get_nested(config, "refine.max_output_tokens", 8000)
+    # Fallback aligned with config/default.yaml's refine.max_output_tokens
+    # (provider ceiling 65536). Old 8000 fallback silently truncated long
+    # refines when yaml config was missing; aligning to the same ceiling
+    # means a misconfigured deployment behaves consistently with a default one.
+    max_output = get_nested(config, "refine.max_output_tokens", 65536)
 
     try:
         # text_completion handles one-shot retry on finish_reason=="length"
