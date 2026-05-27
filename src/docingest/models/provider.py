@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import base64
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import litellm
 
@@ -30,8 +30,11 @@ litellm.suppress_debug_info = True
 # Hard fallback used only when neither model_config nor an explicit caller
 # argument specifies max_response_tokens. Every real caller should have
 # models.defaults.max_response_tokens populated from config/default.yaml;
-# this constant guards against misconfigured tests / callers only.
-_HARD_FALLBACK_MAX_TOKENS = 32768
+# this constant guards against misconfigured tests / callers only. Kept at
+# the provider ceiling (Gemini 3 Flash / 3.1 Pro = 65536) so a misconfigured
+# deployment still gets full headroom — output tokens cost the same whether
+# the cap is 32K or 64K (you only pay for tokens actually emitted).
+_HARD_FALLBACK_MAX_TOKENS = 65536
 
 # Hard fallback for network-level retry count when config is missing.
 # litellm itself defaults to 0 (no retries), which is too brittle for
@@ -288,30 +291,12 @@ def describe_image(
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    # Read and encode image
-    image_bytes = image_path.read_bytes()
-    base64_image = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Detect mime type from extension
-    ext = image_path.suffix.lower()
-    mime_map = {
-        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".gif": "image/gif", ".webp": "image/webp", ".tiff": "image/tiff",
-        ".bmp": "image/bmp",
-    }
-    mime_type = mime_map.get(ext, "image/png")
-
-    # Build message
+    # Build message — one text part + one image part.
     messages = [{
         "role": "user",
         "content": [
             {"type": "text", "text": prompt},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime_type};base64,{base64_image}",
-                },
-            },
+            _encode_image_for_litellm(image_path),
         ],
     }]
 
@@ -346,6 +331,116 @@ def describe_image(
 
     raise RuntimeError(
         f"Vision description failed for {image_path.name}. "
+        f"Last error: {last_error}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+_MIME_BY_EXT = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".tiff": "image/tiff",
+    ".bmp": "image/bmp",
+}
+
+
+def _encode_image_for_litellm(image_path: Path) -> dict[str, Any]:
+    """
+    Encode an image file as a litellm-compatible content part.
+
+    Reused by single-image describe_image and multi-image
+    describe_images_batched so the base64 + mime detection logic lives in
+    one place.
+    """
+    image_bytes = image_path.read_bytes()
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    mime_type = _MIME_BY_EXT.get(image_path.suffix.lower(), "image/png")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime_type};base64,{base64_image}"},
+    }
+
+
+def describe_images_batched(
+    image_paths: Sequence[Path | str],
+    prompt: str,
+    model_config: dict[str, Any] | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    """
+    Send MULTIPLE images to a Vision model in a single API call.
+
+    Used for xlsx whose single sheet renders to multiple PDF pages: sending
+    all pages of one sheet together lets Vision stitch cross-page table
+    continuations (per fair-comparison experiment: 90% vs 18% substring
+    coverage and 10/10 vs 1/10 cross-page continuity score against
+    per-page calls on USDM-style sheets, see pipeline._enrich_with_vision).
+
+    Args:
+        image_paths: Ordered list of page image files. Order = the order
+            Vision sees them. Empty list returns "".
+        prompt: Single instruction prompt covering all images. Caller is
+            responsible for any per-image markers inside the prompt text
+            (e.g. "[Page 8 below:]") if it wants to disambiguate.
+        model_config: Same shape as describe_image's model_config.
+        max_tokens: Caller-provided output cap. None falls through to
+            model_config / models.defaults.
+
+    Returns:
+        Vision response text. Same shape as describe_image — caller
+        receives one merged response covering all input pages.
+
+    Raises:
+        FileNotFoundError: when any image path doesn't exist (fail loud
+            so the caller's fallback path can fire cleanly).
+        RuntimeError: when primary AND fallback providers both fail. Same
+            contract as describe_image.
+    """
+    if not image_paths:
+        return ""
+
+    paths = [Path(p) for p in image_paths]
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(f"Page images not found: {missing}")
+
+    # Build a single message containing text + N images, in caller order.
+    # litellm passes this through to Gemini / OpenAI / Anthropic which all
+    # accept multi-image content arrays.
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for p in paths:
+        content.append(_encode_image_for_litellm(p))
+    messages = [{"role": "user", "content": content}]
+
+    effective_max_tokens = resolve_max_tokens(model_config, max_tokens)
+    effective_num_retries = resolve_max_retries(model_config)
+    models_to_try = _build_model_chain(model_config)
+    last_error = None
+
+    for model_entry in models_to_try:
+        _set_api_key(model_entry)
+        model_name = _resolve_model_name(
+            model_entry.get("provider", "openai"),
+            model_entry.get("model", "gpt-5.4-mini"),
+        )
+        try:
+            response = litellm.completion(
+                model=model_name,
+                messages=messages,
+                max_tokens=effective_max_tokens,
+                num_retries=effective_num_retries,
+            )
+            _record_usage(response, model_name)
+            content_out = response.choices[0].message.content
+            return content_out.strip() if content_out else ""
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise RuntimeError(
+        f"Batched Vision description failed for {len(paths)} image(s). "
         f"Last error: {last_error}"
     )
 

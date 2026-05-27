@@ -1020,6 +1020,11 @@ class DoclingParser(BaseParser):
                 "has_images": "<!-- image" in markdown,
                 "docling_origin": docling_origin,
                 "docling_name": file_path.stem,
+                # Visible sheet count — used by _enrich_with_vision's batched
+                # multi-image trigger (pages/sheet ratio). Independent from
+                # `pages` above (which is sheet_sections length) so future
+                # changes to either don't accidentally break the trigger.
+                "xlsx_visible_sheet_count": len(sheet_sections),
             }
             if extracted:
                 metadata["xlsx_embedded_images"] = extracted

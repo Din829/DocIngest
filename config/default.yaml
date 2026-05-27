@@ -194,6 +194,25 @@ parsing:
           en: [Latin]
           ko: [Latin, Hangul, Han]
 
+    # Batched multi-image Vision call — for xlsx whose single sheet renders
+    # to multiple PDF pages (long 方眼紙 / cross-page tables). Independent
+    # experiments (see notes in pipeline._enrich_with_vision) showed that
+    # sending all 11 pages of one sheet in a single Gemini Vision call beats
+    # per-page calls 90% vs 18% on substring coverage and 10/10 vs 1/10 on
+    # cross-page continuity — because Vision can stitch table continuations
+    # across page boundaries when it sees them together. Only triggered for
+    # xlsx/xls; other formats keep per-page calls (where the assumption
+    # breaks down — PDF pages are usually independent).
+    batched_call:
+      enabled: true                  # false → always per-page (rollback switch)
+      min_pages_per_sheet: 1.5       # trigger when pages/sheet ≥ this. DB-spec
+                                     # xlsx (13 sheet → 16 page = 1.2) stays
+                                     # per-page; USDM-style (4 sheet → 18 page
+                                     # = 4.5) triggers batched.
+      max_images_per_batch: 20       # API hard cap. Larger batches fall back
+                                     # to per-page rather than risk one mega-
+                                     # call hitting model context limits.
+
   # PDF-specific
   pdf:
     table_extraction: true

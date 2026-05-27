@@ -1303,52 +1303,157 @@ def _enrich_with_vision(
         )
         return
 
-    # Parallel Vision calls
-    parallel = get_nested(config, "performance.parallel_files", 4)
+    doc_format = parse_result.metadata.get("format")
+    vision_timeout = get_nested(config, "models.vision.timeout_sec", 180)
     results: dict[int, str] = {}  # page_index → vision result text
     described = 0
     failed = 0
 
-    doc_format = parse_result.metadata.get("format")
+    # ------------------------------------------------------------------
+    # Batched multi-image branch — for xlsx whose single sheet renders to
+    # many PDF pages. Sending all pages of one logical sheet in ONE Vision
+    # call lets the model stitch cross-page table continuations (per fair
+    # experiment: 90% vs 18% substring coverage and 10/10 vs 1/10
+    # continuity score vs per-page). Trigger conditions are conservative:
+    # only fires when the file is clearly a multi-page-per-sheet xlsx.
+    # Every other format / single-page xlsx / DB-spec style xlsx (one
+    # sheet ≈ one page) falls through to the per-page ThreadPoolExecutor
+    # path below — that path is unchanged.
+    # ------------------------------------------------------------------
+    batched_cfg = get_nested(config, "parsing.vision.batched_call", {}) or {}
+    batched_enabled = batched_cfg.get("enabled", False)
+    min_ratio = float(batched_cfg.get("min_pages_per_sheet", 1.5))
+    max_batch = int(batched_cfg.get("max_images_per_batch", 20))
+    sheet_count = parse_result.metadata.get("xlsx_visible_sheet_count")
 
-    vision_timeout = get_nested(config, "models.vision.timeout_sec", 180)
+    use_batched = (
+        batched_enabled
+        and doc_format in ("xlsx", "xls")
+        and isinstance(sheet_count, int) and sheet_count > 0
+        and len(vision_tasks) >= 2
+        and len(vision_tasks) <= max_batch
+        and (len(vision_tasks) / sheet_count) >= min_ratio
+    )
+    # Set once at the top so post-injection code can read it unconditionally.
+    # Holds the stitched batched response when batched mode runs and succeeds,
+    # None otherwise.
+    batched_block: str | None = None
 
-    def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
+    if use_batched:
+        from .parsers.vision import describe_pages_batched_cached
         from .utils.timeout import run_with_timeout
+
+        image_paths = [pd.image_path for _, pd in vision_tasks]
+        page_texts = [pd.text for _, pd in vision_tasks]
+        # Concatenate per-page structured_data so the batched prompt sees
+        # the ground truth from every page in this batch.
+        struct_parts = []
+        for _, pd in vision_tasks:
+            sd = structured_per_page.get(pd.page_no)
+            if sd:
+                struct_parts.append(f"[page {pd.page_no}]\n{sd}")
+        combined_struct = "\n\n".join(struct_parts) if struct_parts else None
+
+        logger.info(
+            f"Vision batched call: sending {len(image_paths)} page image(s) "
+            f"of {sheet_count} sheet(s) in one API call "
+            f"(ratio {len(vision_tasks)/sheet_count:.1f} ≥ {min_ratio})"
+        )
+        # The batched call may take significantly longer than a single page
+        # (~N×). Scale the timeout proportionally with a small ceiling so
+        # a hung API still surfaces eventually.
+        batched_timeout = min(vision_timeout * len(image_paths), 600)
         try:
-            # page_data.page_no is 1-based and matches the hook's
-            # convention for populating structured_extractions_per_page.
-            struct_data = structured_per_page.get(page_data.page_no)
-            return idx, run_with_timeout(
-                lambda: describe_page_cached(
-                    image_path=page_data.image_path,
-                    page_text=page_data.text,
+            batched_text = run_with_timeout(
+                lambda: describe_pages_batched_cached(
+                    image_paths=image_paths,
+                    page_texts=page_texts,
                     config=config,
                     cache=cache,
-                    structured_data=struct_data,
+                    structured_data=combined_struct,
                     doc_format=doc_format,
                 ),
-                vision_timeout,
+                batched_timeout,
             )
-        except TimeoutError as e:
-            logger.warning(f"Vision timed out for page {page_data.page_no}: {e}")
-            return idx, None
         except Exception as e:
-            logger.warning(f"Vision failed for page {page_data.page_no}: {e}")
-            return idx, None
+            logger.warning(
+                f"Vision batched call failed ({type(e).__name__}: {e}) — "
+                f"falling back to per-page Vision."
+            )
+            use_batched = False
+            batched_text = None
 
-    with ThreadPoolExecutor(max_workers=parallel) as executor:
-        futures = {
-            executor.submit(_call_vision, idx, pd): idx
-            for idx, pd in vision_tasks
-        }
-        for future in as_completed(futures):
-            idx, result_text = future.result()
-            if result_text and result_text.strip():
-                results[idx] = result_text.strip()
-                described += 1
-            else:
-                failed += 1
+        if use_batched and batched_text and batched_text.strip():
+            # The batched response is ONE stitched description covering
+            # every page in the batch. It does NOT correspond to any
+            # single Docling section, so we don't write it via the
+            # idx-based `results` dict (Mode A's idx→section mapping
+            # assumes 1 page = 1 section, which breaks for xlsx where
+            # N sheets → M pages). Stash it here; post-injection code
+            # appends the whole block to the end of parse_result.markdown
+            # with an explicit (batched) marker. Mirrors the overflow
+            # path for unaligned vision output.
+            described = len(image_paths)
+            page_range = f"{vision_tasks[0][1].page_no}-{vision_tasks[-1][1].page_no}"
+            logger.info(
+                f"Vision batched call: {described} page(s) described "
+                f"in single response ({len(batched_text):,} chars, "
+                f"pages {page_range})"
+            )
+            batched_block = (
+                f"\n\n<!-- vision-enriched batched, pages={page_range} -->\n"
+                f"{batched_text.strip()}\n"
+            )
+        elif use_batched:
+            # API returned empty/whitespace-only — treat as failure and fall through.
+            logger.warning(
+                "Vision batched call returned empty — falling back to per-page."
+            )
+            use_batched = False
+
+    # ------------------------------------------------------------------
+    # Per-page parallel branch — original behaviour. Runs when batched
+    # mode is disabled, doesn't apply, or fell back due to failure.
+    # ------------------------------------------------------------------
+    if not use_batched:
+        parallel = get_nested(config, "performance.parallel_files", 4)
+
+        def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
+            from .utils.timeout import run_with_timeout
+            try:
+                # page_data.page_no is 1-based and matches the hook's
+                # convention for populating structured_extractions_per_page.
+                struct_data = structured_per_page.get(page_data.page_no)
+                return idx, run_with_timeout(
+                    lambda: describe_page_cached(
+                        image_path=page_data.image_path,
+                        page_text=page_data.text,
+                        config=config,
+                        cache=cache,
+                        structured_data=struct_data,
+                        doc_format=doc_format,
+                    ),
+                    vision_timeout,
+                )
+            except TimeoutError as e:
+                logger.warning(f"Vision timed out for page {page_data.page_no}: {e}")
+                return idx, None
+            except Exception as e:
+                logger.warning(f"Vision failed for page {page_data.page_no}: {e}")
+                return idx, None
+
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {
+                executor.submit(_call_vision, idx, pd): idx
+                for idx, pd in vision_tasks
+            }
+            for future in as_completed(futures):
+                idx, result_text = future.result()
+                if result_text and result_text.strip():
+                    results[idx] = result_text.strip()
+                    described += 1
+                else:
+                    failed += 1
 
     # Inject results into markdown sections.
     # Two modes depending on whether the source has pagebreak markers:
@@ -1393,9 +1498,20 @@ def _enrich_with_vision(
                 f"If precise per-sheet attribution matters for your RAG, filter "
                 f"by the '(overflow)' marker in chunk text rather than title_path."
             )
+        # Batched response (when batched mode succeeded): append to the
+        # last section. The block already carries its own `(batched, pages=X-Y)`
+        # marker so downstream consumers can identify and filter it.
+        if batched_block:
+            sections[-1] = sections[-1].rstrip() + batched_block
         parse_result.markdown = pagebreak.join(sections)
     else:
         # Mode B: append all Vision results in page order at end of document
+        # Batched block (when in Mode B + batched mode succeeded) is also
+        # appended here as a single trailing section.
+        if batched_block:
+            parse_result.markdown = (
+                parse_result.markdown.rstrip() + batched_block
+            )
         if results:
             ordered = sorted(results.items())
             appended = "\n\n".join(
@@ -1412,10 +1528,11 @@ def _enrich_with_vision(
     if cache_enabled:
         cache.close()
 
+    mode_tag = "batched" if use_batched else f"parallel={get_nested(config, 'performance.parallel_files', 4)}"
     logger.info(
         f"Vision enrichment: {described} described, {failed} failed, "
         f"{no_image} no-image, {triage_skipped} triage-skipped, "
-        f"{cap_skipped} cap-skipped (parallel={parallel})"
+        f"{cap_skipped} cap-skipped ({mode_tag})"
     )
 
     # Lineage record — only when at least one page was actually enriched.
