@@ -221,7 +221,18 @@ parsing:
                                      # ratio above qualifies a file for batched,
                                      # all its pages go batched — large files
                                      # split into ceil(total / max_batch)
-                                     # sequential batches. Bounds each model
+                                     # parallel batches (concurrency from
+                                     # performance.parallel_files). 20 chosen
+                                     # after A/B on a 159-page xlsx with
+                                     # batch=5/10/20: smaller batches do NOT
+                                     # improve Vision quality on the real
+                                     # bottleneck (LibreOffice-rendered
+                                     # half-cropped wide sheets read by Vision
+                                     # as "[unreadable]"); Docling openpyxl
+                                     # extraction already covers those cells
+                                     # 100% so per-batch detail loss is moot.
+                                     # 20 gives best wall-clock + token cost.
+                                     # Bounds each model
                                      # call's context window (Gemini 3 Flash
                                      # comfortably handles 20 images per call;
                                      # raise only if you've tested your model

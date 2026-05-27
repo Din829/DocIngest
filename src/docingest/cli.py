@@ -154,8 +154,46 @@ def main(
             "safety abort."
         ),
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help=(
+            "Stream INFO-level docingest pipeline progress to stderr (Vision "
+            "batched calls, per-batch describe, page-image generation, etc.). "
+            "litellm / httpx / urllib3 stay at WARNING regardless — those "
+            "tools' INFO logs are pure noise (one 'Wrapper: Completed Call' "
+            "per LLM call). Independent of --json: stdout JSON output stays "
+            "clean. A full INFO-level run.log file is written to <output>/ "
+            "every run regardless of -v, so post-mortem analysis works "
+            "without re-running with -v."
+        ),
+    ),
 ) -> None:
     """Process documents for RAG and Agentic Search."""
+    # Logging policy:
+    #   - docingest.* loggers always at INFO (so the run.log file captures
+    #     full progress regardless of -v).
+    #   - Third-party loggers (LiteLLM / httpx / urllib3 / openpyxl / PIL)
+    #     forced to WARNING — their INFO is 4-6 noise lines per LLM call
+    #     and drowns out docingest's own progress.
+    #   - StreamHandler attached only when -v is set, so console stays quiet
+    #     unless the user opts in. FileHandler is wired AFTER we resolve
+    #     output_dir below (file path needs to exist first).
+    import logging
+    import sys
+    logging.getLogger("docingest").setLevel(logging.INFO)
+    for noisy in ("LiteLLM", "litellm", "httpx", "httpcore",
+                  "openpyxl", "PIL"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    if verbose:
+        _stream_handler = logging.StreamHandler(sys.stderr)
+        _stream_handler.setLevel(logging.INFO)
+        _stream_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logging.getLogger("docingest").addHandler(_stream_handler)
 
     # Resolve output directory.
     # Policy:
@@ -215,6 +253,24 @@ def main(
     parser = create_parser(config)
     chunker = create_chunker(config) if config.get("chunking", {}).get("enabled", True) else None
 
+    # Attach FileHandler for run.log AFTER output_dir is finalized. Always on
+    # (independent of -v) so post-mortem analysis works without re-running with
+    # -v. Appends across runs so multiple `docingest run` invocations against
+    # the same output dir leave a chronological trace — the file boundary is
+    # the per-run header banner printed below + the "Processing Results"
+    # table footer, both of which the FileHandler captures.
+    output.mkdir(parents=True, exist_ok=True)
+    _file_handler = logging.FileHandler(
+        output / "run.log",
+        mode="a",  # append — multi-run history is more useful than overwrite
+        encoding="utf-8",
+    )
+    _file_handler.setLevel(logging.INFO)
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    ))
+    logging.getLogger("docingest").addHandler(_file_handler)
+
     # Show start info — always to stderr so `--json` consumers get a clean
     # stdout. Interactive users see banner + table on the terminal as before.
     err_console.print(f"\n[bold]DocIngest[/bold] v0.1.0")
@@ -222,6 +278,12 @@ def main(
     err_console.print(f"  Output:   {output}")
     err_console.print(f"  Chunking: {'disabled' if not chunker else config.get('chunking', {}).get('strategy', 'auto')}")
     err_console.print()
+    # Mirror the banner to run.log so file readers see the same context as
+    # interactive users (which run, which inputs, which output dir).
+    logging.getLogger("docingest").info(
+        f"=== run start: inputs={[str(p) for p in inputs]} output={output} "
+        f"chunking={'disabled' if not chunker else config.get('chunking', {}).get('strategy', 'auto')} ==="
+    )
 
     # Run pipeline. CLI opts in to the SIGINT handler so Ctrl+C stops
     # gracefully (finish current file, write aggregates, exit 130).

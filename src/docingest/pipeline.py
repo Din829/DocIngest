@@ -827,7 +827,15 @@ def _generate_page_images_via_libreoffice(
 
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Step 1: → PDF via LibreOffice
+            # Step 1: → PDF via LibreOffice.
+            #
+            # NOTE: IsSkipEmptyPages was tried for xlsx but verified ineffective
+            # — LibreOffice's "Suppress empty pages" is Writer-only (officially
+            # documented as such, confirmed by isolated soffice test: 159 →
+            # 158 page on a real workbook). xlsx blank pages come from
+            # LibreOffice's "fit to page" rendering and have to be tolerated;
+            # Docling openpyxl extraction provides cell-level fallback so
+            # blank-page Vision noise doesn't lose information.
             subprocess.run(
                 [soffice, "--headless", "--convert-to", "pdf",
                  "--outdir", tmpdir, str(file_path)],
@@ -1381,9 +1389,20 @@ def _enrich_with_vision(
             f"{n_batches} batch(es) of ≤ {max_batch} image(s) each"
         )
 
-        batched_blocks: list[str] = []
-        any_batch_failed = False
-        for batch_idx in range(n_batches):
+        # Run batches in parallel — controlled by performance.parallel_files
+        # (same knob as per-page Vision). Earlier this was a sequential
+        # for-loop, which meant a 159-page workbook split into 8 batches ran
+        # 8 calls back-to-back even though each call is mostly I/O-bound
+        # (Gemini Vision wait time). With parallel=4 the same workbook now
+        # overlaps 4 batches at once. Failure semantics preserved: any single
+        # batch failing aborts batched mode for the whole file and triggers
+        # per-page fallback below — same as the old break behaviour, just
+        # surfaced via cancel + flag instead of loop exit.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        parallel = get_nested(config, "performance.parallel_files", 4)
+
+        def _run_one_batch(batch_idx: int) -> tuple[int, str | None, str | None]:
+            """Returns (batch_idx, result_text, error_msg). error_msg None on success."""
             start = batch_idx * max_batch
             end = min(start + max_batch, n_total)
             batch_imgs = all_image_paths[start:end]
@@ -1398,53 +1417,72 @@ def _enrich_with_vision(
             batch_struct = "\n\n".join(batch_struct_parts) if batch_struct_parts else None
 
             # Scale timeout with batch size, capped so a hung API surfaces eventually.
+            # Single-batch wall-clock cap is independent of how many batches run
+            # in parallel — concurrency doesn't change per-call latency.
             batch_timeout = min(vision_timeout * len(batch_imgs), 600)
 
             try:
                 batch_text = run_with_timeout(
-                    lambda imgs=batch_imgs, txts=batch_texts, struct=batch_struct: describe_pages_batched_cached(
-                        image_paths=imgs,
-                        page_texts=txts,
+                    lambda: describe_pages_batched_cached(
+                        image_paths=batch_imgs,
+                        page_texts=batch_texts,
                         config=config,
                         cache=cache,
-                        structured_data=struct,
+                        structured_data=batch_struct,
                         doc_format=doc_format,
                     ),
                     batch_timeout,
                 )
             except Exception as e:
-                logger.warning(
-                    f"Vision batched call failed on batch {batch_idx + 1}/{n_batches} "
-                    f"({type(e).__name__}: {e}) — falling back to per-page Vision "
-                    f"for the WHOLE file (no partial-batched output)."
-                )
-                any_batch_failed = True
-                break
-
+                return batch_idx, None, f"{type(e).__name__}: {e}"
             if not (batch_text and batch_text.strip()):
-                logger.warning(
-                    f"Vision batched call returned empty on batch {batch_idx + 1}/{n_batches} "
-                    f"— falling back to per-page Vision for the whole file."
-                )
-                any_batch_failed = True
-                break
+                return batch_idx, None, "empty response"
 
             page_range = f"{batch_page_nos[0]}-{batch_page_nos[-1]}"
-            logger.info(
-                f"  batch {batch_idx + 1}/{n_batches}: {len(batch_imgs)} page(s) "
-                f"described ({len(batch_text):,} chars, pages {page_range})"
-            )
-            batched_blocks.append(
+            wrapped = (
                 f"<!-- vision-enriched batched batch={batch_idx + 1}/{n_batches} "
                 f"pages={page_range} -->\n{batch_text.strip()}"
             )
+            return batch_idx, wrapped, None
+
+        results_by_idx: dict[int, str] = {}
+        any_batch_failed = False
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            futures = {executor.submit(_run_one_batch, idx): idx for idx in range(n_batches)}
+            for future in as_completed(futures):
+                idx, wrapped, err = future.result()
+                if err is not None:
+                    logger.warning(
+                        f"Vision batched call failed on batch {idx + 1}/{n_batches} "
+                        f"({err}) — falling back to per-page Vision for the WHOLE "
+                        f"file (no partial-batched output)."
+                    )
+                    any_batch_failed = True
+                    # Cancel remaining futures; they may still execute if
+                    # already started (Python can't preempt mid-call), but
+                    # this prevents NEW submissions and lets the executor
+                    # exit faster.
+                    for f in futures:
+                        f.cancel()
+                    break
+                # wrapped is guaranteed non-None when err is None (see _run_one_batch).
+                assert wrapped is not None
+                results_by_idx[idx] = wrapped
+                # Approx progress signal — order is "completion order" not
+                # idx order, which matches what users expect for parallel work.
+                logger.info(
+                    f"  batch {idx + 1}/{n_batches}: described "
+                    f"({len(wrapped):,} chars)"
+                )
 
         if any_batch_failed:
             use_batched = False
         else:
-            # Successful batched run: merge all batch blocks into one
-            # combined block; post-injection appends to last section.
+            # Successful batched run: merge by ORIGINAL batch order (idx) so
+            # the assembled markdown preserves source page sequence even
+            # though batches completed out of order.
             described = n_total
+            batched_blocks = [results_by_idx[i] for i in range(n_batches)]
             batched_block = "\n\n" + "\n\n".join(batched_blocks) + "\n"
 
     # ------------------------------------------------------------------
