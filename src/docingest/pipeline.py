@@ -1333,12 +1333,20 @@ def _enrich_with_vision(
     max_batch = int(batched_cfg.get("max_images_per_batch", 20))
     sheet_count = parse_result.metadata.get("xlsx_visible_sheet_count")
 
+    # max_batch is now an INTRA-batch size cap (each API call sees ≤ max_batch
+    # images), NOT a "skip batched if total > max_batch" gate. Earlier behaviour
+    # silently fell back to per-page on long xlsx (159-page workbook had ratio
+    # 12.2 ≫ 1.5 but got per-page anyway because 159 > 20). Same anti-pattern as
+    # the old max_pages caps: a hardcoded ceiling silently degraded the path
+    # users wanted. Now: if ratio qualifies, batched ALWAYS runs — large inputs
+    # are split into N batches of ≤ max_batch each, processed serially. Per-batch
+    # context stays bounded (model context limit unchanged), per-file behaviour
+    # is consistent regardless of size.
     use_batched = (
         batched_enabled
         and doc_format in ("xlsx", "xls")
         and isinstance(sheet_count, int) and sheet_count > 0
         and len(vision_tasks) >= 2
-        and len(vision_tasks) <= max_batch
         and (len(vision_tasks) / sheet_count) >= min_ratio
     )
     # Set once at the top so post-injection code can read it unconditionally.
@@ -1350,73 +1358,94 @@ def _enrich_with_vision(
         from .parsers.vision import describe_pages_batched_cached
         from .utils.timeout import run_with_timeout
 
-        image_paths = [pd.image_path for _, pd in vision_tasks]
-        page_texts = [pd.text for _, pd in vision_tasks]
+        all_image_paths = [pd.image_path for _, pd in vision_tasks]
+        all_page_texts = [pd.text for _, pd in vision_tasks]
+        all_page_nos = [pd.page_no for _, pd in vision_tasks]
         # Concatenate per-page structured_data so the batched prompt sees
-        # the ground truth from every page in this batch.
-        struct_parts = []
+        # the ground truth from every page in the BATCH (sliced per iteration
+        # below, so each batch only sees its own pages' ground truth).
+        struct_by_page: dict[int, str] = {}
         for _, pd in vision_tasks:
             sd = structured_per_page.get(pd.page_no)
             if sd:
-                struct_parts.append(f"[page {pd.page_no}]\n{sd}")
-        combined_struct = "\n\n".join(struct_parts) if struct_parts else None
+                struct_by_page[pd.page_no] = sd
 
+        # Split into batches of ≤ max_batch images each. ratio gate already
+        # qualified the file, so we always batch — even a 159-page workbook
+        # runs as 8 × 20-image batches rather than degrading to per-page.
+        n_total = len(all_image_paths)
+        n_batches = (n_total + max_batch - 1) // max_batch
         logger.info(
-            f"Vision batched call: sending {len(image_paths)} page image(s) "
-            f"of {sheet_count} sheet(s) in one API call "
-            f"(ratio {len(vision_tasks)/sheet_count:.1f} ≥ {min_ratio})"
+            f"Vision batched call: {n_total} page image(s) of {sheet_count} sheet(s) "
+            f"(ratio {n_total/sheet_count:.1f} ≥ {min_ratio}) → "
+            f"{n_batches} batch(es) of ≤ {max_batch} image(s) each"
         )
-        # The batched call may take significantly longer than a single page
-        # (~N×). Scale the timeout proportionally with a small ceiling so
-        # a hung API still surfaces eventually.
-        batched_timeout = min(vision_timeout * len(image_paths), 600)
-        try:
-            batched_text = run_with_timeout(
-                lambda: describe_pages_batched_cached(
-                    image_paths=image_paths,
-                    page_texts=page_texts,
-                    config=config,
-                    cache=cache,
-                    structured_data=combined_struct,
-                    doc_format=doc_format,
-                ),
-                batched_timeout,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Vision batched call failed ({type(e).__name__}: {e}) — "
-                f"falling back to per-page Vision."
-            )
-            use_batched = False
-            batched_text = None
 
-        if use_batched and batched_text and batched_text.strip():
-            # The batched response is ONE stitched description covering
-            # every page in the batch. It does NOT correspond to any
-            # single Docling section, so we don't write it via the
-            # idx-based `results` dict (Mode A's idx→section mapping
-            # assumes 1 page = 1 section, which breaks for xlsx where
-            # N sheets → M pages). Stash it here; post-injection code
-            # appends the whole block to the end of parse_result.markdown
-            # with an explicit (batched) marker. Mirrors the overflow
-            # path for unaligned vision output.
-            described = len(image_paths)
-            page_range = f"{vision_tasks[0][1].page_no}-{vision_tasks[-1][1].page_no}"
+        batched_blocks: list[str] = []
+        any_batch_failed = False
+        for batch_idx in range(n_batches):
+            start = batch_idx * max_batch
+            end = min(start + max_batch, n_total)
+            batch_imgs = all_image_paths[start:end]
+            batch_texts = all_page_texts[start:end]
+            batch_page_nos = all_page_nos[start:end]
+
+            # Per-batch structured ground truth (only this batch's pages).
+            batch_struct_parts = [
+                f"[page {p}]\n{struct_by_page[p]}"
+                for p in batch_page_nos if p in struct_by_page
+            ]
+            batch_struct = "\n\n".join(batch_struct_parts) if batch_struct_parts else None
+
+            # Scale timeout with batch size, capped so a hung API surfaces eventually.
+            batch_timeout = min(vision_timeout * len(batch_imgs), 600)
+
+            try:
+                batch_text = run_with_timeout(
+                    lambda imgs=batch_imgs, txts=batch_texts, struct=batch_struct: describe_pages_batched_cached(
+                        image_paths=imgs,
+                        page_texts=txts,
+                        config=config,
+                        cache=cache,
+                        structured_data=struct,
+                        doc_format=doc_format,
+                    ),
+                    batch_timeout,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Vision batched call failed on batch {batch_idx + 1}/{n_batches} "
+                    f"({type(e).__name__}: {e}) — falling back to per-page Vision "
+                    f"for the WHOLE file (no partial-batched output)."
+                )
+                any_batch_failed = True
+                break
+
+            if not (batch_text and batch_text.strip()):
+                logger.warning(
+                    f"Vision batched call returned empty on batch {batch_idx + 1}/{n_batches} "
+                    f"— falling back to per-page Vision for the whole file."
+                )
+                any_batch_failed = True
+                break
+
+            page_range = f"{batch_page_nos[0]}-{batch_page_nos[-1]}"
             logger.info(
-                f"Vision batched call: {described} page(s) described "
-                f"in single response ({len(batched_text):,} chars, "
-                f"pages {page_range})"
+                f"  batch {batch_idx + 1}/{n_batches}: {len(batch_imgs)} page(s) "
+                f"described ({len(batch_text):,} chars, pages {page_range})"
             )
-            batched_block = (
-                f"\n\n<!-- vision-enriched batched, pages={page_range} -->\n"
-                f"{batched_text.strip()}\n"
+            batched_blocks.append(
+                f"<!-- vision-enriched batched batch={batch_idx + 1}/{n_batches} "
+                f"pages={page_range} -->\n{batch_text.strip()}"
             )
-        elif use_batched:
-            # API returned empty/whitespace-only — treat as failure and fall through.
-            logger.warning(
-                "Vision batched call returned empty — falling back to per-page."
-            )
+
+        if any_batch_failed:
             use_batched = False
+        else:
+            # Successful batched run: merge all batch blocks into one
+            # combined block; post-injection appends to last section.
+            described = n_total
+            batched_block = "\n\n" + "\n\n".join(batched_blocks) + "\n"
 
     # ------------------------------------------------------------------
     # Per-page parallel branch — original behaviour. Runs when batched

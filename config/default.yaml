@@ -216,9 +216,16 @@ parsing:
                                      # xlsx (13 sheet → 16 page = 1.2) stays
                                      # per-page; USDM-style (4 sheet → 18 page
                                      # = 4.5) triggers batched.
-      max_images_per_batch: 20       # API hard cap. Larger batches fall back
-                                     # to per-page rather than risk one mega-
-                                     # call hitting model context limits.
+      max_images_per_batch: 20       # Per-batch image cap (NOT a "fall back to
+                                     # per-page if total > N" gate). Once the
+                                     # ratio above qualifies a file for batched,
+                                     # all its pages go batched — large files
+                                     # split into ceil(total / max_batch)
+                                     # sequential batches. Bounds each model
+                                     # call's context window (Gemini 3 Flash
+                                     # comfortably handles 20 images per call;
+                                     # raise only if you've tested your model
+                                     # handles more without quality drop).
 
   # PDF-specific
   pdf:
