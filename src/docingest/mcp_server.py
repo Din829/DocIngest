@@ -15,7 +15,9 @@ Adding a new tool:
 
 Running:
   python -m docingest.mcp_server                    # stdio (default)
-  python -m docingest.mcp_server --transport sse    # SSE for web clients
+  python -m docingest.mcp_server --transport http   # Streamable HTTP (web)
+  python -m docingest.mcp_server --transport sse    # SSE (legacy in fastmcp v3,
+                                                    # still works for back-compat)
 
 Requires: pip install fastmcp   (or pip install -e ".[mcp]")
 """

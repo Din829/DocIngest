@@ -121,48 +121,68 @@ class OpenAIEmbedding(EmbeddingProvider):
 
 
 # ---------------------------------------------------------------------------
-# Google (Gemini text-embedding-004)
+# Google (Gemini gemini-embedding-001)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class GeminiEmbedding(EmbeddingProvider):
     """
-    Google Gemini embeddings via the ``google-generativeai`` SDK.
+    Google Gemini embeddings via the official ``google-genai`` SDK.
 
-    Default model is text-embedding-004 (768 dim). The dimension MUST be
-    set explicitly because google-generativeai exposes no introspection
-    helper for it.
+    Default model is gemini-embedding-001 (Matryoshka, supports 768 / 1536 /
+    3072 dim). We default to 768 to preserve the dimension contract that
+    older LightRAG indices were built against — the SDK is asked to truncate
+    to ``self.dimension`` via ``EmbedContentConfig.output_dimensionality``.
+
+    The dimension MUST be passed explicitly: the API's own default is 3072,
+    so accepting the API default would silently break any existing vector
+    store dimensioned at 768.
+
+    Migration note: replaces the deprecated ``google-generativeai`` SDK
+    (EOL 2025-11-30). The new SDK's model names do NOT take the ``models/``
+    prefix the old SDK required — we strip it if present so configs written
+    for the old SDK still work.
     """
 
     provider: str = "google"
-    model: str = "text-embedding-004"
+    model: str = "gemini-embedding-001"
     api_key: str | None = None
     dimension: int = 768
     max_token_size: int = 2048
 
     async def _async_embed(self, texts: list[str]) -> np.ndarray:
-        # Lazy import: google-generativeai is NOT a transitive dependency of
-        # the docingest core; users opting into Gemini embeddings install it
-        # themselves (see [graph] extras).
-        import google.generativeai as genai  # type: ignore[import-not-found]
+        # Lazy import: google-genai is NOT a transitive dependency of the
+        # docingest core; users opting into Gemini embeddings install it
+        # themselves (see [graph-gemini] extras).
+        from google import genai  # type: ignore[import-not-found]
+        from google.genai import types  # type: ignore[import-not-found]
 
         key = self.api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if key:
-            genai.configure(api_key=key)
+        # google-genai falls back to ambient credentials (ADC, Vertex) when
+        # api_key is None — mirror that by passing api_key only when set.
+        client = genai.Client(api_key=key) if key else genai.Client()
 
-        # The SDK is sync — wrap each text in a thread call. Batching is
-        # handled by LightRAG / our backend layer, so we just iterate.
-        def _one(text: str) -> list[float]:
-            result = genai.embed_content(
-                model=self.model if self.model.startswith("models/") else f"models/{self.model}",
-                content=text,
-            )
-            return result["embedding"]
+        # Strip legacy "models/" prefix — required by old SDK, forbidden by new.
+        model_name = self.model.removeprefix("models/")
 
-        results = await asyncio.gather(
-            *(asyncio.to_thread(_one, t) for t in texts)
+        # One batched call — new SDK accepts `contents` as a list, no need for
+        # the per-text asyncio.gather + to_thread dance the old sync SDK forced.
+        # `contents=list[str]` is documented in the SDK's README; the type stub
+        # spelling (ContentListUnion) is wider than that, hence the ignore.
+        response = await client.aio.models.embed_content(
+            model=model_name,
+            contents=texts,  # type: ignore[arg-type]
+            config=types.EmbedContentConfig(output_dimensionality=self.dimension),
         )
-        return np.array(results, dtype=np.float32)
+        embeddings = response.embeddings
+        if not embeddings:
+            # API contract violation — texts went in but no embeddings came out.
+            # Fail loud rather than return a misshapen array LightRAG can't use.
+            raise RuntimeError(
+                f"google-genai embed_content returned no embeddings for "
+                f"{len(texts)} input(s); response={response!r}"
+            )
+        return np.array([emb.values for emb in embeddings], dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
