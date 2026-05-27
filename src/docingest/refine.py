@@ -186,7 +186,14 @@ def refine_single(
     readable_dir = output_dir / readable_dir_name / skill_short
     readable_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = readable_dir / source_path.name
+    # Skill-name convention: any skill containing "html" emits .html; everything
+    # else keeps the source's .md suffix. Lets users add refine_html_xxx variants
+    # without touching code, while default / faithful keep their existing .md
+    # behaviour byte-for-byte.
+    if skill_short and "html" in skill_short:
+        output_path = readable_dir / (source_path.stem + ".html")
+    else:
+        output_path = readable_dir / source_path.name
     output_path.write_text(refined, encoding="utf-8")
 
     result["output"] = str(output_path)
