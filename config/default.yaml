@@ -134,9 +134,16 @@ parsing:
   # The AI decides what to do (no code-level thresholds or filtering).
   vision:
     enabled: true             # true | false — master switch
-    max_pages: 50             # Global cap on Vision API calls per file.
-                              # Prevents runaway cost on huge documents.
-                              # null = no limit (use with caution).
+    max_pages: null           # Global cap on Vision API calls per file. null
+                              # (default) defers to the `safety:` section for
+                              # cost control — safety.mode=warn/strict runs a
+                              # pre-flight budget check and prompts the user
+                              # BEFORE any LLM call. A hard cap here would just
+                              # silently truncate (159-page xlsx → drop pages
+                              # 51-159 with no signal to the caller), which is
+                              # information loss disguised as defence. Set an
+                              # int here only if a specific workload needs a
+                              # tighter cap independent of safety budget.
     image_dpi: 180            # resolution for page images sent to Vision.
                               # 72 = fastest/smallest (readable for large text only)
                               # 150 = good balance (main elements clear, small labels fuzzy)
@@ -436,7 +443,12 @@ parsing:
       extract_metadata_rows: 5    # first N rows: try to pull key-value pairs into metadata
       extract_images: true        # pull embedded images from xlsx zip (xl/media/)
       ensure_page_images: true    # LibreOffice → PDF → page screenshots when Docling has none
-      max_page_images: 10         # cap page screenshots sent to Vision (excess → text-only, with warning)
+      max_page_images: null       # no per-format cap; defers to parsing.vision.max_pages (default 50).
+                                  # Earlier 10 was overly defensive — single-sheet 方眼紙 / DB design
+                                  # / process-flow xlsx routinely renders to 20-160 PDF pages via
+                                  # LibreOffice, and the global parsing.vision.max_pages already
+                                  # acts as the cost ceiling. Set an int here only if a specific
+                                  # xlsx workload needs a tighter local cap.
       max_image_pixels: 4000000   # single image pixel cap (≈2000x2000). Larger images are scaled down.
 
     # Optional per-format Vision override. See parsing.pdf.vision for usage.
