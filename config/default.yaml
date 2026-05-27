@@ -368,6 +368,21 @@ parsing:
     max_rows: 10000
     include_formulas: false
 
+    # AutoShape connector relationship extraction.
+    # LibreOffice's xlsx → PDF rendering sometimes drops the terminal point
+    # of arrow connectors (xdr:cxnSp), making画面遷移図 / フロー図 visually
+    # incomplete on the screenshot Vision sees. This hook reads the OOXML
+    # drawing XML directly, reconstructs source-box → target-box pairs by
+    # geometric proximity, and feeds the list to Vision as ground-truth
+    # structured data — same channel as PPTX chart direct-read. Vision then
+    # trusts the relationship list for arrow direction and focuses on
+    # labels / annotations / phase groupings that the list cannot convey.
+    #
+    # No effect on xlsx without drawings or without connectors. Failure
+    # modes (encrypted xlsx / unreadable XML / no edges within proximity
+    # threshold) silently skip via HookNoOp without polluting lineage.
+    extract_connector_data: true
+
     # Render xlsx directly via openpyxl instead of routing through Docling.
     # Why this is the default: Docling's Excel backend renders all sheets
     # into one flat markdown stream and *misaligns* sheet headings against

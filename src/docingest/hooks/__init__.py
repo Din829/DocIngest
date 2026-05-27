@@ -212,6 +212,15 @@ def _register_default_hooks() -> None:
     except ImportError as e:
         logger.debug(f"PPTX chart hook not available: {e}")
 
+    # XLSX AutoShape connector relationships — feeds Vision ground truth
+    # for 画面遷移図 / フロー図 sheets where LibreOffice drops arrow
+    # terminal points. Same shape as pptx_chart: structured_data → Vision.
+    try:
+        from .xlsx_connector import xlsx_connector_hook
+        _register_post("post_parse", ["xlsx"], xlsx_connector_hook)
+    except ImportError as e:
+        logger.debug(f"XLSX connector hook not available: {e}")
+
     # #3 File metadata enrichment (Docling origin + exiftool + derived created)
     try:
         from .file_metadata import file_metadata_hook

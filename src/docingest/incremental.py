@@ -137,6 +137,7 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.xlsx.max_rows",
     "parsing.xlsx.include_formulas",
     "parsing.xlsx.denoising",
+    "parsing.xlsx.extract_connector_data",  # hook: xlsx connector → Vision ground truth
     "chunking.enabled",
     "chunking.strategy",
     "chunking.max_tokens",
