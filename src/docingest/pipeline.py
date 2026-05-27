@@ -783,7 +783,7 @@ def _generate_page_images_via_libreoffice(
     file_path: Path,
     parse_result,
     config: dict[str, Any],
-    max_pages: int,
+    max_pages: int | None,
     max_pixels: int,
     format_label: str,
 ) -> None:
@@ -852,7 +852,10 @@ def _generate_page_images_via_libreoffice(
                 images = convert_from_path(str(pdf_files[0]), dpi=image_dpi)
                 total_pages = len(images)
                 for i, img in enumerate(images):
-                    if i >= max_pages:
+                    # max_pages may be None (no per-format cap; defers entirely
+                    # to the global parsing.vision.max_pages enforcement
+                    # downstream). int comparison would TypeError on None.
+                    if max_pages is not None and i >= max_pages:
                         break
                     name = f"{file_path.stem}-page-{i + 1:03d}.png"
                     out = assets_dir / name
@@ -895,7 +898,8 @@ def _generate_page_images_via_libreoffice(
                     pdf_result = conv.convert(str(pdf_files[0]))
                     total_pages = len(pdf_result.document.pages) if hasattr(pdf_result.document, "pages") else 0
                     for page_no, page in pdf_result.document.pages.items():
-                        if len(pages_data) >= max_pages:
+                        # See note above re: max_pages=None.
+                        if max_pages is not None and len(pages_data) >= max_pages:
                             break
                         pil = getattr(page.image, "pil_image", None) if page.image else None
                         if pil is None:
@@ -925,8 +929,11 @@ def _generate_page_images_via_libreoffice(
                     f"via LibreOffice for {file_path.name}"
                 )
 
-            # Emit warning if pages were capped (visible in frontmatter + logs)
-            if total_pages > max_pages:
+            # Emit warning if pages were capped (visible in frontmatter + logs).
+            # When max_pages is None there is no per-format cap; the global
+            # parsing.vision.max_pages enforcement downstream handles the
+            # cost ceiling and emits its own log.
+            if max_pages is not None and total_pages > max_pages:
                 warn_msg = (
                     f"{format_label} produced {total_pages} pages, "
                     f"only first {max_pages} sent to Vision "
