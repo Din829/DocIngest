@@ -244,7 +244,14 @@ parsing:
   pptx:
     include_notes: true         # include speaker notes
     vision_page_images: true    # LibreOffice → PDF → page screenshots → Vision
-    max_page_images: 30         # PPT can have many slides — cap for cost control
+    max_page_images: null       # null (default) = no per-format cap. Cost control
+                                # is the `safety:` section's job (pre-flight budget
+                                # check + warn/strict, user-approved). A hardcoded
+                                # cap here would silently drop slides past N to
+                                # text-only — information loss disguised as defence,
+                                # same anti-pattern we removed from xlsx and
+                                # parsing.vision.max_pages. Set an int only if a
+                                # specific workload needs a tighter local limit.
     max_image_pixels: 4000000   # auto-downscale oversized page images
 
     # Chart data direct-read.
@@ -269,7 +276,15 @@ parsing:
   # the document via LibreOffice → PDF → screenshots lets Vision AI describe them.
   docx:
     vision_page_images: true    # LibreOffice → PDF → page screenshots → Vision
-    max_page_images: 20         # cap pages sent to Vision (excess → text-only + warning)
+    max_page_images: null       # null (default) = no per-format cap. Cost control
+                                # belongs to `safety:` (pre-flight, user-approved),
+                                # not to a silent post-hoc truncation here. Long
+                                # specs / 仕様書 / manuals routinely run 30-80 pages
+                                # of which figures matter; a 20-cap dropped 60% of
+                                # the visual content unannounced. Same anti-pattern
+                                # we removed from xlsx and parsing.vision.max_pages.
+                                # Set an int only when a workload genuinely needs a
+                                # tighter local limit.
     max_image_pixels: 4000000   # auto-downscale oversized page images
 
     # Math equations (OMML) → LaTeX preprocessing.
