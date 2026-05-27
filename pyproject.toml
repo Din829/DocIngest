@@ -16,12 +16,18 @@ dependencies = [
                               # pulling docling base no longer drags 5.6GB torch.
 
     # Core: AI/LLM
-    "litellm>=1.83",          # Multi-provider LLM API (Vision, chunking assist).
-                              # 1.82.7/1.82.8 had a PyPI supply-chain
-                              # compromise; >=1.83 is the safe floor.
+    "litellm>=1.86.1",        # Multi-provider LLM API (Vision, chunking assist).
+                              # >=1.83.7 closes CVE-2026-42208 (pre-auth SQLi,
+                              # CISA KEV). We use litellm as a library (not the
+                              # proxy server) so the SQLi surface is unreachable,
+                              # but the pin must not allow the vulnerable
+                              # 1.81.16–1.83.6 range. 1.86.1 = current latest.
 
     # Core: CLI & config
-    "typer>=0.12",            # CLI framework
+    "typer>=0.15",            # CLI framework.
+                              # >=0.15 aligns with typer's own current rich
+                              # dependency floor (rich>=13.8); avoids resolver
+                              # picking a 0.12 from 2024 against a much newer rich.
     "pyyaml>=6.0",            # YAML config loading
     "rich>=13.0",             # Terminal output formatting
     "python-dotenv>=1.0",     # .env file loading for API keys
@@ -29,16 +35,31 @@ dependencies = [
     # Core: caching & data
     "diskcache>=5.6",         # AI call result caching
     "openpyxl>=3.1",          # Excel reading (inspect + chunker)
-    "pillow>=10.0",           # Image processing (page screenshots)
+    "pillow>=11.3,<13",       # Image processing (page screenshots).
+                              # >=11.3 closes CVE-2025-48379 (DDS heap overflow)
+                              # and CVE-2026-25990 (PSD OOB write, fixed 12.1.1).
+                              # We only use Image.open / Image.LANCZOS / .resize —
+                              # verified safe across 10→11→12 (no removals).
+                              # <13 cap is defensive; 13 not released yet.
 
     # Hooks: format-specific enrichment
     "python-pptx>=1.0",       # PPTX chart data direct-read
-    "beautifulsoup4>=4.12",   # DOCX OMML → LaTeX preprocessing
+    "beautifulsoup4>=4.13",   # DOCX OMML → LaTeX preprocessing.
+                              # >=4.13 picks up the type-hint reshuffle
+                              # (exceptions/warnings moved to bs4.exceptions /
+                              # bs4._warnings). We only use Tag / find / find_all
+                              # so no API impact.
     "defusedxml>=0.7",        # XML safety (OMML, EPUB)
 
     # PDF fallback & inspection
-    "pymupdf>=1.24",          # Garbled text recovery + PDF page count (inspect)
-    "requests>=2.31",         # URL resolution (yt-dlp info download)
+    "pymupdf>=1.26.7",        # Garbled text recovery + PDF page count (inspect).
+                              # >=1.26.7 closes CVE-2026-3029 (path traversal in
+                              # `pymupdf embed-extract` CLI). We use the library
+                              # API only so impact is nil — but pin must not
+                              # allow vulnerable versions.
+    "requests>=2.33",         # URL resolution (yt-dlp info download).
+                              # >=2.33 closes CVE-2026-25645 (predictable temp
+                              # path in extract_zipped_paths).
 ]
 
 [project.optional-dependencies]
@@ -50,20 +71,45 @@ tesseract = [
 ]
 nlp = [
     "sudachipy>=0.6",         # Japanese morphological analysis (keyword extraction)
-    "sudachidict_core>=20240409",  # SudachiPy core dictionary
+    "sudachidict_core>=20251022",  # SudachiPy core dictionary.
+                                   # Bumped from 20240409 → 20251022 because
+                                   # Japanese vocabulary drifts; ~18 months of
+                                   # word additions matter for keyword extraction
+                                   # quality on recent content.
 ]
 mcp = [
-    "fastmcp>=2.0",           # MCP server framework
+    "fastmcp>=3.2,<4",        # MCP server framework.
+                              # >=3.2 closes three 2.x CVEs (SSRF/path
+                              # traversal CVE-2026-32871, OAuth confused-deputy
+                              # CVE-2026-27124, cmd injection CVE-2025-64340).
+                              # Our usage is the bare-decorator API
+                              # (FastMCP(name=, instructions=) + @mcp.tool +
+                              # mcp.run(transport=)) which is fully
+                              # backward-compatible from v2 to v3. <4 cap is
+                              # defensive; v4 not released yet.
 ]
 audio = [
-    "dashscope",              # Qwen3-ASR (default audio transcription engine)
+    "dashscope>=1.25",        # Qwen3-ASR (default audio transcription engine).
+                              # Soft floor: 1.25+ ensures the Qwen3-ASR-Flash-
+                              # Filetrans endpoint (up to 12h audio, base64/URL)
+                              # is reachable. SDK does additive minor bumps; no
+                              # known breaking changes in the 1.x series.
 ]
 graph = [
     # Optional GraphRAG layer (docingest.graph). Loads only when explicitly
     # imported via `import docingest.graph`; main `docingest run` works
     # unchanged without these installed.
-    "lightrag-hku>=1.0,<2.0", # Knowledge graph + community detection backend
-    "openai>=1.50",           # OpenAI embeddings (default embedding provider)
+    "lightrag-hku>=1.0,<1.5", # Knowledge graph + community detection backend.
+                              # <1.5 keeps 1.5rc out: that rc deprecated
+                              # ENTITY_TYPES env var (→ ENTITY_TYPE_PROMPT_FILE)
+                              # and removed QueryParam.model_func. We only use
+                              # the LightRAG / EmbeddingFunc / QueryParam top-
+                              # level API + ainsert / aquery — stable across 1.x.
+    "openai>=1.50,<3",        # OpenAI embeddings (default embedding provider).
+                              # <3 cap is defensive — we only use AsyncOpenAI +
+                              # client.embeddings.create, both stable in 2.x.
+                              # 3.x not released yet but pin protects against
+                              # future signature changes.
     # nest_asyncio is applied ONLY by the MCP server entry point (not the
     # library / CLI path). LightRAG 1.4's internal asyncio.Lock binds to
     # the first event loop and rejects subsequent asyncio.run() calls,
@@ -78,13 +124,19 @@ graph-local = [
     # Local sentence-transformers embeddings (zero API cost). Adds ~2 GB of
     # PyTorch wheels — kept separate so users opting for OpenAI / Gemini
     # embeddings don't pay this download.
-    "sentence-transformers>=2.7",
+    "sentence-transformers>=3.0",
+    # Bumped from 2.7 → 3.0 for compatibility with current embedding model
+    # weights on Hugging Face. We only use SentenceTransformer(...).encode()
+    # for inference; 3.x's training-API rewrite doesn't affect that path.
 ]
 graph-gemini = [
-    # Optional: Gemini embeddings via google-generativeai. Most users on
-    # the [graph] path use OpenAI embeddings; opt in only if you want
-    # Gemini's text-embedding-004.
-    "google-generativeai>=0.7",
+    # Optional: Gemini embeddings via the official google-genai SDK.
+    # Replaces the legacy google-generativeai package (EOL 2025-11-30, now
+    # marked Development Status :: 7 - Inactive on PyPI). See migration
+    # guide: https://ai.google.dev/gemini-api/docs/migrate
+    # Most users on the [graph] path use OpenAI embeddings; opt in here
+    # only if you want Gemini's gemini-embedding-001 (768/1536/3072 dim).
+    "google-genai>=2.0",
 ]
 dev = [
     "pytest>=8.0",

@@ -1,0 +1,136 @@
+# =============================================================================
+# DocIngest production Dockerfile (reference template — copy + adapt)
+# =============================================================================
+#
+# Bakes in every lesson from 实际踩雷.md and INTEGRATION.md "Deployment":
+#   - System binaries installed BEFORE pip (proper layer cache, §4.6)
+#   - onnxruntime + rapidocr models pre-downloaded as ROOT (avoids §4.11
+#     PermissionError when non-root container hits the first PDF)
+#   - pyproject.toml copied BEFORE src/ so editing source doesn't bust the
+#     pip-install layer (§4.6)
+#   - verify_deps.py gates the build (fails fast if anything is missing)
+#   - Slim base, CPU-only torch (avoids §4.5 11GB image)
+#
+# Why single-stage instead of multi-stage:
+#   Multi-stage saves disk only if the runtime stage drops the big stuff
+#   (compilers, source). For DocIngest the dominant size is
+#   LibreOffice (~500MB) + Python deps — both needed at runtime. The
+#   builder→runtime split mostly adds COPY complexity for little savings,
+#   so we keep one stage and skip build-essential at the end with
+#   `apt-get autoremove`.
+#
+# Build:
+#   docker build -t docingest:prod -f Dockerfile.example .
+#
+# Run:
+#   docker run --rm -v "$PWD/data:/data" \
+#       -e GEMINI_API_KEY=... \
+#       docingest:prod docingest run /data/docs -o /data/kb
+#
+# Customisation knobs (build args, all optional):
+#   --build-arg PYTHON_VERSION=3.11
+#   --build-arg INSTALL_PROFILE=default      # default|minimal|no-graph|full
+#   --build-arg INSTALL_OCR=1                # 0=skip onnxruntime+rapidocr
+#   --build-arg VERIFY_PROFILE=default       # default|strict|<comma-list>
+# =============================================================================
+
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim
+
+ARG INSTALL_PROFILE=default
+ARG INSTALL_OCR=1
+ARG VERIFY_PROFILE=default
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# -----------------------------------------------------------------------------
+# Layer 1: system binaries (DocIngest can't install these via pip)
+# Cached forever unless this RUN itself changes.
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        # required by DocIngest core
+        libreoffice \
+        ffmpeg \
+        poppler-utils \
+        # recommended (drop if you don't need exiftool metadata / yt-dlp URLs)
+        libimage-exiftool-perl \
+        nodejs \
+        # build-time only — removed by autoremove at the end of this RUN
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# -----------------------------------------------------------------------------
+# Layer 2: Python dependency install (cache-friendly order)
+# Copy ONLY pyproject.toml + a stub package first so this layer is reused
+# as long as pyproject.toml itself doesn't change. Editing src/ later
+# won't bust this layer.
+# -----------------------------------------------------------------------------
+COPY pyproject.toml requirements.txt README.md ./
+RUN mkdir -p src/docingest && \
+    echo "__version__ = '0.0.0'" > src/docingest/__init__.py
+
+# CPU-only torch (only matters if INSTALL_PROFILE pulls torch — graph-local).
+# If you never use [graph-local], this line is a no-op.
+RUN pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Profile-driven extras. Mirrors scripts/install_python_deps.sh.
+RUN case "${INSTALL_PROFILE}" in \
+        minimal)   EXTRAS="" ;; \
+        no-graph)  EXTRAS="[mcp,audio,nlp]" ;; \
+        full)      EXTRAS="[mcp,audio,nlp,graph,graph-local]" ;; \
+        *)         EXTRAS="[mcp,audio,nlp,graph]" ;; \
+    esac && \
+    pip install -e ".${EXTRAS}" && \
+    pip install pdf2image PyExifTool yt-dlp
+
+# -----------------------------------------------------------------------------
+# Layer 3: OCR stack pre-download (must happen as ROOT)
+# §4.11 fix: rapidocr lazily downloads .onnx into its package directory;
+# a non-root runtime would hit PermissionError on the first PDF parse.
+# -----------------------------------------------------------------------------
+RUN if [ "${INSTALL_OCR}" = "1" ]; then \
+        pip install onnxruntime rapidocr && \
+        python -c "from rapidocr import RapidOCR; RapidOCR()" ; \
+    fi
+
+# -----------------------------------------------------------------------------
+# Layer 4: real source code (copied last so source edits only bust this layer)
+# -----------------------------------------------------------------------------
+COPY src/ ./src/
+COPY config/ ./config/
+COPY scripts/ ./scripts/
+COPY skills/ ./skills/
+
+# -----------------------------------------------------------------------------
+# Layer 5: drop build-time tools to slim the final image
+# -----------------------------------------------------------------------------
+RUN apt-get purge -y --auto-remove build-essential && \
+    rm -rf /var/lib/apt/lists/* /root/.cache
+
+# -----------------------------------------------------------------------------
+# Layer 6: build-time gate. Fails the image build if anything required is
+# missing. Override VERIFY_PROFILE=strict to also require all optional groups.
+# -----------------------------------------------------------------------------
+RUN python scripts/verify_deps.py \
+        $(case "${VERIFY_PROFILE}" in \
+            strict)  echo "--strict" ;; \
+            default) echo "" ;; \
+            *)       echo "--require ${VERIFY_PROFILE}" ;; \
+          esac) \
+        --no-warnings
+
+# -----------------------------------------------------------------------------
+# Layer 7: non-root user (model cache is already populated as root above)
+# -----------------------------------------------------------------------------
+RUN useradd --create-home --shell /bin/bash docingest && \
+    chown -R docingest:docingest /app
+USER docingest
+
+ENTRYPOINT ["docingest"]
+CMD ["--help"]

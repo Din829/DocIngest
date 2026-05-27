@@ -37,8 +37,9 @@ test_pptx_*/
 # Misc
 errors.json
 
-# Local debug scripts (ad-hoc repro / verification — not part of test suite)
+# Local debug / experiment scripts (ad-hoc repro / verification — not part of test suite)
 debug_*.py
+experiment_*.py
 
 # Local-only operator notes (not for upstream — may contain deployment
 # specifics, project-internal references, etc.)
