@@ -448,6 +448,19 @@ parsing:
 - `ThreadPoolExecutor` 并发调用，worker 数读 `performance.parallel_files`（该配置被 Vision 页内并发独占使用；文件级并发**刻意不实装**，见 §9.1）
 - 每次调用按**图片内容哈希 + structured_data hash** 做 cache key，同页同内容重跑零成本
 
+#### Batched 多图调用（xlsx 长 sheet 专用）
+
+xlsx 一个 sheet 可能被 LibreOffice 渲染成多张 PDF page（长方眼紙 / 跨页表），per-page 独立调用看不到跨页延续。当满足以下条件时，`_enrich_with_vision` 改走一次合并调用，把整批 page 图喂给 Vision：
+
+- `parsing.vision.batched_call.enabled` = true（默认开）
+- 文件格式 ∈ {xlsx, xls}
+- `len(vision_tasks) / visible_sheet_count >= min_pages_per_sheet`（默认 1.5）
+- `len(vision_tasks) <= max_images_per_batch`（默认 20，超了 fallback 单页）
+
+不满足任一条件 → 完全走原 ThreadPoolExecutor 单页路径（PDF / PPTX / DOCX / 单页 xlsx / DB-spec 类多 sheet 1:1 xlsx 全部不触发）。合并结果以 `<!-- vision-enriched batched, pages=X-Y -->` 标记追加到最后一个 pagebreak section 末尾；任意失败（empty response / API 异常）自动 fallback 单页并 warn。Cache namespace 与单页 disjoint（`batched_vision|...` vs `page_vision|...`），不会互相污染。
+
+实测见 commit `0248b6e` 的提交信息（foox USDM 4 sheet → 18 page：per-page ×18 跑 204s 截断 9/11，batched ×1 跑 69s 0 截断，命中率 18% → 90%+）。
+
 ### 5.2 Excel 路径 — 用 openpyxl 而非 Docling 渲染
 
 **默认开启 `parsing.xlsx.use_openpyxl_renderer: true`**。`DoclingParser.parse` 入口最先判断 `suffix in {".xlsx", ".xls"}` + 配置开关 + openpyxl 可用，命中 → 调 `_parse_xlsx_via_openpyxl`；否则走原 Docling 路径。

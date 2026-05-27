@@ -35,6 +35,7 @@ pip install -e ".[mcp]"              # MCP Server (FastMCP)
 pip install -e ".[audio]"            # Audio transcription (DashScope Qwen3-ASR)
 pip install -e ".[graph]"            # Optional GraphRAG layer (LightRAG)
 pip install -e ".[graph-local]"      # Add local embedding model (zero API cost)
+pip install -e ".[graph-gemini]"     # Gemini embeddings for GraphRAG (google-genai SDK)
 pip install -e ".[nlp,mcp,audio]"    # All optional Python packages
 ```
 
@@ -58,6 +59,20 @@ pip install magika
 ```
 
 Run `docingest doctor` at any time to check your environment.
+
+For automated deployment (CI / Docker / new machine), see [`scripts/`](scripts/):
+
+```bash
+./scripts/install_python_deps.sh        # pip extras wrapper
+./scripts/install_system_deps.sh        # Linux/macOS — soffice/ffmpeg/poppler/exiftool/node
+./scripts/install_system_deps.ps1       # Windows — same via winget + manual poppler
+python scripts/verify_deps.py           # true gate (exits non-zero on missing deps —
+                                        # docingest doctor never does, so CI can't use it)
+```
+
+`Dockerfile.example` at the repo root is a single-stage production template that
+wires these scripts together (system bins layer → pip layer → OCR model pre-download
+as root → `verify_deps.py` build gate → non-root user).
 
 ### Use as a dependency of another project
 
