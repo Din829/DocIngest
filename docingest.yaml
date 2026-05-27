@@ -1,0 +1,20 @@
+# DocIngest 项目配置 —— 最小侵入式覆盖
+# 优先级：CLI > env (DOCINGEST__*) > 本文件 > config/default.yaml
+#
+# 设计原则：DocIngest 默认值已经经过作者大量实战调过（看 default.yaml 注释），
+# 只在确实不合用的地方动，其他全部继承默认。
+# 临时调整请用 env 变量，不要改本文件。
+
+# 注意：本来在这里覆盖了 parsing.xlsx.denoising.max_page_images=30，
+# 严格本地对照（cap=10 vs cap=30 跑 4 个文件）后发现 cap 提高带来的
+# 是浪费 token 而非信息——多送的 Vision 结果在 pipeline.py::_enrich_with_vision
+# 的 "if idx < len(sections)" 处被静默丢弃（pagebreak section 数 < page 数时）。
+# 因此回滚，使用 DocIngest 默认 cap=10。
+# 如果哪天真遇到 sheet 数特别多的文件需要全送 Vision，用临时 env：
+#   DOCINGEST__parsing__xlsx__denoising__max_page_images=30 docingest run xxx.xlsx
+
+knowledge_map:
+  # 默认 true —— 每次跑都额外 1 次 LLM 调用生成 knowledge base summary。
+  # 关掉后 Stage 1 关键词索引依然生成（零成本），只是不写 AI 摘要。
+  # 内部测试 / 反复跑同 corpus 没价值，按需手动跑。
+  ai_summary: false

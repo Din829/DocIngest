@@ -1361,13 +1361,38 @@ def _enrich_with_vision(
     has_pagebreaks = len(sections) > 1
 
     if has_pagebreaks:
-        # Mode A: align by section index
+        # Mode A: align by section index.
+        # Overflow: when LibreOffice renders one xlsx sheet to multiple PDF
+        # pages (long 方眼紙 layouts), page_count can exceed sheet_count and
+        # results[idx>=len(sections)] would otherwise be silently dropped.
+        # Append overflow to the last section (typically continuation pages
+        # of the final sheet) and log a warning so the leak is visible.
+        overflow: list[tuple[int, str]] = []
         for idx, text in results.items():
             if idx < len(sections):
                 sections[idx] = (
                     sections[idx].rstrip()
                     + f"\n\n<!-- vision-enriched -->\n{text}\n"
                 )
+            else:
+                overflow.append((idx, text))
+        if overflow:
+            overflow.sort()
+            extra = "\n\n".join(
+                f"<!-- vision-enriched page={idx + 1} (overflow) -->\n{text}"
+                for idx, text in overflow
+            )
+            sections[-1] = sections[-1].rstrip() + f"\n\n{extra}\n"
+            logger.warning(
+                f"Vision: {len(overflow)} page result(s) overflowed pagebreak "
+                f"count ({len(sections)} sections vs {len(results)} pages) — "
+                f"appended to last section. Common with xlsx whose LibreOffice "
+                f"render produces more pages than sheets. "
+                f"Overflow chunks inherit the last section's title_path, which "
+                f"misattributes pages originally belonging to earlier sheets. "
+                f"If precise per-sheet attribution matters for your RAG, filter "
+                f"by the '(overflow)' marker in chunk text rather than title_path."
+            )
         parse_result.markdown = pagebreak.join(sections)
     else:
         # Mode B: append all Vision results in page order at end of document
