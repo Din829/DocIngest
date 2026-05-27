@@ -532,7 +532,8 @@ def refine_cmd(
     skill: Optional[str] = typer.Option(
         None,
         "--skill",
-        help="SKILL name to use (default: refine_default).",
+        help="SKILL name (default: refine_default). Built-in: refine_default, "
+             "refine_faithful, refine_html. Skills containing 'html' emit .html.",
     ),
     config_file: Optional[Path] = typer.Option(
         None,

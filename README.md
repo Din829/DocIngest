@@ -144,9 +144,10 @@ docingest inspect report.pdf --json   # JSON output (for Agents / MCP)
 ```bash
 docingest refine ./knowledge/sources/spec.md                        # Default: readability-first
 docingest refine ./knowledge/sources/*.md --skill refine_faithful   # Faithful: word-for-word, only dedup + format
+docingest refine ./knowledge/sources/spec.md --skill refine_html    # HTML: fidelity-preserving HTML5 fragment (.html)
 ```
 
-Available skills: `refine_default` (allows rewriting) | `refine_faithful` (preserves original text exactly)
+Available skills: `refine_default` (allows rewriting) | `refine_faithful` (preserves original text exactly) | `refine_html` (same fidelity as faithful, outputs HTML fragment with `.html` extension)
 
 ### Python Library
 
