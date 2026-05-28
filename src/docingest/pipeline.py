@@ -848,6 +848,21 @@ def _generate_page_images_via_libreoffice(
                 )
                 return
 
+            # Step 1.5: xlsx-only — read PDF outline to build sheet→page map.
+            # Cheap (one pymupdf.open + get_toc, no rendering); the map is
+            # consumed downstream by the connector hook and Vision batched
+            # mode. Failure of any kind returns {} and downstream falls
+            # back to the legacy 1-sheet-1-page assumption — this NEVER
+            # decides whether a page is sent to Vision.
+            if (format_label == "Excel"
+                    and get_nested(config, "parsing.xlsx.sheet_page_map.enabled", True)):
+                visible = parse_result.metadata.get("xlsx_visible_sheet_names")
+                if isinstance(visible, list) and visible:
+                    from .utils.xlsx_sheet_map import build_sheet_page_map
+                    sheet_map = build_sheet_page_map(pdf_files[0], visible)
+                    if sheet_map:
+                        parse_result.metadata["xlsx_sheet_page_map"] = sheet_map
+
             # Step 2: PDF → page images
             # Resolve target DPI from config (unified across all render paths)
             image_dpi = get_nested(config, "parsing.vision.image_dpi", 180)
@@ -2198,6 +2213,19 @@ def process_single_file(
             "suffix_format",        # only set when magika overrode the suffix
             "hidden_text",          # PDF-only doc-level flag
             "structured_extractions_per_page",  # hook-internal, pre-Vision
+            # xlsx-only file-level fields produced by docling_parser and
+            # utils.xlsx_sheet_map. They drive pipeline routing decisions
+            # (batched Vision trigger, connector hook page anchor, sheet→
+            # page mapping for any future sheet-aware code) and must STAY
+            # on parse_result.metadata so those consumers can read them.
+            # On chunks they're pure duplication — the sheet a chunk
+            # belongs to is already in metadata.sheet_name + .title_path;
+            # chunks don't need the whole-workbook map. Measured cost on
+            # a 13-sheet xlsx: ~295 KB of jsonl bloat (~17% of file size)
+            # for zero retrieval value.
+            "xlsx_sheet_page_map",
+            "xlsx_visible_sheet_names",
+            "xlsx_visible_sheet_count",
         })
         parse_meta_for_chunks = {
             k: v for k, v in parse_result.metadata.items()

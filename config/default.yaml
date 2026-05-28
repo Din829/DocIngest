@@ -444,6 +444,21 @@ parsing:
     # threshold) silently skip via HookNoOp without polluting lineage.
     extract_connector_data: true
 
+    # sheet → PDF page mapping via the LibreOffice PDF outline.
+    # LibreOffice's calc_pdf_Export emits a level-1 PDF bookmark per
+    # rendered sheet; pymupdf reads them and we resolve them back to
+    # openpyxl sheet names (normalising whitespace because LO trims
+    # trailing spaces and collapses internal runs in outline titles).
+    # The map is consumed by xlsx_connector (correct page anchor when
+    # sheet → multi-page) and future sheet-aware code.
+    # RECALL SAFETY: never used to skip work. Missing/partial map ⇒
+    # downstream falls back to legacy "1 sheet = 1 page" assumption.
+    # No Vision page is ever dropped because of this map.
+    # Disable only if pymupdf is unavailable or you observe mis-mapping
+    # on a specific corpus (in which case please open an issue).
+    sheet_page_map:
+      enabled: true
+
     # Render xlsx directly via openpyxl instead of routing through Docling.
     # Why this is the default: Docling's Excel backend renders all sheets
     # into one flat markdown stream and *misaligns* sheet headings against

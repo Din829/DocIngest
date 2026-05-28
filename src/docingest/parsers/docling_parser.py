@@ -900,6 +900,10 @@ class DoclingParser(BaseParser):
 
             sheet_sections: list[str] = []
             anchored_assets: set[str] = set()
+            # Visible sheet names in workbook order. Emitted into metadata
+            # so the pipeline's sheet→page mapping (utils.xlsx_sheet_map)
+            # can match PDF outline bookmarks back to openpyxl sheet names.
+            visible_sheet_names: list[str] = []
 
             for sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
@@ -908,6 +912,7 @@ class DoclingParser(BaseParser):
                 # hidden sheets varies; explicit skip keeps us predictable.)
                 if getattr(ws, "sheet_state", "visible") != "visible":
                     continue
+                visible_sheet_names.append(sheet_name)
 
                 row_to_assets: dict[int, list[str]] = {}
                 for anchor_info in anchors_by_sheet.get(sheet_name, []):
@@ -1025,6 +1030,11 @@ class DoclingParser(BaseParser):
                 # `pages` above (which is sheet_sections length) so future
                 # changes to either don't accidentally break the trigger.
                 "xlsx_visible_sheet_count": len(sheet_sections),
+                # Visible sheet names in workbook order — fed to
+                # utils.xlsx_sheet_map.build_sheet_page_map after the
+                # LibreOffice PDF render, so the resulting sheet→page map
+                # uses the same names downstream code reads from openpyxl.
+                "xlsx_visible_sheet_names": list(visible_sheet_names),
             }
             if extracted:
                 metadata["xlsx_embedded_images"] = extracted

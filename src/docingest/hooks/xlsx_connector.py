@@ -337,10 +337,21 @@ def xlsx_connector_hook(
     if total_edges == 0:
         raise HookNoOp("no connector relationships reconstructed")
 
-    # Convert sheet index → page number. For the common single-page-per-sheet
-    # case this is identity (sheet 1 = page 1). Multi-page-per-sheet (long
-    # 方眼紙 layouts) lands all edges on the FIRST page of that sheet — Vision
-    # for later pages still has the rendered image to fall back on.
+    # Convert sheet index → page number.
+    #
+    # Preferred source: parse_result.metadata["xlsx_sheet_page_map"], an
+    # accurate sheet_name → first_page_no dict built from the PDF outline
+    # in pipeline.py after LibreOffice render. When present we use it.
+    #
+    # Fallback (map absent OR specific sheet not in map OR sheet_idx out
+    # of range): identity mapping — sheet 1 → page 1. This is the same
+    # assumption this hook has used since day one; preserved verbatim so
+    # behaviour on map miss is byte-identical to pre-feature behaviour.
+    # Multi-page-per-sheet lands all edges on the FIRST page of that
+    # sheet; Vision for later pages still has the rendered image.
+    sheet_map = parse_result.metadata.get("xlsx_sheet_page_map") or {}
+    visible_sheets = parse_result.metadata.get("xlsx_visible_sheet_names") or []
+
     extractions: dict[int, str] = parse_result.metadata.setdefault(
         "structured_extractions_per_page", {}
     )
@@ -348,7 +359,10 @@ def xlsx_connector_hook(
         md_block = _format_edges_as_markdown(edges)
         if not md_block:
             continue
-        page_no = sheet_idx  # 1-based, identity mapping for 1 sheet = 1 page
+        page_no = sheet_idx  # default fallback (legacy 1 sheet = 1 page)
+        if isinstance(visible_sheets, list) and 1 <= sheet_idx <= len(visible_sheets):
+            sheet_name = visible_sheets[sheet_idx - 1]
+            page_no = sheet_map.get(sheet_name, sheet_idx)
         if page_no in extractions:
             extractions[page_no] = extractions[page_no] + "\n\n" + md_block
         else:
