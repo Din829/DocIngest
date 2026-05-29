@@ -189,6 +189,29 @@ def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
                 "scope": scope,
             })
 
+    # --- Image-handling safety: OCR off + no Vision = silent content loss ---
+    # With Docling OCR disabled (the default), image-only / scanned pages rely
+    # ENTIRELY on per-page Vision. If Vision is also off, OR no Vision API key
+    # is set, those pages produce no text at all — silent loss. Surface loudly.
+    results["image_warning"] = None
+    if config is not None:
+        from .config import get_nested
+        ocr_on = bool(get_nested(config, "parsing.ocr.enabled", True))
+        vision_on = bool(get_nested(config, "parsing.vision.enabled", True))
+        has_vision_key = bool(
+            results["api_keys"].get("GEMINI_API_KEY", {}).get("set")
+            or results["api_keys"].get("OPENAI_API_KEY", {}).get("set")
+        )
+        if not ocr_on and (not vision_on or not has_vision_key):
+            reason = ("Vision is disabled" if not vision_on
+                      else "no GEMINI_API_KEY / OPENAI_API_KEY is set")
+            results["image_warning"] = (
+                f"Docling OCR is OFF and {reason} — image-only / scanned pages "
+                f"will produce NO text (silent content loss). Fix: set a Vision "
+                f"API key, or set parsing.ocr.enabled=true to fall back to "
+                f"Docling OCR."
+            )
+
     return results
 
 
@@ -270,6 +293,12 @@ def print_doctor(results: dict[str, Any]) -> None:
             state = "[yellow]ON[/yellow]" if sw["enabled"] else "[green]off[/green]"
             table5.add_row(sw["path"], state, sw["scope"], sw["when_on"])
         console.print(table5)
+
+    # Image-handling warning — OCR off + no Vision means scanned/image pages
+    # silently yield nothing. Print prominently, above the core-deps summary.
+    img_warn = results.get("image_warning")
+    if img_warn:
+        console.print(f"\n[bold red]⚠ Image handling:[/bold red] {img_warn}")
 
     # Summary
     core_ok = all(v["ok"] for v in results["core"].values())

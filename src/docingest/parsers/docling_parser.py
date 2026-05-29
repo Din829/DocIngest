@@ -181,7 +181,13 @@ class DoclingParser(BaseParser):
 
         # OCR
         ocr_cfg = get_nested(self.config, "parsing.ocr", {})
-        pipeline_options.do_ocr = True
+        # do_ocr is config-driven (default True = backward compatible). Docling's
+        # built-in OCR (RapidOCR/EasyOCR) only fills image-only regions; on docs
+        # whose image content is already handled by per-page Vision it is
+        # redundant, and with a CJK-mismatched default model (RapidOCR ships a
+        # Chinese model) it actively corrupts Japanese into Simplified-Chinese
+        # garbage. Callers disable it via parsing.ocr.enabled.
+        pipeline_options.do_ocr = bool(ocr_cfg.get("enabled", True))
         if ocr_cfg.get("force", False):
             # Force OCR: bypass text layer, useful for broken PDFs
             # Attribute name varies by Docling version
@@ -714,6 +720,35 @@ class DoclingParser(BaseParser):
         )) / get_nested(self.config, "output.assets_dir", "assets")
         assets_dir.mkdir(parents=True, exist_ok=True)
 
+        # Per-page picture count — an OCR-independent "this page has visual
+        # content" signal for triage (see PageData.num_pictures and pipeline's
+        # _should_skip_vision). Two complementary sources, OR'd per page:
+        #   1. Docling picture elements (works for any format Docling parses).
+        #   2. (PDF only) fitz embedded-image count — catches images Docling's
+        #      layout pass does NOT register as pictures (figures that used to
+        #      surface only via OCR garble). Verified necessary: Docling missed
+        #      several image pages that fitz sees.
+        pic_per_page: dict[int, int] = {}
+        for _pic in getattr(doc, "pictures", None) or []:
+            _prov = getattr(_pic, "prov", None)
+            if _prov:
+                _pn = _prov[0].page_no
+                pic_per_page[_pn] = pic_per_page.get(_pn, 0) + 1
+        if file_path.suffix.lower() == ".pdf":
+            # file_path is always the real PDF here — no pre-parse hook rewrites
+            # PDFs (the OMML hook targets DOCX), so reading it directly matches
+            # what Docling parsed.
+            try:
+                import fitz
+                _fdoc = fitz.open(file_path)
+                for _i, _pg in enumerate(_fdoc, start=1):
+                    _n = len(_pg.get_images())
+                    if _n:
+                        pic_per_page[_i] = max(pic_per_page.get(_i, 0), _n)
+                _fdoc.close()
+            except Exception as e:
+                logger.debug(f"fitz per-page image count failed: {e}")
+
         for page_no, page in doc.pages.items():
             # Extract per-page text via Docling
             page_text = ""
@@ -744,6 +779,7 @@ class DoclingParser(BaseParser):
                 page_no=page_no,
                 text=page_text,
                 image_path=image_path,
+                num_pictures=pic_per_page.get(page_no, 0),
             ))
 
         # Extract embedded images from xlsx zip (xl/media/)

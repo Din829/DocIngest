@@ -1100,6 +1100,14 @@ def _should_skip_vision(
     if "<!-- image -->" in text:
         return False
 
+    # Page carries picture elements (Docling figures or, for PDF, embedded
+    # images detected by fitz) → Vision must describe them. This is the
+    # OCR-INDEPENDENT image signal: without it, "invisible image pages" — a
+    # figure Docling did not render as <!-- image --> and whose ONLY previous
+    # trigger was OCR garble — get wrongly skipped once Docling OCR is off.
+    if getattr(page_data, "num_pictures", 0) > 0:
+        return False
+
     # Has structured data (e.g. PPTX chart) → Vision describes surrounding visuals
     if structured_per_page.get(page_data.page_no):
         return False

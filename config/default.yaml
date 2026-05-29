@@ -102,7 +102,20 @@ parsing:
 
   # OCR settings (auto-triggered for scanned documents)
   ocr:
-    engine: "auto"            # auto | easyocr | tesseract | rapidocr
+    # Docling's built-in OCR (RapidOCR/EasyOCR). Per-page Vision already reads
+    # image content far more accurately; Docling's default RapidOCR model is
+    # Chinese, so on Japanese / other-language image PDFs it emits
+    # Simplified-Chinese garbage that pollutes output AND wastes time (~16x
+    # slower on image-heavy pages). Disable to let Vision own all image
+    # reading. Safe to disable because triage now sends every page carrying
+    # picture elements to Vision via an OCR-independent signal
+    # (PageData.num_pictures). Keep true only when processing scanned PDFs
+    # WITHOUT a Vision provider configured. `doctor` warns if you disable OCR
+    # without a Vision key (image-only pages would then yield nothing).
+    enabled: false            # false (default): Vision-only, Docling OCR off.
+                              # true: re-enable Docling OCR (scanned PDFs when
+                              # no Vision provider is configured).
+    engine: "auto"            # auto | easyocr | tesseract | rapidocr (used only when enabled)
     languages: ["eng", "jpn", "chi_sim"]
     force: false              # true: force OCR even on text-layer PDFs
 

@@ -26,6 +26,12 @@ class PageData:
     page_no: int
     text: str              # Docling-extracted text for this page
     image_path: str = ""   # Path to saved page image (for Vision)
+    num_pictures: int = 0  # Visual-element count on this page: Docling picture
+                           # elements + (PDF) fitz embedded-image count. An
+                           # OCR-INDEPENDENT signal for triage — guarantees an
+                           # image page is never skipped for Vision just because
+                           # Docling's OCR is off (no garble to trip the
+                           # garble-detection layers). Default 0.
 
 
 @dataclass
