@@ -55,6 +55,16 @@ try:
 except ImportError:
     pass
 
+# `docingest skills list` — the machine-readable counterpart to the refine
+# `--skill` flag's help text. Lets any consumer (agent / system integration)
+# discover the available refine styles without reading the prompt bodies.
+skills_app = typer.Typer(
+    name="skills",
+    help="List the refine SKILLs available to `docingest refine --skill`.",
+    no_args_is_help=True,
+)
+app.add_typer(skills_app, name="skills")
+
 console = Console()
 # Dedicated stderr console for banners, progress, and errors. Keeps stdout
 # clean for `--json` consumers (agents / subprocess callers) without
@@ -421,6 +431,14 @@ def _print_results(result) -> None:
                 f"[red]{u}[/red] unreadable "
                 f"(score: {score:.2f})"
             )
+            console.print(
+                "  [dim]Score is informational only — a heuristic marker "
+                "count, not a parse-failure signal. A low score is often the "
+                "source itself being unreadable (blur, stamps/watermarks, "
+                "shrunk-down screenshots, handwriting) that even a human "
+                "couldn't recover; Vision honestly flagged it rather than "
+                "guessing.[/dim]"
+            )
             # Show top 3 files with most issues for quick triage
             files_with_issues = quality.get("files", [])
             if files_with_issues:
@@ -661,6 +679,43 @@ def refine_cmd(
                 console.print(f"  {Path(r['source']).name}: {r['warning']}")
 
     console.print(f"\n[green]Refined: {refined_count}[/green] / {len(results)} files\n")
+
+
+@skills_app.command("list")
+def skills_list_cmd(
+    config_file: Optional[Path] = typer.Option(
+        None, "-c", "--config", help="Path to project config YAML."
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the listing as JSON to stdout."),
+) -> None:
+    """List the refine SKILLs `docingest refine --skill <name>` can use.
+
+    These are bare prompt files (`skills/*.SKILL.md`), consumed internally
+    by `refine` as the system prompt — they are NOT Claude Code skills you
+    invoke directly. This command is the machine-readable index of which
+    refine styles exist; `--json` is for SDK agents / system integrations.
+    """
+    from .refine import list_refine_skills
+
+    config = _load_config_or_exit(project_config_path=config_file)
+    skills = list_refine_skills(config)
+
+    if as_json:
+        import json
+        # Plain print() — JSON is machine output, must not be Rich-rendered.
+        print(json.dumps({"refine_skills": skills}, ensure_ascii=False, indent=2))
+        return
+
+    if not skills:
+        err_console.print("[yellow]No refine SKILLs found under skills/.[/yellow]")
+        return
+
+    table = Table(title="Refine SKILLs (docingest refine --skill <name>)")
+    table.add_column("Skill", style="bold")
+    table.add_column("Summary (first line of the prompt)")
+    for s in skills:
+        table.add_row(s["name"], s["summary"])
+    console.print(table)
 
 
 if __name__ == "__main__":

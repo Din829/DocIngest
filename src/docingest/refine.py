@@ -54,6 +54,40 @@ def _load_skill(skill_name: str, config: dict[str, Any]) -> str:
     )
 
 
+def list_refine_skills(config: dict[str, Any]) -> list[dict[str, str]]:
+    """List the refine SKILLs discoverable in the same two locations
+    `_load_skill` searches: the project-local `skills/` dir (CWD) wins over
+    the package-bundled one on a name clash.
+
+    Each entry is `{name, summary, path}`. `summary` is the SKILL's first
+    non-empty line — these files are bare prompts (no frontmatter), and the
+    opening line states the role ("You are a document formatting
+    specialist..."), which is enough for a consumer to pick a skill.
+
+    Returned so `docingest skills list` and any programmatic consumer can
+    discover the refine styles without reading the prompt bodies.
+    """
+    skills_dir_name = get_nested(config, "refine.skills_dir", "skills")
+    package_root = Path(__file__).resolve().parent.parent.parent
+    search_dirs = [Path.cwd() / skills_dir_name, package_root / skills_dir_name]
+
+    found: dict[str, dict[str, str]] = {}
+    for directory in search_dirs:
+        if not directory.is_dir():
+            continue
+        for skill_md in sorted(directory.glob("*.SKILL.md")):
+            name = skill_md.name[: -len(".SKILL.md")]
+            if name in found:  # project-local already won
+                continue
+            summary = ""
+            for line in skill_md.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    summary = line.strip()
+                    break
+            found[name] = {"name": name, "summary": summary, "path": str(skill_md)}
+    return list(found.values())
+
+
 # ---------------------------------------------------------------------------
 # Single file refine
 # ---------------------------------------------------------------------------

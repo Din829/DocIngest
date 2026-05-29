@@ -17,8 +17,13 @@ DocIngest converts any document into clean Markdown (`sources/*.md`), chunked te
 (`knowledge_search.SKILL.md`). It does **no** embeddings, **no** vector search, **no**
 answer generation — you retrieve over its output with your own tools.
 
-Same capability is reachable three ways. This table is the single source of truth;
-pick the channel that matches how you're calling DocIngest.
+> Note: `knowledge_search.SKILL.md` is a **generated search guide you Read**, not a
+> Claude Code skill you invoke. It lives in the output dir, not in any skill path, so
+> it's never auto-injected — the `.SKILL.md` name is historical.
+
+Same capability is reachable three ways. The command tables below are a reading guide;
+the **source of truth for flags is `docingest <cmd> --help`** (and `docingest skills list`
+for the refine styles) — when in doubt, run those rather than trusting this copy.
 
 ## CLI commands (`docingest <cmd>`)
 
@@ -28,6 +33,7 @@ pick the channel that matches how you're calling DocIngest.
 | `inspect` | Estimate size/pages/cost — **no parsing** | ALWAYS first for large/unknown/expensive inputs (Vision is 1 API call per page). Skip only for a few small text files. | `--json`; `-c/--config` |
 | `refine` | Rewrite a Markdown file into a human-readable version | ONLY when the user wants a readable/published version. **NOT** a RAG step — RAG consumes the raw `sources/*.md`. | `--skill refine_default\|refine_faithful\|refine_html`; `-o/--output`; `-c/--config` |
 | `doctor` | Check environment: packages, external tools, API keys | After install, or when something fails unexpectedly. | (none) |
+| `skills list` | List the refine SKILLs `refine --skill` can use | When unsure which refine style fits; `--json` for programmatic discovery. | `--json` |
 
 ## graph subcommands (`docingest graph <cmd>`) — opt-in
 

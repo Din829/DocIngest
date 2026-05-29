@@ -18,6 +18,7 @@ Per-flag detail: `docingest <cmd> --help`.
 | `inspect` | Estimate size/pages/cost — no parsing | ALWAYS first for large/unknown inputs (Vision = 1 call/page) | `--json` |
 | `refine` | Markdown → human-readable copy | Only when user wants a readable version; NOT a RAG step | `--skill refine_default\|refine_faithful\|refine_html`; `-o` |
 | `doctor` | Check env / deps / API keys | After install or on failure | (none) |
+| `skills list` | List the refine SKILLs `refine --skill` can use (name + summary) | When unsure which refine style fits; `--json` for programmatic discovery | `--json` |
 
 **graph** (`docingest graph <cmd>`, needs `[graph]`, pricier than Vision — only for "X↔Y relationships" / corpus-wide themes / multi-hop; for single facts your Grep on `sources/*.md` is cheaper)
 
