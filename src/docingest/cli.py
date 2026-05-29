@@ -32,7 +32,14 @@ from .pipeline import run_pipeline
 
 app = typer.Typer(
     name="docingest",
-    help="Universal document preprocessing for RAG and Agentic Search.",
+    help=(
+        "Universal document preprocessing for RAG and Agentic Search.\n\n"
+        "Commands: run (docs -> Markdown+chunks+index) | inspect (cost preflight, "
+        "no parsing) | refine (human-readable copy) | doctor (env check) | "
+        "graph (build/query/status/enrich a knowledge graph; needs [graph]).\n"
+        "Run `docingest <cmd> --help` for flags. JSON -> stdout, banner -> stderr; "
+        "exit 0 ok / 1 fail / 2 safety abort."
+    ),
     add_completion=False,
     invoke_without_command=True,
 )
@@ -138,10 +145,10 @@ def main(
         False,
         "-y", "--yes", "--acknowledge-large",
         help=(
-            "Proceed even when safety (strict mode) would abort the run due "
-            "to oversized files or over-budget per-run totals. Use after "
-            "reviewing the estimate; in warn mode (default) this flag is "
-            "a no-op."
+            "Proceed even when safety (strict mode, the default) would "
+            "abort the run due to oversized files or over-budget per-run "
+            "totals. Use after reviewing the estimate; in warn mode this "
+            "flag is a no-op."
         ),
     ),
     json_output: bool = typer.Option(
@@ -371,7 +378,7 @@ def _print_results(result) -> None:
     safety = getattr(result, "safety", None) or {}
     if safety.get("violations"):
         n = len(safety["violations"])
-        mode = safety.get("mode", "warn")
+        mode = safety.get("mode", "strict")
         aborted = safety.get("aborted", False)
         color = "red" if aborted else "yellow"
         status = "ABORTED — nothing was processed" if aborted else "proceeding"

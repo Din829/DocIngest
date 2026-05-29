@@ -53,6 +53,11 @@ mcp = FastMCP(
         "- inspect(paths)              — pre-flight cost estimate, NO parsing\n"
         "- run(paths, output_dir)      — do the actual preprocessing\n"
         "- refine(files)               — OPTIONAL AI polish for humans\n"
+        "- build_graph / query_graph / graph_status / enrich_chunks\n"
+        "                              — OPTIONAL GraphRAG layer ([graph] extra);\n"
+        "                                only for themes / relationships / multi-hop\n"
+        "                                questions — pricier than Vision. For single-\n"
+        "                                fact lookup, native Grep on sources/*.md wins.\n"
         "\n"
         "Searching / reading the knowledge base is NOT exposed as an MCP\n"
         "tool by design — use your own native Grep / Read / Glob on the\n"
@@ -348,7 +353,7 @@ def refine(
       optional human track.
     - Do NOT refine large files blindly: the LLM call cost scales with
       input tokens. The tool auto-skips files beyond
-      refine.max_input_tokens (default 8000) — check `skipped` in the
+      refine.max_input_tokens (default 50000) — check `skipped` in the
       result and respond to user with a clear reason.
 
     SKILL CHOICE
@@ -358,6 +363,9 @@ def refine(
     - "refine_faithful": preserves original wording EXACTLY, only
       removes duplicates and fixes layout. Use for legal / contractual /
       compliance documents where paraphrasing is unacceptable.
+    - "refine_html": same word-for-word fidelity as refine_faithful, but
+      emits an HTML5 fragment (.html) instead of Markdown. Use when the
+      output is embedded in a web page.
 
     TYPICAL WORKFLOW
         # User: "clean up the contract doc for sharing"

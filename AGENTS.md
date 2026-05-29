@@ -1,55 +1,59 @@
 # AGENTS.md
 
-DocIngest = 文档前处理引擎。任意输入（PDF / Office / HTML / 图像 / 音视频 / ZIP / URL）→ Markdown + chunks + 索引。
-**不做检索、不做 embedding、不做答案生成。**
+DocIngest = document preprocessing engine. Any input (PDF / Office / HTML /
+images / audio / video / ZIP / URLs) → Markdown + chunks + index.
+**No retrieval, no embeddings, no answer generation** — it prepares data; you
+search it with your own Grep/Read on `sources/*.md` or vector search on `chunks.jsonl`.
 
-## 30 秒上手
+## Command catalog — read this before you start
+
+Same table as `.claude/skills/docingest/SKILL.md` (single source of truth).
+Per-flag detail: `docingest <cmd> --help`.
+
+**CLI** (`docingest <cmd>`)
+
+| Command | What it does | When | Key flags |
+|---|---|---|---|
+| `run` | Docs → Markdown + chunks + index | Main command; after `inspect` for big inputs. Re-running same `-o` is cheap. | `-o` (REQUIRED for multi-input); `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet`; `--parallel N`; `--force`; `-y/--yes`; `--json`; `-v` |
+| `inspect` | Estimate size/pages/cost — no parsing | ALWAYS first for large/unknown inputs (Vision = 1 call/page) | `--json` |
+| `refine` | Markdown → human-readable copy | Only when user wants a readable version; NOT a RAG step | `--skill refine_default\|refine_faithful\|refine_html`; `-o` |
+| `doctor` | Check env / deps / API keys | After install or on failure | (none) |
+
+**graph** (`docingest graph <cmd>`, needs `[graph]`, pricier than Vision — only for "X↔Y relationships" / corpus-wide themes / multi-hop; for single facts your Grep on `sources/*.md` is cheaper)
+
+| Command | What it does | Key flags |
+|---|---|---|
+| `build` | Build knowledge graph on `chunks.jsonl` | `--mode vector_only\|full`; `--force`; `--enrich-chunks` |
+| `query` | Ask the graph | `--kb`; `--mode naive\|local\|global\|hybrid\|mix`; `--top-k` |
+| `status` | Is a graph built? + counts | `--json` |
+| `enrich` | Replay graph entities → `chunks_enriched.jsonl` (no LLM) | `--json` |
+
+**MCP** (`python -m docingest.mcp_server`) — 7 tools, same behaviour:
+`inspect` · `run` · `refine` · `build_graph` · `query_graph` · `graph_status` · `enrich_chunks`
+(the 4 graph tools need `[graph]`; `graph_status` takes no `config_overrides`).
+
+**Conventions (all commands)**: JSON→stdout, banner/errors→stderr · exit `0` ok / `1` fail / `2` safety abort · `run` is incremental (avoid `--force`) · fine-grained output control: Python API `outputs=[...]`, CLI/MCP use `--no-chunks` or `config_overrides`.
+
+## Quick start
 
 ```bash
-pip install -e ".[mcp]"
-cp .env.example .env          # 填 GEMINI_API_KEY / DASHSCOPE_API_KEY
-docingest doctor              # 体检：缺什么依赖一目了然
+pip install -e ".[mcp]"     # core + MCP server; add ,nlp,audio,graph as needed
+cp .env.example .env        # fill GEMINI_API_KEY / DASHSCOPE_API_KEY
+docingest doctor            # checks deps, tools, API keys
 docingest run ./docs/ -o ./knowledge/
 ```
 
-## 怎么调
+## Workflow
 
-| 通道 | 入口 | 何时用 |
-|---|---|---|
-| CLI | `docingest run / inspect / refine / doctor` | 命令行直接跑；`--json` 输出给 agent / 子进程消费 |
-| Python 库 | `import docingest; docingest.ingest(...)` | 嵌入到别的 Python 项目 |
-| MCP server | `python -m docingest.mcp_server` | Claude Desktop / Code / Cursor 等通过 MCP 调用 |
+For unknown / large inputs, **inspect for cost first, then run**:
 
-## Agent 工作流
+1. `inspect(paths)` → check `est_cost_usd` and `recommendation`
+2. `run(paths, output_dir)` → process (incremental; second run hits cache, seconds)
+3. Browse outputs: `index.json` (file list) → `sources/*.md` (grep/read) → `chunks.jsonl` (downstream RAG)
+4. Optional: `refine(files, skill="refine_faithful")` → human-readable copy
 
-未知 / 大文件 → **先 inspect 看成本，再 run**：
+**On safety abort** (`safety.mode=strict` flags an over-budget run): report the
+violation summary to the user FIRST — don't blindly retry with `--yes` /
+`acknowledge_large=True`.
 
-1. `inspect(paths)` → 看 `est_cost_usd` 和 `recommendation`
-2. `run(paths, output_dir)` → 实际处理（默认增量，二次跑命中缓存秒级）
-3. 浏览产物：`index.json`（文件清单）→ `sources/*.md`（grep / read）→ `chunks.jsonl`（喂下游 RAG）
-4. 可选：`refine(files, skill="refine_faithful")` → 给人看的版本
-
-## 重要习惯
-
-- Vision 是最大成本来源——**每页一次 API 调用**。大文件先 `inspect`。
-- `run` 默认增量。没真有理由（改了 chunking 策略且 cache 没自动失效）别用 `--force`。
-- `safety.mode=strict` 触发 abort 时，**先把 violation 报告给用户**，不要盲目 `--yes` 重试。
-- `sources/*.md` 是 RAG / agentic search 的真源；`refine` 只为人可读，**不是** RAG 流水线的一步。
-- CLI 子进程消费：`docingest run --json` / `inspect --json` 把 JSON 写 stdout，banner 走 stderr。
-
-## GraphRAG 层（可选，opt-in）
-
-主流程不动；用户主动调才生效。**只在用户问"主题/关系/多跳"类问题时考虑**——比 Vision 还贵。
-
-| 何时用 graph | 何时不用 |
-|---|---|
-| "X 和 Y 的关系" | "X 是什么" → 普通 RAG / grep 更便宜 |
-| "整个语料的主题" | 单一事实查找 |
-| 跨文档关联推理 | 同一文档内信息提取 |
-
-四个 MCP 工具：`build_graph` / `query_graph` / `graph_status` / `enrich_chunks`。装 `pip install -e ".[graph]"` 才出现。
-
-典型流：`graph_status` → 未建则 `build_graph`（一次性烧钱，几分钟）→ `query_graph(mode="hybrid")`。
-想让传统向量 RAG 也吃图的红利：`enrich_chunks` 生成 `chunks_enriched.jsonl`，原 chunks.jsonl 不动。
-
-完整功能、配置、Python API、MCP 客户端配置见 [README.md](README.md)。
+Full features, config, Python API, MCP client setup: [README.md](README.md).

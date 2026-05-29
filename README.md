@@ -114,8 +114,8 @@ Options:
 ```
 -o, --output PATH    Output directory (default: ./knowledge/<input-name>/ for single input, ./knowledge/ for mixed)
 -c, --config PATH    Project config YAML
---strategy TEXT      Override chunking strategy: auto | heading | recursive
-                     (auto picks slide/sheet/timestamp/whole by file format)
+--strategy TEXT      Override chunking strategy: auto | heading | recursive | slide | sheet
+                     (auto picks heading/recursive/slide/sheet/timestamp/whole by file format)
 --no-chunks          Only output Markdown, skip chunks.jsonl
 --parallel INTEGER   Worker count for Vision API calls and ASR segmentation
                      (file-level parallelism is not yet implemented)
@@ -283,7 +283,8 @@ pip install -e ".[mcp]"
 **Run:**
 ```bash
 python -m docingest.mcp_server                    # stdio (Claude Desktop, Claude Code, VS Code Copilot)
-python -m docingest.mcp_server --transport sse    # SSE (web clients)
+python -m docingest.mcp_server --transport http   # Streamable HTTP (web clients — recommended)
+python -m docingest.mcp_server --transport sse    # SSE (legacy in fastmcp v3; kept for back-compat)
 ```
 
 **Available tools** (every tool accepts optional `config_overrides` for dynamic behavior). Tools that process documents route through the public Python facade so MCP and library callers always share the same behaviour:
