@@ -73,8 +73,21 @@ def test_mixed_content():
     assert "Our performance" in all_text
     print("  Quote present  OK")
 
-    # Title paths
-    paths = [c.metadata.get("title_path", "") for c in chunks]
+    # Title paths — verify per-section title_path tracking.
+    # The default config has chunking.heading.merge_small_sections=True, which
+    # (correctly, by design — see config/default.yaml) folds this tiny 135-token
+    # doc's seven sub-sections into a single chunk, so no individual section's
+    # title_path survives. To test the title_path machinery itself we disable
+    # that merge for this assertion only, exercising hard section boundaries.
+    import copy
+    cfg_no_merge = copy.deepcopy(config)
+    cfg_no_merge.setdefault("chunking", {}).setdefault("heading", {})[
+        "merge_small_sections"
+    ] = False
+    section_chunks = AutoChunker(cfg_no_merge).chunk(
+        mixed_doc, {"source": "mixed.md", "format": "md"}
+    )
+    paths = [c.metadata.get("title_path", "") for c in section_chunks]
     assert any("Data Section" in p for p in paths)
     assert any("Conclusion" in p for p in paths)
     print("  Title paths correct  OK")
