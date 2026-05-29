@@ -209,9 +209,104 @@ _PROVIDER_EXTRA_ENV_MAP: dict[str, dict[str, str]] = {
     },
 }
 
+# Cloud-provider extra fields → the litellm.completion() keyword argument that
+# carries them. Same shape as _PROVIDER_EXTRA_ENV_MAP above, but mapping to
+# litellm CALL PARAMETERS instead of process env vars. This is what the
+# concurrency-safe path (_resolve_call_credentials) uses: credentials travel
+# as per-call kwargs and never touch global os.environ, so concurrent calls in
+# a long-running host (web server / worker) with different keys can't clobber
+# each other's credentials. Field names are the keys downstream Provider
+# classes put into model_config (see to_model_config in providers.py); kwarg
+# names follow litellm's own contract
+# (https://docs.litellm.ai/docs/providers/<provider>).
+#
+# vertex_credentials maps to litellm's vertex_credentials kwarg, which accepts
+# BOTH a filepath AND a raw JSON string — strictly more capable than the env
+# path (GOOGLE_APPLICATION_CREDENTIALS, filepath only) that _set_api_key uses.
+_PROVIDER_EXTRA_ARG_MAP: dict[str, dict[str, str]] = {
+    "azure": {
+        "api_base": "api_base",
+        "api_version": "api_version",
+    },
+    "bedrock": {
+        "aws_access_key_id": "aws_access_key_id",
+        "aws_secret_access_key": "aws_secret_access_key",
+        "aws_region_name": "aws_region_name",
+        "aws_session_token": "aws_session_token",
+        "aws_profile_name": "aws_profile",
+    },
+    "vertex_ai": {
+        "vertex_project": "vertex_project",
+        "vertex_location": "vertex_location",
+        "vertex_credentials": "vertex_credentials",
+    },
+}
+
+
+def _resolve_call_credentials(model_config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Resolve a model entry's credentials into per-call litellm kwargs.
+
+    Returns a dict to splat into ``litellm.completion(**creds)``. Unlike the
+    legacy ``_set_api_key`` (which mutates global ``os.environ`` and therefore
+    races under concurrency), this keeps every credential local to the single
+    call — two concurrent ``ingest()`` calls in the same process, each using a
+    different API key, cannot clobber each other. This is the path all three
+    production call sites (describe_image / describe_images_batched /
+    text_completion) use.
+
+    Resolution:
+
+    1. **Primary ``api_key``** — only emitted when the caller put a plaintext
+       ``api_key`` in model_config (the Provider-object injection path). It is
+       passed as litellm's ``api_key`` kwarg directly; no env var name is
+       needed because litellm's kwarg overrides env lookup. Vertex AI is the
+       one exception (no api_key concept) — its ``api_key`` field, if set, is
+       ignored here and auth flows entirely through the extra fields below.
+
+    2. **Cloud-provider extras** (Azure endpoint/version, AWS creds/region,
+       Vertex project/location/credentials) — every field the caller actually
+       set is mapped to its litellm kwarg via ``_PROVIDER_EXTRA_ARG_MAP``.
+       Missing/empty fields are skipped, so a caller relying on ambient cloud
+       credentials (container IAM role, gcloud ADC, ~/.aws/config) gets an
+       empty dict and litellm falls through to its own discovery.
+
+    **Backward compatibility:** when model_config carries NO plaintext
+    credentials (the classic env-var / .env / ``api_key_env`` path), this
+    returns ``{}`` and litellm reads from the environment exactly as before —
+    no behaviour change for existing deployments.
+    """
+    provider = str(model_config.get("provider", "")).lower()
+    creds: dict[str, Any] = {}
+
+    # Cloud extras (api_base / aws_* / vertex_*) → call kwargs.
+    for field_name, kwarg in _PROVIDER_EXTRA_ARG_MAP.get(provider, {}).items():
+        value = model_config.get(field_name)
+        if value:
+            creds[kwarg] = value
+
+    # Primary api_key. Vertex has no api_key concept (see provider docstring),
+    # so we never forward it there — auth is via vertex_* / ADC above.
+    explicit = model_config.get("api_key")
+    if explicit and provider != "vertex_ai":
+        creds["api_key"] = explicit
+
+    return creds
+
 
 def _set_api_key(model_config: dict[str, Any]) -> None:
     """
+    DEPRECATED for the production call path — kept only for backward
+    compatibility (existing unit tests + any external importers) and because
+    ``audio_provider`` reuses ``_PROVIDER_TO_ENV_KEY``. The library's own
+    Vision / text-completion calls now use :func:`_resolve_call_credentials`,
+    which passes credentials as per-call kwargs and is concurrency-safe.
+
+    Mutating global ``os.environ`` (what this function does) races when several
+    calls with different keys run concurrently in one process; prefer
+    ``_resolve_call_credentials``. This shim is retained verbatim so its
+    documented write-to-env contract is unchanged.
+
     Mirror the model entry's credential fields to the env vars litellm reads.
 
     Two parallel paths:
@@ -310,7 +405,9 @@ def describe_image(
     last_error = None
 
     for model_entry in models_to_try:
-        _set_api_key(model_entry)
+        # Per-call credentials as kwargs (concurrency-safe — no os.environ
+        # mutation). Empty dict when the caller uses the env/.env path.
+        call_creds = _resolve_call_credentials(model_entry)
         model_name = _resolve_model_name(
             model_entry["provider"],
             model_entry["model"],
@@ -321,6 +418,7 @@ def describe_image(
                 messages=messages,
                 max_tokens=effective_max_tokens,
                 num_retries=effective_num_retries,
+                **call_creds,
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content
@@ -420,7 +518,9 @@ def describe_images_batched(
     last_error = None
 
     for model_entry in models_to_try:
-        _set_api_key(model_entry)
+        # Per-call credentials as kwargs (concurrency-safe — no os.environ
+        # mutation). Empty dict when the caller uses the env/.env path.
+        call_creds = _resolve_call_credentials(model_entry)
         model_name = _resolve_model_name(
             model_entry["provider"],
             model_entry["model"],
@@ -431,6 +531,7 @@ def describe_images_batched(
                 messages=messages,
                 max_tokens=effective_max_tokens,
                 num_retries=effective_num_retries,
+                **call_creds,
             )
             _record_usage(response, model_name)
             content_out = response.choices[0].message.content
@@ -506,7 +607,9 @@ def text_completion(
     last_error = None
 
     for model_entry in models_to_try:
-        _set_api_key(model_entry)
+        # Per-call credentials as kwargs (concurrency-safe — no os.environ
+        # mutation). Empty dict when the caller uses the env/.env path.
+        call_creds = _resolve_call_credentials(model_entry)
         model_name = _resolve_model_name(
             model_entry["provider"],
             model_entry["model"],
@@ -517,6 +620,7 @@ def text_completion(
                 messages=messages,
                 max_tokens=effective_max_tokens,
                 num_retries=effective_num_retries,
+                **call_creds,
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content

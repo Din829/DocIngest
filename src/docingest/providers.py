@@ -310,6 +310,9 @@ __all__ = [
     "GeminiProvider",
     "OpenAIProvider",
     "AnthropicProvider",
+    "AzureOpenAIProvider",
+    "BedrockProvider",
+    "VertexAIProvider",
     "DashScopeProvider",
     "WhisperProvider",
 ]
