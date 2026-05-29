@@ -250,7 +250,10 @@ docingest.ingest("./docs/", output="./kb/", on_progress=on_event)
 | `index` | `"index"` in outputs | content of `index.json` |
 | `knowledge_map` | `"knowledge_map"` in outputs | parsed `knowledge_map.yaml` |
 | `quality_report` | `"quality_report"` in outputs | parsed `quality_report.json` |
-| `stats` | always | `total_files`, `successful`, `failed`, `token_usage`, `errors`, `safety`, ... |
+| `stats` | always | `total_files`, `successful`, `failed`, `token_usage`, `errors`, `warnings`, `quality`, `safety`, `interrupted` |
+| `output_dir` | always | absolute path the run wrote to (handy for later CLI ops) |
+
+(`run_log` is a valid `outputs=` value — it toggles writing `log.md` on disk — but it is not a field on `IngestResult`; the run history lives in the file, not the return object.)
 
 **API stability** — only names re-exported from `docingest/__init__.py` are public. Internal modules (`docingest.pipeline`, `docingest.parsers`, `docingest.chunkers`, hooks, output writers) may change between minor versions.
 

@@ -181,8 +181,12 @@ def refine_single(
 
     # Write output — subdirectory per skill to avoid overwrite
     readable_dir_name = get_nested(config, "refine.output_dir", "readable")
-    # Strip "refine_" prefix for cleaner directory names
-    skill_short = skill_name.removeprefix("refine_") if skill_name else "default"
+    # Strip "refine_" prefix for cleaner directory names. Use the RESOLVED
+    # `skill` (which already fell back to refine.default_skill when skill_name
+    # is None), not the raw skill_name argument — otherwise a knowledge base
+    # configured with default_skill=refine_html but invoked without --skill
+    # would land in readable/default/*.md instead of readable/html/*.html.
+    skill_short = skill.removeprefix("refine_")
     readable_dir = output_dir / readable_dir_name / skill_short
     readable_dir.mkdir(parents=True, exist_ok=True)
 
