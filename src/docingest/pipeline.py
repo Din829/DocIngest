@@ -2536,7 +2536,7 @@ def run_pipeline(
     #   strict — refuse unless acknowledge_large=True.
     # Any failure inside the safety module is swallowed (see safety.py's
     # try/except wrappers) so a Phase 0 bug can never block the pipeline.
-    safety_mode = str(get_nested(config, "safety.mode", "warn") or "warn").lower()
+    safety_mode = str(get_nested(config, "safety.mode", "strict") or "strict").lower()
     safety_enabled = get_nested(config, "safety.enabled", True)
     if safety_enabled and safety_mode != "off":
         try:

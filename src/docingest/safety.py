@@ -7,8 +7,9 @@ a structured violation report. Callers (run_pipeline) decide what to do
 with it based on safety.mode:
 
   off    — Phase 0 is skipped entirely (legacy behaviour).
-  warn   — log violations, keep running (default).
-  strict — refuse to run unless the caller passes acknowledge_large=True.
+  warn   — log violations, keep running.
+  strict — (default) refuse to run unless the caller passes
+           acknowledge_large=True (Python / MCP) or --yes (CLI).
 
 Design principles
 -----------------

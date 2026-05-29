@@ -273,6 +273,35 @@ result = run_pipeline([Path("./docs")], config, parser, chunker)
 print(f"{result.successful}/{result.total_files} files, {result.total_chunks} chunks")
 ```
 
+### How agents discover commands
+
+One command catalog (CLI / graph / MCP, three sections) is the single source of
+truth, surfaced on every channel an agent enters through — so it sees the full
+command set no matter how it calls DocIngest:
+
+- **Agent Skill** `.claude/skills/docingest/SKILL.md` — its frontmatter
+  `description` lists the whole command set and is auto-loaded into context
+  (~100 tokens, zero action), so the agent knows the commands exist before
+  reading anything; the body holds the full table. Agent Skills are an
+  [open standard](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview)
+  (Claude.ai / Claude Code / API), so this isn't Claude-Code-specific.
+- **AGENTS.md** — same table at the top, for agents reading the repo directly
+  or environments without skill support.
+- **MCP `instructions`** — the at-a-glance tool list, for MCP callers.
+- **`docingest --help`** — the command set at the top, for shell/agent callers.
+
+Disclosure is progressive: the skill `description` (≈100 tokens, always) → the
+full table in `SKILL.md` / AGENTS.md (on demand) → `docingest <cmd> --help` for
+per-flag detail. The catalog is hand-written but pinned to the code by
+`tests/unit/test_command_catalog.py`, which asserts the documented command set,
+`--strategy` values, and `refine` default match the source — change a command
+without updating the table and the test goes red.
+
+> Not to be confused with `skills/refine_*.SKILL.md` (LLM prompts for the
+> `refine` command) or the generated `<output>/knowledge_search.SKILL.md`
+> (a per-knowledge-base search guide for downstream agents) — both reuse the
+> `SKILL.md` filename but are unrelated to the Agent Skill above.
+
 ### MCP Server (for AI Agents)
 
 Thin MCP wrapper — exposes DocIngest as tools for AI Agents (Claude / GPT / etc.).

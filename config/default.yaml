@@ -892,36 +892,51 @@ run_log:
 #
 # Modes:
 #   off    — skip Phase 0 entirely (legacy behaviour).
-#   warn   — (default) log violations but run anyway.
-#   strict — refuse to run; caller must raise a threshold or pass
-#            --yes (CLI) / acknowledge_large=true (Python API / MCP).
+#   warn   — log violations, run anyway.
+#   strict — (default) refuse to run; caller must raise a threshold or
+#            opt in:
+#              CLI:        docingest run ... --yes
+#              Python lib: docingest.ingest(..., acknowledge_large=True)
+#              MCP agent:  inspect first → surface violations to human →
+#                          retry with acknowledge_large=True
+#
+# Why strict default: a single rogue 1 GB CSV / 5 h video silently chews
+# through API budget or OOMs the process in warn mode. Strict makes the
+# operator look at the cost report before paying it; the day-to-day
+# small-file user is unaffected because thresholds below are sized to
+# real-world docs, not toys.
 #
 # MCP agents receive safety.violations in the run result, so they can
 # inspect them and retry with acknowledge_large=true. This mirrors MCP's
 # own elicitation/create pattern (confirm-on-expensive).
 #
-# Defaults below are tuned for small projects (the "对半" baseline —
-# roughly half of the industry-standard defaults like Anthropic's
-# 100-page vision cutoff). Raise them freely for larger workloads.
+# Thresholds below are sized for real-world business documents (multi-
+# hundred-page reports, multi-MB workbooks). Tighten them if your
+# workload is tighter; relax further if you routinely process large
+# inputs (and consider mode: warn as the safer relaxation).
 safety:
   enabled: true
-  mode: "warn"                  # off | warn | strict
+  mode: "strict"                # off | warn | strict
 
   # Per-file thresholds. A single file exceeding ANY of these is flagged.
   # Set a field to null to disable that specific dimension.
+  # Sized so a typical business document (long contract, dense report,
+  # multi-MB workbook) doesn't trip strict; outliers (1 GB CSV, 2 h
+  # video, 500-page scan) do.
   per_file:
-    max_pages: 50               # PDF pages / PPTX slides / DOCX est-pages
-    max_chars_est: 250000       # Estimated text length (sampled for PDF)
-    max_rows: 20000             # xlsx / csv total rows
-    max_duration_sec: 900       # 15 min — audio / video
-    max_size_mb: 25             # Disk-size fallback
-    max_est_cost_usd: 1.0       # Dollar budget per file
+    max_pages: 100              # PDF pages / PPTX slides / DOCX est-pages
+                                # (Anthropic Vision's own default cap)
+    max_chars_est: 500000       # ≈ 200 pages of dense text
+    max_rows: 50000             # xlsx / csv total rows
+    max_duration_sec: 1800      # 30 min — audio / video
+    max_size_mb: 100            # Disk-size fallback
+    max_est_cost_usd: 2.0       # Dollar budget per file
 
   # Per-run thresholds — protect against "many small files adding up".
   per_run:
-    max_total_pages: 200
-    max_total_files: 50
-    max_total_est_cost_usd: 5.0
+    max_total_pages: 500
+    max_total_files: 100
+    max_total_est_cost_usd: 10.0
 
   # Text-length estimation tuning for PDF.
   # PyMuPDF's get_text() is fast but full scan of a 1000-page PDF still

@@ -218,13 +218,31 @@ def _inspect_media(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _inspect_text(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    """TXT / MD / CSV: byte count as a char_est proxy (UTF-8 ≈ chars)."""
+    """TXT / MD / CSV: byte count as a char_est proxy (UTF-8 ≈ chars).
+
+    CSV / TSV additionally get a streaming line count. Row count is the
+    stronger cost signal than bytes for tabular data — a 1 GB CSV of one
+    long column vs. a 1 GB CSV of 6 M rows are very different workloads,
+    and the safety.per_file.max_rows threshold only triggers if we
+    actually surface a row count. Streaming line count costs ~1 s/GB
+    and never loads the file into memory.
+    """
     _ = config
     try:
         size = file_path.stat().st_size
-        return {"chars_est": size}
     except OSError:
         return {}
+    info: dict[str, Any] = {"chars_est": size}
+    if file_path.suffix.lower() in {".csv", ".tsv"}:
+        try:
+            n = 0
+            with open(file_path, "rb") as f:
+                for _line in f:
+                    n += 1
+            info["total_rows"] = n
+        except OSError as e:
+            logger.debug(f"CSV row count failed for {file_path.name}: {e}")
+    return info
 
 
 # Format → inspector mapping. Unknown suffixes fall through to size-only.

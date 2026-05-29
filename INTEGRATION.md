@@ -241,10 +241,10 @@ Re-runs always pick up where they left off via the incremental cache — no manu
 Phase 0 safety check (`safety.mode`) flags files / runs over budget **before** any LLM call. Three modes:
 
 - `off` — no checks
-- `warn` (default) — log violations, proceed
-- `strict` — abort unless the caller passes `acknowledge_large=True` (function parameter on `ingest()` / MCP `run` / CLI `--yes`)
+- `warn` — log violations, proceed
+- `strict` (default) — abort unless the caller passes `acknowledge_large=True` (function parameter on `ingest()` / MCP `run` / CLI `--yes`)
 
-Defaults are tuned for small projects. Raise thresholds in `docingest.yaml` for larger workloads. See `safety:` section in `default.yaml` for every knob.
+Defaults are tuned for real-world business documents (multi-hundred-page reports, multi-MB workbooks). Raise thresholds in `docingest.yaml` for larger workloads, or drop to `warn` mode if you'd rather absorb the cost without confirmation. See `safety:` section in `default.yaml` for every knob.
 
 ---
 
