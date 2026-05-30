@@ -607,6 +607,79 @@ def doctor_cmd() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Visualize subcommand
+# ---------------------------------------------------------------------------
+
+@app.command("visualize")
+def visualize_cmd(
+    knowledge_dir: Path = typer.Argument(
+        ...,
+        help="Processed knowledge dir (must contain index.json + assets/).",
+        exists=True,
+        file_okay=False,
+    ),
+    pages: Optional[str] = typer.Option(
+        None, "--pages", help="Only these pages, comma-separated (e.g. 1,3,5).",
+    ),
+    labels: Optional[str] = typer.Option(
+        None, "--labels", help="Only these labels, comma-separated (e.g. text,table).",
+    ),
+    numbers: bool = typer.Option(
+        False, "--numbers", help="Annotate each box with its reading-order number.",
+    ),
+    output_subdir: str = typer.Option(
+        "viz", "--output", help="Output subdir under the knowledge dir.",
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None, "-c", "--config", help="Path to project config YAML.",
+    ),
+) -> None:
+    """Draw element bounding boxes onto page images (QA / debugging)."""
+    from .output.visualizer import visualize_knowledge
+
+    config = _load_config_or_exit(project_config_path=config_file)
+    image_dpi = int(get_nested(config, "parsing.vision.image_dpi", 180))
+
+    page_list = [int(p.strip()) for p in pages.split(",") if p.strip()] if pages else None
+    label_list = [s.strip() for s in labels.split(",") if s.strip()] if labels else None
+
+    try:
+        result = visualize_knowledge(
+            knowledge_dir,
+            pages=page_list,
+            labels=label_list,
+            numbers=numbers,
+            output_subdir=output_subdir,
+            image_dpi=image_dpi,
+        )
+    except FileNotFoundError as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
+
+    if not result["files"]:
+        console.print(
+            "[yellow]No bounding boxes to draw.[/yellow] Either this knowledge dir "
+            "has no PDF-parsed files, or it was built with "
+            "output.include_bounding_boxes=false."
+        )
+        raise typer.Exit(0)
+
+    table = Table(title="Parse Visualization")
+    table.add_column("File", style="bold", max_width=44)
+    table.add_column("Pages", justify="right")
+    table.add_column("Boxes", justify="right")
+    table.add_column("Scale source")
+    for f in result["files"]:
+        nboxes = sum(p["boxes"] for p in f["pages"])
+        scale_src = "page_size" if f["has_page_sizes"] else "dpi-assumed"
+        table.add_row(f["file"], str(len(f["pages"])), str(nboxes), scale_src)
+    console.print(table)
+    console.print(
+        f"\n  {result['total_pages']} annotated page(s) → [cyan]{result['output_dir']}[/cyan]\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Refine subcommand
 # ---------------------------------------------------------------------------
 

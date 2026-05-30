@@ -123,6 +123,12 @@ class IndexBuilder:
         # look this up from index.json by matching chunk.metadata.source.
         if metadata.get("element_boxes"):
             entry["element_boxes"] = metadata["element_boxes"]
+        # Per-page PDF dimensions (points), paired with element_boxes so a
+        # visualizer can scale bboxes onto rendered page images at any DPI
+        # (scale = image_px_width / page_point_width). Stored per-file alongside
+        # element_boxes for the same reason — it's inherently per-file data.
+        if metadata.get("page_sizes"):
+            entry["page_sizes"] = metadata["page_sizes"]
 
         self.files.append(entry)
         self.total_chunks += chunks_count
