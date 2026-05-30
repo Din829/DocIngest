@@ -164,6 +164,31 @@ docingest refine ./knowledge/sources/spec.md --skill refine_html    # HTML: fide
 
 Available skills: `refine_default` (allows rewriting) | `refine_faithful` (preserves original text exactly) | `refine_html` (same fidelity as faithful, outputs HTML fragment with `.html` extension)
 
+### Visualize parse layout (QA / debugging)
+
+Draw Docling's element bounding boxes onto the rendered page images — a quick way to check parse quality (tables / titles / figures detected correctly?). Reads `index.json` + `assets/`, writes annotated PNGs to a `viz/` subdir. Needs a knowledge base built with `output.include_bounding_boxes` (default on).
+
+```bash
+docingest visualize ./knowledge/                        # all pages, every label
+docingest visualize ./knowledge/ --pages 1,3 --numbers  # only pages 1 & 3, tag reading order
+docingest visualize ./knowledge/ --labels table         # only table boxes
+```
+
+### LangChain integration (optional)
+
+Load a knowledge base's chunks **straight into LangChain** as `Document` objects — reusing DocIngest's semantic chunks instead of re-splitting with a naive character splitter. Because LangChain itself integrates dozens of vector stores / retrievers (Azure AI Search, Bedrock Knowledge Bases, Pinecone, ...), this one adapter bridges DocIngest to all of them. The extra pulls only `langchain-core`:
+
+```bash
+pip install -e ".[langchain]"
+```
+
+```python
+from docingest.integrations.langchain import DocIngestLoader
+
+docs = DocIngestLoader("./knowledge/").load()   # -> list[langchain_core.documents.Document]
+vectorstore.add_documents(docs)                  # any LangChain backend — you own embeddings / index / config
+```
+
 ### Python Library
 
 DocIngest exposes a small, stable Python API for use as a dependency of other projects. The public surface is exactly: `ingest`, `inspect`, `refine`, `IngestResult`, `build_config`, and the Provider classes — everything else under `docingest.*` is internal.
@@ -725,6 +750,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rati
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
 - **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Eight-layer defence for damaged pages: `glyph<` / `&lt;` CID markers, U+FFFD ratio, complex-table density, CJK mixed-script anomaly, **language-script consistency** (new) — catches CMap failures that produce CLEAN but WRONG Unicode (e.g. Bengali/Thai/Tibetan chars on a Japanese-declared document; the other checks miss this because the output is legal Unicode). Whitelist per language (ja/zh/en/ko by default), add a language = edit `parsing.vision.triage.language_script_check.expected_scripts` — no code change. Default ON (`parsing.vision.triage.enabled`).
 - **Bounding boxes** — per-element PDF coordinates extracted from Docling for RAG source citation and highlighting. Exposed per file in `index.json` (`files[].element_boxes[<page_no>] = [{label, bbox, text_preview}, ...]`); RAG apps look them up by matching `chunk.metadata.source` → index entry. Toggle via `output.include_bounding_boxes`.
+- **Parse visualization** — `docingest visualize <kb>` draws those element boxes onto the rendered page images (colored by label, optional reading-order numbers) for QA / debugging. PIL on PNG; scales bboxes via the per-page `page_sizes` now stored in `index.json` (falls back to render-DPI for KBs built earlier).
+- **Repeating-furniture dedup** — opt-in `pre_write` hook collapses per-page furniture Vision transcribed (e.g. a `DocuSign Envelope ID` repeated on every page) down to its first copy — never deletes every copy, so no unique content is lost. Default OFF (`hooks.strip_repeating.enabled`).
+- **LangChain integration** — `DocIngestLoader` (opt-in `[langchain]` extra) maps `chunks.jsonl` → LangChain `Document`, bridging DocIngest to any LangChain vector store / retriever (Azure AI Search, Bedrock, Pinecone, ...) while reusing its semantic chunks. Pulls only `langchain-core`.
 - **Chunk lineage** — every chunk in `chunks.jsonl` carries a `metadata.lineage` sub-dict recording `source_markdown`, `original_input` (filename / mimetype / binary_hash / last_modified), and an ordered `transformations` array of what actually shaped it (parser → hooks → vision → chunker). Disabled features (e.g. sanitize.enabled=false) and triaged-out Vision pages are NOT recorded — lineage is a positive provenance trail for RAG citation / quality attribution / reproducibility, not a debug log. Existing flat metadata fields (`source`, `original_file`, `format`, `language`, `title_path`, …) are preserved unchanged for backwards compatibility.
 - **Hidden text detection** — flags invisible/background content via Docling ContentLayer analysis.
 - **Sensitive data sanitization** — opt-in PII masking (email, URL, credit card with Luhn validation, IPv4, JP phone). High-precision rules only, no name detection. Default OFF (`sanitize.enabled`).

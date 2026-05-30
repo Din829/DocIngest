@@ -147,6 +147,7 @@ DocIngest/
 │  │  ├─ pptx_chart.py               post_parse：chart 直读
 │  │  ├─ file_metadata.py            pre_write：Docling origin 提升 + exiftool
 │  │  ├─ sanitize.py                 pre_write：PII 掩码（默认关）
+│  │  ├─ strip_repeating.py          pre_write：跨页重复页眉脚去重（保留首份，默认关）
 │  │  └─ _docx_math/                 OMML → LaTeX 转换器（port from MarkItDown）
 │  ├─ enrichment/
 │  │  └─ path_injector.py            chunk 路径注入
@@ -168,7 +169,11 @@ DocIngest/
 │  │  ├─ knowledge_map.py            Phase 4 + AI summary
 │  │  ├─ keyword_extractor.py        Sudachi / regex 双后端
 │  │  ├─ quality_report.py           Vision marker 扫描
-│  │  └─ run_log.py                  log.md append-only 运行时间线
+│  │  ├─ run_log.py                  log.md append-only 运行时间线
+│  │  └─ visualizer.py               element_boxes + 页图 → 带框 PNG（docingest visualize，QA/调试）
+│  ├─ integrations/                  可选下游框架适配（独立 import，不进主 pipeline）
+│  │  ├─ __init__.py                 包标记（不 import 任何子模块，避免拉可选依赖）
+│  │  └─ langchain.py                chunks.jsonl → LangChain Document（DocIngestLoader，opt-in）
 │  └─ graph/                         可选 GraphRAG 子模块（独立 import，不进主 pipeline）
 │     ├─ __init__.py                 public API: build / query / status / enrich_chunks / EmbeddingProvider / GraphBackend
 │     ├─ api.py                      facade：build / query / status / enrich_chunks + Result dataclass + 配置合并
