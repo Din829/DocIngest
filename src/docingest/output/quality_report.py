@@ -96,7 +96,12 @@ def generate_report(
           - total_questions: sum of [?] markers across all files
           - total_unreadable: sum of [unreadable] markers
           - files: per-file details (only files with issues)
-          - quality_score: 0.0-1.0, 1.0 = zero uncertainty
+          - quality_score: 0.0-1.0, 1.0 = zero uncertainty. INFORMATIONAL
+            ONLY — a heuristic marker count, NOT a parse-failure signal: a
+            low score often just means the source itself is illegible (blur,
+            stamps/watermarks, shrunk-down screenshots, handwriting) that
+            even a human couldn't recover, and Vision honestly flagged it
+            rather than guessing.
     """
     if not sources_dir.exists():
         return {
@@ -178,5 +183,7 @@ def format_summary(report: dict[str, Any]) -> str:
     return (
         f"Quality: {issues}/{total} files ({pct}%) have uncertainty markers "
         f"— {q} [?] partial reads, {u} [unreadable] gaps "
-        f"(score: {score:.2f})"
+        f"(score: {score:.2f}; informational only — a marker count, not a "
+        f"parse-failure signal: a low score is often the source itself being "
+        f"unreadable, which Vision honestly flagged rather than guessing)"
     )

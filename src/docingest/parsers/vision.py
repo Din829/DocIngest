@@ -49,8 +49,20 @@ There are EXACTLY TWO symbols for flagging content you cannot read:
    Examples: `¥1,234,5[?]`, `invoice_20[?]`, `2024/0[?]/15`
 
 2. **`[unreadable]`** — the ONLY marker for fully illegible content.
-   Optional descriptive suffix with colon: `[unreadable: top-left node]`
-   Used standalone when no context is helpful: `[unreadable]`
+   Optional suffix with colon, to help a human reviewer judge whether the
+   gap is worth chasing (often the source itself is unreadable — even a
+   human couldn't recover it). Format: `[unreadable: <reason> — <where>]`,
+   where `<reason>` is ONE word from this CLOSED set and `<where>` (after an
+   em dash) is an optional short location/role hint:
+     - `blur`        — pixels too blurred to identify any character
+     - `obscured`    — covered by a stamp / watermark / another element
+     - `cut-off`     — text runs past the page boundary
+     - `low-res`     — resolution too low to resolve the glyphs
+     - `handwritten` — handwriting that cannot be reliably transcribed
+   Examples: `[unreadable: obscured — table row under the seal]`,
+   `[unreadable: blur]`. Pick the single closest reason; do NOT invent other
+   reason words or write a free-form explanation.
+   Used standalone when no reason is clear: `[unreadable]`
 
 **FORBIDDEN alternative forms** — do NOT use these:
 - `[illegible]`, `[unclear]`, `[blurred]`, `[cut off]`, `[???]`, `???`
@@ -78,10 +90,13 @@ If you can make out some of a value but not all:
 - A partial read with [?] is MORE useful than [unreadable] or guessing
 
 ### Priority 3: [unreadable] is the last resort
-Only use [unreadable] when the content is genuinely illegible:
-- Pixel-level blur so severe you cannot identify any character
-- Content obscured by another element (watermark, stamp)
-- Text cut off outside the page boundary
+Only use [unreadable] when the content is genuinely illegible (tag the
+reason from the closed set above):
+- Pixel-level blur so severe you cannot identify any character → `blur`
+- Content obscured by another element (watermark, stamp) → `obscured`
+- Text cut off outside the page boundary → `cut-off`
+- Resolution too low to resolve the glyphs → `low-res`
+- Handwriting that cannot be reliably transcribed → `handwritten`
 - DO NOT use [unreadable] just because text is small — read it first
 - DO NOT use [unreadable] because you're "not 100% sure" — if you can see it, write it
 
@@ -322,6 +337,9 @@ There are EXACTLY TWO symbols for flagging content you cannot read:
 
 1. **`[?]`** — the ONLY marker for partially visible content.
 2. **`[unreadable]`** — the ONLY marker for fully illegible content.
+   Optional reason suffix from the CLOSED set `blur` / `obscured` /
+   `cut-off` / `low-res` / `handwritten`: `[unreadable: obscured]`. Pick the
+   single closest word; do not invent others or write a free-form reason.
 
 **FORBIDDEN alternative forms** — do NOT use these:
 `[illegible]`, `[unclear]`, `[blurred]`, `[cut off]`, `[???]`, `???`,
