@@ -75,9 +75,13 @@ COPY pyproject.toml requirements.txt README.md ./
 RUN mkdir -p src/docingest && \
     echo "__version__ = '0.0.0'" > src/docingest/__init__.py
 
-# CPU-only torch (only matters if INSTALL_PROFILE pulls torch — graph-local).
-# If you never use [graph-local], this line is a no-op.
-RUN pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
+# CPU-only torch — installed FIRST so docling reuses it instead of pulling the
+# CUDA wheel. docling depends on torch transitively (NOT just [graph-local]):
+# its DocumentConverter imports torch at module load, so any profile drags it.
+# The default Linux PyPI wheel is the ~5.6GB CUDA build, of which DocIngest
+# uses none (CPU inference only). Use --index-url (NOT --extra-index-url) so
+# the CPU index is the sole source for torch and the CUDA wheel can't sneak in.
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 # Profile-driven extras. Mirrors scripts/install_python_deps.sh.
 RUN case "${INSTALL_PROFILE}" in \

@@ -9,6 +9,14 @@
 #
 # This file is for environments that require requirements.txt (e.g. Docker).
 # It mirrors pyproject.toml — if you update deps, update pyproject.toml first.
+#
+# IMPORTANT — CPU-only torch: docling pulls torch transitively, and the default
+# Linux PyPI wheel is the ~5.6GB CUDA build (unused — DocIngest is CPU-only).
+# Install CPU torch FIRST, then this file:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#     pip install -r requirements.txt
+# Do NOT add --index-url to this file: it would force ALL packages through the
+# CPU index, which doesn't carry litellm/typer/etc. and the install would fail.
 
 # === Core ===
 docling>=2.70

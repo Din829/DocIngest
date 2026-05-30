@@ -12,8 +12,13 @@ license = { text = "MIT" }
 dependencies = [
     # Core: document parsing
     "docling>=2.95",          # Document parsing (PDF/PPT/Excel/HTML/images).
-                              # 2.92+ moved torch to [models-local] extras —
-                              # pulling docling base no longer drags 5.6GB torch.
+                              # NOTE: docling pulls torch transitively and its
+                              # DocumentConverter imports torch at module load,
+                              # so `pip install docling` DOES drag the ~5.6GB
+                              # CUDA torch by default (it is NOT confined to
+                              # [models-local]). DocIngest runs CPU inference
+                              # only — install CPU torch first to avoid the GPU
+                              # libs; see scripts/install_python_deps.sh.
 
     # Core: AI/LLM
     "litellm>=1.86.1",        # Multi-provider LLM API (Vision, chunking assist).

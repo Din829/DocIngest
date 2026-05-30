@@ -22,9 +22,24 @@ Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → pa
 ```bash
 git clone https://github.com/Din829/DocIngest.git
 cd DocIngest
-pip install -e .                     # Core dependencies
+
+# CPU-only torch FIRST. docling pulls torch transitively; the default Linux
+# wheel is the ~5.6GB CUDA build (unused — DocIngest is CPU inference only).
+# Installing it first lets `pip install -e .` reuse it, skipping ~5GB of GPU
+# libs. (Windows/macOS PyPI torch is usually CPU already; --index-url makes it
+# deterministic on every machine / cloud.)
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+pip install -e .                     # Core dependencies (reuses the CPU torch above)
 cp .env.example .env                 # Fill in API keys
 docingest doctor                     # Check what's missing
+```
+
+Or run the helper, which does CPU torch + the default extras for you:
+
+```bash
+./scripts/install_python_deps.sh      # Linux / macOS
+.\scripts\install_python_deps.ps1     # Windows (PowerShell)
 ```
 
 Optional extras (install as needed):

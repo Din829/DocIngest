@@ -49,19 +49,33 @@ case "$PROFILE" in
     full)      EXTRAS="[mcp,audio,nlp,graph,graph-local]" ;;
 esac
 
+# CPU-only torch — installed BEFORE docling. docling pulls torch transitively
+# (its DocumentConverter imports torch at module load); the default Linux PyPI
+# wheel is the ~5.6GB CUDA build, of which DocIngest uses NONE (CPU inference
+# only). Forcing the CPU build here means the later `pip install -e .` sees
+# torch already satisfied and won't drag the CUDA wheel. Verified: docling adds
+# no nvidia/cuda packages on top of a pre-installed CPU torch.
+TORCH_CMD="pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu"
 CMD="pip install -e \"${REPO_ROOT}${EXTRAS}\""
 EXTRA_CMD="pip install pdf2image PyExifTool"
 
 echo "=== DocIngest Python deps install (profile: $PROFILE) ==="
-echo "Step 1: $CMD"
-echo "Step 2 (lazy imports, not in pyproject): $EXTRA_CMD"
+echo "Step 1 (CPU-only torch, before docling): $TORCH_CMD"
+echo "Step 2: $CMD"
+echo "Step 3 (lazy imports, not in pyproject): $EXTRA_CMD"
 
 if [[ $DRY_RUN -eq 1 ]]; then
     echo "(dry-run: nothing installed)"
     exit 0
 fi
 
+# Drop any pre-existing (possibly CUDA) torch first — pip won't swap an
+# already-satisfied torch, so without this the CPU install below is a no-op
+# on machines that already have the CUDA build.
+pip uninstall -y torch torchvision 2>/dev/null || true
+
 # shellcheck disable=SC2086
+eval $TORCH_CMD
 eval $CMD
 eval $EXTRA_CMD
 
