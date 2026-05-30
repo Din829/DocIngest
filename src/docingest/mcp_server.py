@@ -726,6 +726,10 @@ def main():
     except ImportError:
         pass
 
+    # Resolve bundled binaries (packaged exe / imageio-ffmpeg) — same as CLI.
+    from .utils.bundled_binaries import ensure_bundled_binaries
+    ensure_bundled_binaries()
+
     mcp.run(transport=transport)  # type: ignore[arg-type]
 
 

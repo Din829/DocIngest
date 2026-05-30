@@ -100,6 +100,15 @@ audio = [
                               # is reachable. SDK does additive minor bumps; no
                               # known breaking changes in the 1.x series.
 ]
+bundle = [
+    # Binaries that ship WITH a packaged exe so the end user installs nothing
+    # system-wide. imageio-ffmpeg's wheel bundles a cross-platform ffmpeg
+    # (~60MB); ensure_bundled_binaries() points FFMPEG_PATH at it at startup.
+    # NOTE: imageio-ffmpeg bundles ffmpeg only, NOT ffprobe — ffprobe (used
+    # for media duration) must be shipped separately in the packaging step,
+    # or its absence degrades gracefully (no duration_sec, no crash).
+    "imageio-ffmpeg>=0.5",
+]
 graph = [
     # Optional GraphRAG layer (docingest.graph). Loads only when explicitly
     # imported via `import docingest.graph`; main `docingest run` works

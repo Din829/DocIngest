@@ -21,6 +21,12 @@ try:
 except ImportError:
     pass  # python-dotenv not installed — user manages env vars manually
 
+# Point env vars at any binaries we ship (packaged exe / imageio-ffmpeg) so
+# find_binary resolves to them. After load_dotenv so an explicit *_PATH in
+# .env wins (ensure_bundled_binaries never overrides an already-set var).
+from .utils.bundled_binaries import ensure_bundled_binaries
+ensure_bundled_binaries()
+
 import typer
 from rich.console import Console
 from rich.table import Table
