@@ -152,11 +152,24 @@ graph-gemini = [
     # only if you want Gemini's gemini-embedding-001 (768/1536/3072 dim).
     "google-genai>=2.0",
 ]
+langchain = [
+    # Optional LangChain integration (docingest.integrations.langchain):
+    # DocIngestLoader maps chunks.jsonl → langchain_core Document, bridging
+    # DocIngest to ANY LangChain vector store / retriever (Azure AI Search,
+    # Bedrock Knowledge Bases, Pinecone, OpenSearch, ...). Only langchain-core
+    # is needed here — Document + BaseLoader live in it; the heavy backend
+    # packages (langchain-community / langchain-aws / ...) are installed by the
+    # user per the backend they target, so DocIngest stays lightweight. Core
+    # `docingest run` never imports this; it loads only on explicit import.
+    "langchain-core>=0.3,<2",  # Document(id/page_content/metadata) + BaseLoader
+                               # (lazy_load). API stable 0.3 → 1.4 (current);
+                               # <2 guards against an unknown future 2.0 break.
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
-# Install everything: pip install -e ".[nlp,mcp,audio,ocr,graph]"
+# Install everything: pip install -e ".[nlp,mcp,audio,ocr,graph,langchain]"
 
 [project.scripts]
 docingest = "docingest.cli:app"
