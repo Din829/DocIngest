@@ -277,3 +277,75 @@ def find_binary(
             return found_path
 
     return None
+
+
+def run_soffice_convert(
+    src: "Path | str",
+    out_dir: "Path | str",
+    convert_to: str,
+    *,
+    config: Any = None,
+    timeout: int = 180,
+):
+    """Run LibreOffice headless conversion. Single entry point for every
+    soffice `--convert-to` call so the LibreOffice invariants live in one place.
+
+    Two invariants, both VERIFIED against a real PyInstaller-packaged build
+    (a packaged exe reproduces each failure; the fix resolves it):
+
+    1. **Writable UserInstallation profile.** soffice needs a writable
+       user-profile dir to initialize. We pass an explicit fresh temp profile
+       per call — deterministic across machines, and a fresh profile also
+       dodges LibreOffice's same-profile concurrency lock.
+
+    2. **Restore the Windows DLL search order before spawning (frozen only).**
+       PyInstaller's bootloader calls SetDllDirectory so bundled DLLs load
+       first; child processes INHERIT this, so a bundled soffice loads the
+       app's incompatible DLLs and aborts with 0xC0000142 (no pdf). This is a
+       process-level setting — env tweaks don't fix it (all env variants were
+       tried and failed). SetDllDirectory(None) restores the standard order
+       just for the spawn. Windows + frozen only; a no-op elsewhere. See
+       PyInstaller "Common Issues and Pitfalls" (subprocess / DLL order).
+
+    Returns the CompletedProcess, or None when soffice isn't available — the
+    caller then degrades exactly as before (skip rendering / fall back).
+    """
+    import subprocess
+    import tempfile
+
+    soffice = find_binary("soffice", config)
+    if not soffice:
+        return None
+
+    frozen_win = sys.platform.startswith("win") and getattr(sys, "frozen", False)
+    if frozen_win:
+        # Restore standard DLL search order so the bundled soffice loads its
+        # own libs, not the frozen app's. Scoped to this spawn; PyInstaller's
+        # setting is per-process and only matters for what we launch here.
+        import ctypes
+        ctypes.windll.kernel32.SetDllDirectoryW(None)
+
+    try:
+        # Fresh, writable profile per conversion. soffice wants a file:// URI.
+        with tempfile.TemporaryDirectory(prefix="lo_profile_") as profile:
+            profile_uri = Path(profile).as_uri()
+            return subprocess.run(
+                [
+                    soffice,
+                    f"-env:UserInstallation={profile_uri}",
+                    "--headless",
+                    "--convert-to", convert_to,
+                    "--outdir", str(out_dir),
+                    str(src),
+                ],
+                capture_output=True,
+                timeout=timeout,
+            )
+    finally:
+        if frozen_win:
+            # Re-assert PyInstaller's DLL dir so the app's own later ctypes /
+            # DLL loads keep working as the bootloader intended.
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                import ctypes
+                ctypes.windll.kernel32.SetDllDirectoryW(meipass)

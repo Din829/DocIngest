@@ -313,6 +313,7 @@ class DoclingParser(BaseParser):
             # Extract per-element bounding boxes (if enabled)
             if get_nested(self.config, "output.include_bounding_boxes", True):
                 metadata["element_boxes"] = self._extract_bounding_boxes(doc)
+                metadata["page_sizes"] = self._extract_page_sizes(doc)
 
             # Detect hidden text via content_layer (if enabled, PDF only)
             if get_nested(self.config, "parsing.pdf.hidden_text_detection.enabled", True):
@@ -372,6 +373,30 @@ class DoclingParser(BaseParser):
         except Exception as e:
             logger.debug(f"Bounding box extraction failed: {e}")
         return boxes
+
+    @staticmethod
+    def _extract_page_sizes(doc) -> dict:
+        """
+        Extract per-page dimensions (PDF points) from Docling's Document model.
+
+        Returns ``{page_no: [width, height]}``. Paired with
+        _extract_bounding_boxes so a visualizer can map PDF-point bboxes onto
+        the rendered page image at ANY render DPI / downscale level::
+
+            scale = image_px_width / page_point_width
+
+        Without this the visualizer must assume the render DPI (works for
+        standard pages, drifts for downscaled / non-standard ones).
+        """
+        sizes: dict[int, list[float]] = {}
+        try:
+            for page_no, page in doc.pages.items():
+                size = getattr(page, "size", None)
+                if size is not None:
+                    sizes[page_no] = [round(size.width, 1), round(size.height, 1)]
+        except Exception as e:
+            logger.debug(f"Page size extraction failed: {e}")
+        return sizes
 
     @staticmethod
     def _detect_hidden_content(doc) -> dict:
@@ -1109,9 +1134,8 @@ class DoclingParser(BaseParser):
         Tries LibreOffice headless → PDF → images pipeline.
         Gracefully does nothing if tools aren't available.
         """
-        import subprocess
         import tempfile
-        from ..utils.binary_finder import find_binary
+        from ..utils.binary_finder import find_binary, run_soffice_convert
 
         # Cross-platform LibreOffice lookup — handles Windows Program Files
         # installs, macOS /Applications bundles, and config/env overrides.
@@ -1122,11 +1146,12 @@ class DoclingParser(BaseParser):
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                # Step 1: Convert to PDF via LibreOffice
-                subprocess.run(
-                    [soffice, "--headless", "--convert-to", "pdf",
-                     "--outdir", tmpdir, str(file_path)],
-                    capture_output=True, timeout=120,
+                # Step 1: Convert to PDF via LibreOffice (helper supplies the
+                # writable UserInstallation profile soffice needs to run,
+                # esp. inside a packaged exe).
+                run_soffice_convert(
+                    file_path, tmpdir, "pdf",
+                    config=self.config, timeout=120,
                 )
                 pdf_files = list(Path(tmpdir).glob("*.pdf"))
                 if not pdf_files:

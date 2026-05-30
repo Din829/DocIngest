@@ -718,7 +718,7 @@ def _maybe_convert_xls(
     import shutil
     import subprocess
     import tempfile
-    from .utils.binary_finder import find_binary
+    from .utils.binary_finder import find_binary, run_soffice_convert
 
     soffice = find_binary("soffice", config)
     if not soffice:
@@ -751,12 +751,17 @@ def _maybe_convert_xls(
     if not cached_xlsx.exists():
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                proc = subprocess.run(
-                    [soffice, "--headless", "--convert-to", "xlsx",
-                     "--outdir", tmpdir, str(file_path)],
-                    capture_output=True, timeout=180,
+                proc = run_soffice_convert(
+                    file_path, tmpdir, "xlsx", config=config, timeout=180,
                 )
                 produced = list(Path(tmpdir).glob("*.xlsx"))
+                if proc is None:
+                    # soffice unavailable — same degrade as a failed convert.
+                    _pipeline_logger.warning(
+                        f".xls → .xlsx conversion skipped for "
+                        f"{file_path.name}: LibreOffice not found"
+                    )
+                    return file_path, None
                 if proc.returncode != 0 or not produced:
                     _pipeline_logger.warning(
                         f".xls → .xlsx conversion failed for "
@@ -801,10 +806,9 @@ def _generate_page_images_via_libreoffice(
         max_pixels: Auto-downscale images exceeding this pixel count.
         format_label: "Excel" / "Word" / etc., used only in log messages and warnings.
     """
-    import subprocess
     import tempfile
     from .parsers.base import PageData
-    from .utils.binary_finder import find_binary
+    from .utils.binary_finder import find_binary, run_soffice_convert
 
     # Already has images → nothing to do
     if parse_result.pages and any(p.image_path for p in parse_result.pages):
@@ -836,10 +840,11 @@ def _generate_page_images_via_libreoffice(
             # LibreOffice's "fit to page" rendering and have to be tolerated;
             # Docling openpyxl extraction provides cell-level fallback so
             # blank-page Vision noise doesn't lose information.
-            subprocess.run(
-                [soffice, "--headless", "--convert-to", "pdf",
-                 "--outdir", tmpdir, str(file_path)],
-                capture_output=True, timeout=180,
+            # helper supplies the writable UserInstallation profile soffice
+            # needs (esp. inside a packaged exe); None → not found, pdf_files
+            # stays empty and we degrade via the existing check below.
+            run_soffice_convert(
+                file_path, tmpdir, "pdf", config=config, timeout=180,
             )
             pdf_files = list(Path(tmpdir).glob("*.pdf"))
             if not pdf_files:
