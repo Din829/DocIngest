@@ -253,5 +253,15 @@ def _register_default_hooks() -> None:
     except ImportError as e:
         logger.debug(f"Sanitize hook not available: {e}")
 
+    # Repeating header/footer stripper (default OFF, opt-in via config).
+    # Removes per-page furniture (watermarks / logos / page numbers) that
+    # Vision transcribes into the markdown. Registered LAST so it runs after
+    # all content-enriching pre_write hooks have populated the markdown.
+    try:
+        from .strip_repeating import strip_repeating_hook
+        _register_post("pre_write", ["*"], strip_repeating_hook)
+    except ImportError as e:
+        logger.debug(f"strip_repeating hook not available: {e}")
+
 
 _register_default_hooks()

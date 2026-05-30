@@ -1067,6 +1067,31 @@ sanitize:
   # Key = sha256(model_id + file_content_hash + relevant_config_hash)
 
 # =============================================================================
+# Hooks — pre/post-parse extension points
+# =============================================================================
+hooks:
+  # Strip repeating per-page furniture (watermarks / logos / page numbers /
+  # running dates) from the markdown before chunking — they otherwise pollute
+  # every chunk. Vision transcribes the whole page image, so docling's own
+  # content_layer furniture filter doesn't catch furniture that came via Vision.
+  strip_repeating:
+    enabled: false              # Default OFF — opt-in. Off = zero change.
+    min_repeat_pages: 3         # A line repeating VERBATIM on >= N pages is
+                                # DEDUPLICATED: first copy kept, later copies
+                                # dropped. Never deletes every copy, so no
+                                # unique content is ever lost (some body text —
+                                # per-section notes, a short contract's header —
+                                # also repeats verbatim). Raise to be stricter.
+    max_line_chars: 120         # Only short lines are considered (furniture is
+                                # short); long lines (body) are never touched.
+    strip_page_numbers: false   # Opt-in. Drop standalone 1-3 digit lines (page
+                                # numbers). OFF by default: a bare number is
+                                # almost always a page number, but a body figure
+                                # can land alone on a line, so it is not 100%
+                                # safe. Turn on only if your docs have no such
+                                # bare numeric body lines.
+
+# =============================================================================
 # GraphRAG (optional — requires `pip install -e ".[graph]"`)
 # =============================================================================
 # Builds an entity / relation knowledge graph + (optionally) community

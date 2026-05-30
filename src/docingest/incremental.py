@@ -171,6 +171,12 @@ _RELEVANT_CONFIG_PATHS = [
                                            # flipping it rewrites markdown before write
     "sanitize.rules",                      # custom PII rule set — changes
                                            # what gets masked in markdown
+    "hooks.strip_repeating.enabled",       # header/footer stripper toggle —
+                                           # flipping it rewrites markdown before write
+    "hooks.strip_repeating.min_repeat_pages",   # repetition threshold — changes
+                                           # which lines get stripped
+    "hooks.strip_repeating.max_line_chars",     # line-length cutoff for stripping
+    "hooks.strip_repeating.strip_page_numbers", # page-number stripping toggle
     "metadata.exiftool.enabled",           # hook #3: exiftool gating
     "metadata.exiftool.fields",            # hook #3: whitelist changes
     "output.markdown.frontmatter_fields",  # which fields appear in YAML
