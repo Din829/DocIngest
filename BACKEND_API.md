@@ -46,7 +46,7 @@ JS 界面（手写 HTML/CSS）
 | `get_summary(dir)` | 读 `index.json` + `quality_report.json` | 完了屏/库详情数据（文件数、chunk 数、各文件 title/pages/language） |
 | `preview_markdown(dir, file)` | 读 `sources/<file>.md` | 完了屏右侧预览内容 |
 | `open_folder(dir)` | 系统打开目录 | — |
-| `start_refine(dir, files, skill)` | `api.refine(files, skill=)` | 整形结果（10 弹窗选 skill：refine_default/faithful/html） |
+| `start_refine(dir, files, skill)` | `api.refine(files, skill=, output=)` | 整形结果（10 弹窗选 skill：refine_default/faithful/html）。`output` 默认推导到 sources 的父目录，桥层可显式传该库目录 |
 
 ### C. 环境 / 配置（05–07 设置屏）
 
@@ -83,7 +83,9 @@ JS 界面（手写 HTML/CSS）
 3. **每库写 `meta.json`**（新增小产物）：`{display_name, source_files, created_at}`。
    index.json 有 `processed_at` 但没「用户起的名」；库列表展示要靠它。
 4. **正式库 vs 临时/测试**：`_` 前缀目录视为非正式，`list_knowledge` 排除；
-   只有带 `meta.json`（或非 `_` 前缀且有 index.json）的算正式库。
+   判定分现状 / 将来：**现状**（meta.json 尚未实现，见第四节）只能粗判——非 `_`
+   前缀 + 有 index.json + 不是裸 `assets/`（撒根碎片，无 index.json）；**将来**
+   加了 meta.json 后，以「有 meta.json」为正式库的准确标识。
 
 ## 四、要补的后端改动
 
