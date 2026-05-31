@@ -648,6 +648,12 @@ models:
 parsing:
   vision:
     image_dpi: 180
+    supplement_only: false      # Global default: Vision transcribes the whole page.
+                                # xlsx flips to true below (supplement only —
+                                # openpyxl already has the table, Vision just adds
+                                # visuals → no Docling↔Vision dup). PDF/PPT stay
+                                # false: Docling fragments 方眼紙 tables, so they
+                                # need full transcription to recover the body.
     triage:
       enabled: true             # Skip pure-text pages (saves Vision API cost)
   pdf:
@@ -655,6 +661,10 @@ parsing:
       enabled: true             # Detect invisible/background content
     vision:                     # Optional per-format Vision override (model / max_response_tokens / image_dpi).
       image_dpi: 220            # Unset fields fall through to global models.vision.* / parsing.vision.*.
+  xlsx:
+    vision:
+      supplement_only: true     # Vision adds visuals only, never re-transcribes
+                                # the openpyxl-rendered table (removes xlsx dup).
   pptx:
     vision:
       max_response_tokens: 8192 # PPT pages are content-light — cap output to save cost.
@@ -716,11 +726,14 @@ for each new file:
       ├─ Excel denoise         merged cells, sparse rows
       ├─ LibreOffice pages     xlsx/docx/pptx → PDF → screenshots
       ├─ post_parse hook       PPTX chart direct-read
-      ├─ Vision enrichment     per-page, 8-layer triage, parallel
+      ├─ Vision enrichment     per-page, 8-layer triage, parallel; format-split
+                                supplement/full — xlsx supplements visuals only
+                                (no table re-transcribe), PDF/PPT full whole-page
       ├─ pre_write hook        exiftool / sanitize
-      ├─ Vision dedup          OFF by default — both Docling and Vision kept
-                                (opt-in via output.dedup.enabled when both
-                                 views are known to overlap reliably)
+      ├─ Vision dedup          OFF by default — duplication is already removed at
+                                the source by the format-split supplement above;
+                                this old length-ratio post-pass stays opt-in
+                                (output.dedup.enabled)
       ├─ write sources/*.md    + assets/
       └─ chunk + path-inject   auto / heading / slide / sheet / timestamp
       │
@@ -740,6 +753,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rati
 - **Video URL support** — YouTube, Bilibili, and 1000+ platforms via yt-dlp. Auto subtitle + metadata extraction.
 - **ZIP archive expansion** — recursive unpacking with Japanese filename recovery, bomb protection.
 - **Per-page Vision AI** — AI decides per page: clean up text / describe charts / OCR scan. Parallel execution, cached by content hash.
+- **Format-aware Vision supplement** — xlsx (rendered cleanly by openpyxl) lets Vision SUPPLEMENT only the visual content (charts / pictures / stamps) and never re-transcribe the table, removing the Docling↔Vision duplication **at the source** (measured: per-section re-transcription 65–92% → 0–5%, and body text is never dropped because it lives in the openpyxl render the supplement can't touch). PDF/PPT stay on full whole-page transcription — Docling fragments their 方眼紙 tables, so they need it to recover the body. Per-format via `parsing.<format>.vision.supplement_only` (global default off, xlsx on).
 - **PPTX chart direct-read** — python-pptx extracts chart data (categories, series, values) as 100% accurate Markdown tables. Vision supplements with visual context.
 - **DOCX math equations** — OMML → LaTeX preprocessing before Docling parses. `$E=mc^{2}$` instead of garbled text.
 - **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists) and per-type `on_overflow` strategy — oversized Markdown tables are split at data-row boundaries with the header repeated in every sub-chunk (2026 industry standard, handles Docling's merged-cell expansion). Single-pass heading merge (prelude + orphan-heading + small-section policies) produces zero-fragment chunks with the deepest-available title_path. Adjacent byte-identical chunks auto-deduplicated. All behaviour is config-driven — every knob in `chunking.heading.*` and `chunking.protection.*`.
