@@ -181,6 +181,116 @@ Trust the structured data block — focus your effort on everything the block \
 cannot see."""
 
 
+# Supplement mode (parsing.vision.supplement_only: true, the default). Same
+# rules as _PAGE_PROMPT, but Vision SUPPLEMENTS Docling instead of re-emitting
+# the whole page: body text Docling already captured is NOT repeated, while ALL
+# visual content (text in images, diagram/chart labels, garbled fixes) is
+# captured fully. This removes the Docling↔Vision duplication at the source.
+# Verified on real samples: perfect dedup + full visual capture.
+_PAGE_PROMPT_SUPPLEMENT = """\
+You are a document preprocessing specialist. You receive ONE page image plus \
+text that a parsing engine (Docling) pre-extracted from it (may be incomplete, \
+garbled, or empty). Docling reliably captures flowing body text and simple \
+tables, but CANNOT see content that lives inside images, figures, diagrams, \
+charts, screenshots, or stylized graphics.
+
+Your job: produce a SUPPLEMENT to the Docling text below — capture what Docling \
+could not, without repeating what it already has.
+
+**MOST IMPORTANT RULE — read this first.** Look at the Docling block below. If \
+it is EMPTY, nearly empty, or clearly missing most of the page's text (a common \
+case for scanned documents, image-based PDFs, and photographed forms), then \
+Docling failed — there is NOTHING to supplement. In that case you MUST \
+transcribe the ENTIRE page yourself, verbatim: every heading, table row, field, \
+label, and body line you can read. Do NOT skip text just because it "looks like \
+body content Docling should have" — if it is NOT in the Docling block, it is \
+YOUR job to capture it. Treat "supplement" as "make the page complete": only \
+skip text that is genuinely ALREADY present and accurate in the Docling block.
+
+Accuracy is more important than completeness. A hallucinated value is worse \
+than a gap marked with [unreadable]. Never invent content you cannot see.
+
+## Uncertainty marker vocabulary (USE ONLY THESE — no other forms)
+
+There are EXACTLY TWO symbols for flagging content you cannot read:
+
+1. **`[?]`** — the ONLY marker for partially visible content.
+   Replace the uncertain portion with `[?]` inline.
+   Examples: `¥1,234,5[?]`, `invoice_20[?]`, `2024/0[?]/15`
+
+2. **`[unreadable]`** — the ONLY marker for fully illegible content.
+   Optional suffix with colon: `[unreadable: <reason> — <where>]`, where \
+   `<reason>` is ONE word from this CLOSED set:
+     - `blur` / `obscured` / `cut-off` / `low-res` / `handwritten`
+   Used standalone when no reason is clear: `[unreadable]`
+
+**FORBIDDEN forms** (do NOT use): `[illegible]`, `[unclear]`, `[blurred]`, \
+`???`, ellipses `...`, HTML comments, "cannot be read", "(low confidence)". \
+These markers are machine-scanned by a downstream quality report.
+
+## What to capture (this is the supplement — be thorough on visuals)
+
+1. **Body text / simple tables already in the Docling block → DO NOT repeat.** \
+   If Docling captured it accurately, skip it.
+2. **Visual content → capture FULLY and verbatim** (your main job; do not \
+   summarize or skip):
+   - all text rendered inside images / screenshots / figures
+   - every label, axis, legend, node, annotation in diagrams / charts / \
+     flowcharts / gantt charts / ER diagrams
+   - section headings/titles that appear as part of a graphic
+   - any visible text the Docling block is MISSING
+   - corrections where Docling is garbled (give the corrected text, noting it)
+   When unsure whether something is "visual", INCLUDE it — missing real content \
+   is worse than minor overlap.
+
+## Flowchart and diagram rules
+
+- Read every node's label **verbatim**. Small labels still count.
+- Illegible node → label `[unreadable]` + describe shape/position to preserve \
+  structure (e.g. "left rectangular node [unreadable], connected to center").
+- List every connection: "A → B"; arrow labels verbatim, else "unlabeled arrow".
+
+## Strict prohibitions
+
+- **NEVER invent values** for blank/unclear cells. Empty → leave empty.
+- **NEVER guess** a number/date/name/amount you cannot see clearly.
+- **NEVER use [unreadable]** just because text is small — read it first.
+
+## Formatting
+
+- Preserve original language and numbers/dates verbatim. Do NOT paraphrase.
+- Compact Markdown (tables/lists/headings). No code-block wrapper. No preamble.
+
+## When (and ONLY when) to output nothing
+
+Output EXACTLY `(no additional visual content)` and nothing else ONLY IF the \
+Docling block already contains the page's full text accurately AND there is no \
+visual content to add. If the Docling block is empty or sparse, you must NEVER \
+output this line — transcribe the page (see the MOST IMPORTANT RULE above).
+
+## Docling pre-extracted text (may be incomplete or garbled)
+
+---
+{page_text}
+---
+
+## Pre-extracted structured data (GROUND TRUTH — do not re-transcribe)
+
+This block was read directly from the source object model (e.g. PPTX chart \
+XML). It is authoritative. Do NOT restate its values; DO describe what it does \
+NOT contain (annotations, callouts, highlights, legend semantics, neighbouring \
+text). If "(none)" or empty, act normally per the rules above. If the block is \
+missing something visible in the image (an axis unit, a chart type), add it.
+
+---
+{structured_data}
+---
+
+Now examine the page image and output ONLY the supplemental Markdown (or the \
+exact "(no additional visual content)" line). Capture all visual content; do \
+not repeat Docling's body text; mark uncertainty; never invent."""
+
+
 def resolve_vision_config(
     config: dict[str, Any],
     doc_format: str | None,
@@ -203,12 +313,33 @@ def resolve_vision_config(
     return base
 
 
+def resolve_supplement_only(config: dict[str, Any], doc_format: str | None) -> bool:
+    """Per-format override > global default for supplement mode.
+
+    GLOBAL default is False (full whole-page Vision) — required for PDF/PPT
+    whose 方眼紙 tables Docling flattens into fragments; supplement there would
+    silently drop body text (measured: contract recall 8/8 full vs 4/8
+    supplement). xlsx flips to True via parsing.xlsx.vision.supplement_only:
+    its openpyxl render already produces clean tables, so Vision only needs to
+    add visuals — and the table text lives in the openpyxl render, which
+    supplement never touches, so it cannot drop body text.
+    """
+    if doc_format:
+        ov = get_nested(
+            config, f"parsing.{doc_format.lower()}.vision.supplement_only", None
+        )
+        if ov is not None:
+            return bool(ov)
+    return bool(get_nested(config, "parsing.vision.supplement_only", False))
+
+
 def describe_page(
     image_path: str | Path,
     page_text: str,
     model_config: dict[str, Any],
     structured_data: str | None = None,
     max_tokens: int = 32768,
+    supplement_only: bool = True,
 ) -> str:
     """
     Send a page image + extracted text to Vision AI.
@@ -233,7 +364,8 @@ def describe_page(
     if not image_path.exists():
         raise FileNotFoundError(f"Page image not found: {image_path}")
 
-    prompt = _PAGE_PROMPT.format(
+    template = _PAGE_PROMPT_SUPPLEMENT if supplement_only else _PAGE_PROMPT
+    prompt = template.format(
         page_text=page_text if page_text.strip() else "(empty — no text extracted)",
         structured_data=structured_data if structured_data and structured_data.strip() else "(none)",
     )
@@ -251,6 +383,16 @@ def _structured_data_cache_tag(structured_data: str | None) -> str:
     if not structured_data:
         return "nostruct"
     return "struct-" + hashlib.sha256(structured_data.encode("utf-8")).hexdigest()[:16]
+
+
+def _prompt_hash(template: str) -> str:
+    """Short hash of a prompt template body, folded into Vision cache keys so
+    editing the prompt TEXT invalidates stale entries. The supplement/full flag
+    alone is NOT enough — when only the prompt wording changes (e.g. tuning the
+    supplement rules) the flag stays the same but the result must differ. Not
+    security-sensitive — truncated SHA256 is plenty for cache keying."""
+    import hashlib
+    return "p" + hashlib.sha256(template.encode("utf-8")).hexdigest()[:8]
 
 
 def describe_page_cached(
@@ -283,6 +425,19 @@ def describe_page_cached(
     primary = vision_model_config.get("primary", {})
     model_name = f"{primary.get('provider', 'openai')}/{primary.get('model', 'gpt-4o-mini')}"
 
+    # Supplement mode is part of the prompt → its value MUST be in the cache key
+    # so flipping it (or the prompt) invalidates stale entries instead of
+    # serving results produced by the other prompt.
+    supplement_only = resolve_supplement_only(config, doc_format)
+    # The flag alone isn't enough — editing the prompt TEXT must also bust the
+    # cache, so fold in a hash of the actual template body that will be used.
+    template = _PAGE_PROMPT_SUPPLEMENT if supplement_only else _PAGE_PROMPT
+    prompt_tag = ("supplement" if supplement_only else "full") + "-" + _prompt_hash(template)
+    # In supplement mode page_text IS the ground truth (openpyxl table text) →
+    # changing it must bust the cache. In full mode page_text is tied to the
+    # image (already covered by the image content hash), so tag "nopt".
+    pt_tag = _structured_data_cache_tag(page_text) if supplement_only else "nopt"
+
     if cache:
         img_hash = content_hash_file(image_path)
         return cache.get_or_call(
@@ -290,14 +445,14 @@ def describe_page_cached(
             content_hash=img_hash,
             call_fn=lambda: describe_page(
                 image_path, page_text, vision_model_config, structured_data,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens, supplement_only=supplement_only,
             ),
-            extra_key=f"page_vision|{_structured_data_cache_tag(structured_data)}",
+            extra_key=f"page_vision|{prompt_tag}|{pt_tag}|{_structured_data_cache_tag(structured_data)}",
         )
     else:
         return describe_page(
             image_path, page_text, vision_model_config, structured_data,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens, supplement_only=supplement_only,
         )
 
 
@@ -390,12 +545,70 @@ stitched-together Markdown representation. Read aggressively; mark \
 uncertainty explicitly; never invent content."""
 
 
+# Supplement variant for xlsx batched calls. The openpyxl renderer already
+# extracted the sheet's table text (passed in as ground_truth), so Vision only
+# ADDS visual content (embedded pictures, charts, stamps, handwriting) and does
+# NOT re-transcribe table rows. Emits "(no additional visual content)" when a
+# batch has nothing visual to add. Safe for xlsx because openpyxl output is
+# clean/structured (unlike Docling's fragmented PDF 方眼紙 output), so the
+# "GROUND TRUTH empty -> transcribe in full" escape never misfires on fragments.
+_BATCHED_PROMPT_SUPPLEMENT = """\
+You receive {n_images} consecutive page images that all belong to the SAME \
+logical sheet of a spreadsheet, in order. A parser (openpyxl) has ALREADY \
+extracted this sheet's table text accurately — it is shown below as GROUND \
+TRUTH.
+
+Your job: produce a SUPPLEMENT — add ONLY the VISUAL content the table text \
+could NOT capture; do NOT re-transcribe the table.
+
+**MOST IMPORTANT RULE.** The table cell text is already captured (see GROUND \
+TRUTH). Do NOT re-output table rows or cell values. ONLY add what lives in the \
+images and is NOT plain cell text:
+  - text inside embedded pictures / screenshots / figures
+  - labels, axes, legends, nodes in charts / diagrams / ER diagrams / flowcharts
+  - stamps, handwritten notes, callouts, annotations drawn on the sheet
+  - any visible text clearly part of a graphic, not a table cell
+If GROUND TRUTH is empty or clearly missing most of what you see in the images, \
+it failed — transcribe what you see in FULL (do not skip).
+
+If across ALL {n_images} pages there is NOTHING visual to add beyond the table \
+text in GROUND TRUTH, output EXACTLY `(no additional visual content)` and \
+nothing else.
+
+## Uncertainty markers (USE ONLY THESE)
+`[?]` partial; `[unreadable]` (reason: blur / obscured / cut-off / low-res / \
+handwritten) illegible. FORBIDDEN: `[illegible]`, `???`, ellipses, HTML \
+comments, "(low confidence)".
+
+## Rules
+- NEVER invent values. Preserve original language and numbers verbatim.
+- Compact Markdown. No code-block wrapper. No preamble.
+
+## GROUND TRUTH — openpyxl-extracted table text (already captured; do NOT repeat)
+
+---
+{ground_truth}
+---
+
+## Additional structured data (also ground truth; do NOT repeat)
+
+---
+{structured_data}
+---
+
+Now examine the {n_images} page images and output ONLY supplemental visual \
+content (or the exact `(no additional visual content)` line). Do not repeat \
+the table text; mark uncertainty; never invent."""
+
+
 def describe_pages_batched(
     image_paths: "Sequence[Path | str]",
     page_texts: list[str],
     model_config: dict[str, Any],
     structured_data: str | None = None,
     max_tokens: int = 32768,
+    supplement_only: bool = False,
+    ground_truth: str = "",
 ) -> str:
     """
     Send multiple page images of ONE logical sheet to Vision in a single
@@ -426,18 +639,30 @@ def describe_pages_batched(
             f"({len(page_texts)}) must have the same length"
         )
 
-    # Concatenate per-page text with explicit page boundaries so Vision
-    # can correlate OCR text with the corresponding image when stitching.
-    joined_text = "\n\n".join(
-        f"[page {i + 1} text]\n{t.strip() or '(empty)'}"
-        for i, t in enumerate(page_texts)
-    )
-
-    prompt = _BATCHED_PROMPT.format(
-        n_images=len(image_paths),
-        page_text=joined_text,
-        structured_data=structured_data if structured_data and structured_data.strip() else "(none)",
-    )
+    sd = structured_data if structured_data and structured_data.strip() else "(none)"
+    if supplement_only:
+        # xlsx: openpyxl already holds the table text (ground_truth); Vision only
+        # ADDS visuals, never re-transcribes — this removes xlsx duplication at
+        # the source. page_texts are intentionally unused here (they are empty
+        # for LibreOffice-rendered xlsx pages; the openpyxl ground_truth is the
+        # real table text).
+        prompt = _BATCHED_PROMPT_SUPPLEMENT.format(
+            n_images=len(image_paths),
+            ground_truth=ground_truth.strip() or "(empty — transcribe from images in full)",
+            structured_data=sd,
+        )
+    else:
+        # Concatenate per-page text with explicit page boundaries so Vision
+        # can correlate OCR text with the corresponding image when stitching.
+        joined_text = "\n\n".join(
+            f"[page {i + 1} text]\n{t.strip() or '(empty)'}"
+            for i, t in enumerate(page_texts)
+        )
+        prompt = _BATCHED_PROMPT.format(
+            n_images=len(image_paths),
+            page_text=joined_text,
+            structured_data=sd,
+        )
 
     return describe_images_batched(
         image_paths, prompt, model_config, max_tokens=max_tokens,
@@ -451,6 +676,7 @@ def describe_pages_batched_cached(
     cache: AICache | None = None,
     structured_data: str | None = None,
     doc_format: str | None = None,
+    ground_truth: str = "",
 ) -> str:
     """
     Batched multi-image Vision with caching.
@@ -473,6 +699,13 @@ def describe_pages_batched_cached(
     primary = vision_model_config.get("primary", {})
     model_name = f"{primary.get('provider', 'openai')}/{primary.get('model', 'gpt-4o-mini')}"
 
+    supplement_only = resolve_supplement_only(config, doc_format)
+    template = _BATCHED_PROMPT_SUPPLEMENT if supplement_only else _BATCHED_PROMPT
+    # supplement folds the openpyxl ground_truth into the prompt, so its content
+    # must bust the cache too; full mode has no ground_truth (tag "nogt").
+    gt_tag = _structured_data_cache_tag(ground_truth) if supplement_only else "nogt"
+    prompt_tag = ("bsupp" if supplement_only else "bfull") + "-" + _prompt_hash(template)
+
     if cache:
         # Combine all per-image content hashes in caller order — order
         # matters because Vision treats them as a sequence.
@@ -485,12 +718,14 @@ def describe_pages_batched_cached(
             content_hash=combined,
             call_fn=lambda: describe_pages_batched(
                 paths, page_texts, vision_model_config, structured_data,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens, supplement_only=supplement_only,
+                ground_truth=ground_truth,
             ),
-            extra_key=f"batched_vision|n={len(paths)}|{_structured_data_cache_tag(structured_data)}",
+            extra_key=f"batched_vision|{prompt_tag}|{gt_tag}|n={len(paths)}|{_structured_data_cache_tag(structured_data)}",
         )
     else:
         return describe_pages_batched(
             paths, page_texts, vision_model_config, structured_data,
-            max_tokens=max_tokens,
+            max_tokens=max_tokens, supplement_only=supplement_only,
+            ground_truth=ground_truth,
         )

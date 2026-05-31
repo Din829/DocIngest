@@ -1257,6 +1257,14 @@ def _has_unexpected_scripts(
     return ratio > max_ratio
 
 
+def _is_empty_supplement(text: str) -> bool:
+    """In supplement mode, Vision returns "(no additional visual content)" when
+    Docling already captured the page. Detect that sentinel (tolerant of minor
+    punctuation/whitespace) so we emit no vision-enriched block for the page."""
+    t = text.strip().strip(".。").lower()
+    return t in ("(no additional visual content)", "no additional visual content")
+
+
 def _enrich_with_vision(
     parse_result,
     config: dict[str, Any],
@@ -1397,6 +1405,13 @@ def _enrich_with_vision(
         all_image_paths = [pd.image_path for _, pd in vision_tasks]
         all_page_texts = [pd.text for _, pd in vision_tasks]
         all_page_nos = [pd.page_no for _, pd in vision_tasks]
+        from .parsers.vision import resolve_supplement_only
+        batched_supplement = resolve_supplement_only(config, doc_format)
+        # supplement (xlsx): openpyxl already extracted the table text; feed it
+        # as ground truth so Vision adds ONLY visuals, never re-transcribes the
+        # table (removes xlsx duplication at the source). parse_result.markdown
+        # here is the pre-Vision openpyxl render. full mode passes "" (unused).
+        batched_ground_truth = parse_result.markdown if batched_supplement else ""
         # Concatenate per-page structured_data so the batched prompt sees
         # the ground truth from every page in the BATCH (sliced per iteration
         # below, so each batch only sees its own pages' ground truth).
@@ -1458,6 +1473,7 @@ def _enrich_with_vision(
                         cache=cache,
                         structured_data=batch_struct,
                         doc_format=doc_format,
+                        ground_truth=batched_ground_truth,
                     ),
                     batch_timeout,
                 )
@@ -1465,6 +1481,10 @@ def _enrich_with_vision(
                 return batch_idx, None, f"{type(e).__name__}: {e}"
             if not (batch_text and batch_text.strip()):
                 return batch_idx, None, "empty response"
+            if batched_supplement and _is_empty_supplement(batch_text):
+                # supplement found nothing visual to add for this batch — normal,
+                # NOT a failure; emit no block (the openpyxl table text stands).
+                return batch_idx, "", None
 
             page_range = f"{batch_page_nos[0]}-{batch_page_nos[-1]}"
             wrapped = (
@@ -1519,6 +1539,17 @@ def _enrich_with_vision(
     # ------------------------------------------------------------------
     if not use_batched:
         parallel = get_nested(config, "performance.parallel_files", 4)
+        # Per-page supplement fix: xlsx that renders 1-sheet≈1-page goes per-page
+        # (not batched). page_data.text is EMPTY for LibreOffice-rendered xlsx
+        # pages → the supplement prompt's "Docling empty → transcribe full" escape
+        # fires → Vision re-transcribes the whole table (measured: moonmile dup
+        # 37% unchanged). Feed the openpyxl render (parse_result.markdown is
+        # pre-Vision here = the openpyxl table text) as the per-page Docling text
+        # so supplement knows the table is already captured. full mode (PDF/PPT)
+        # keeps the page's own text. Mirrors the batched-path ground_truth fix.
+        from .parsers.vision import resolve_supplement_only
+        _pp_supplement = resolve_supplement_only(config, doc_format)
+        _pp_ground = parse_result.markdown if _pp_supplement else None
 
         def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
             from .utils.timeout import run_with_timeout
@@ -1526,10 +1557,11 @@ def _enrich_with_vision(
                 # page_data.page_no is 1-based and matches the hook's
                 # convention for populating structured_extractions_per_page.
                 struct_data = structured_per_page.get(page_data.page_no)
+                pg_text = _pp_ground if _pp_ground is not None else page_data.text
                 return idx, run_with_timeout(
                     lambda: describe_page_cached(
                         image_path=page_data.image_path,
-                        page_text=page_data.text,
+                        page_text=pg_text,
                         config=config,
                         cache=cache,
                         structured_data=struct_data,
@@ -1551,8 +1583,13 @@ def _enrich_with_vision(
             }
             for future in as_completed(futures):
                 idx, result_text = future.result()
-                if result_text and result_text.strip():
-                    results[idx] = result_text.strip()
+                cleaned = result_text.strip() if result_text else ""
+                # Supplement mode: "(no additional visual content)" means Docling
+                # already captured the page — emit NO vision-enriched block for
+                # it (that's the whole point of dedup). Treat it like an empty
+                # result so it isn't appended. Not a failure: the page is fine.
+                if cleaned and not _is_empty_supplement(cleaned):
+                    results[idx] = cleaned
                     described += 1
                 else:
                     failed += 1

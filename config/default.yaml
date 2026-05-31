@@ -147,6 +147,27 @@ parsing:
   # The AI decides what to do (no code-level thresholds or filtering).
   vision:
     enabled: true             # true | false — master switch
+    supplement_only: false    # GLOBAL DEFAULT = false (full whole-page Vision).
+                              # Per-format override below flips xlsx to true.
+                              # WHY format-split (measured, not guessed):
+                              #   PDF/PPT 方眼紙 tables get FLATTENED into
+                              #   fragments by Docling's layout model (it never
+                              #   classifies them as a table). Only FULL Vision
+                              #   transcription recovers them. supplement there
+                              #   silently DROPS body text — Vision sees the
+                              #   non-empty fragment and assumes Docling has it
+                              #   (verified: contract page recall 8/8 full vs
+                              #   4/8 supplement). So PDF/PPT MUST stay full.
+                              #   xlsx is different: the openpyxl renderer
+                              #   already emits CLEAN structured tables, so
+                              #   Vision only needs to SUPPLEMENT visuals, not
+                              #   re-transcribe — flipped on via
+                              #   parsing.xlsx.vision.supplement_only. xlsx body
+                              #   text lives in the openpyxl render, which
+                              #   supplement never touches → cannot drop it.
+                              # full-mode duplication measured at only 1-9% of
+                              # the document, almost all of it xlsx tables that
+                              # the xlsx-supplement override then removes.
     max_pages: null           # Global cap on Vision API calls per file. null
                               # (default) defers to the `safety:` section for
                               # cost control — safety.mode=warn/strict runs a
@@ -513,6 +534,16 @@ parsing:
       # max_response_tokens: 32768
       # image_dpi: 200
       # model: { provider: ..., model: ... }
+      # xlsx-only: Vision SUPPLEMENTS the openpyxl table render — it ADDS visual
+      # content (embedded charts/pictures/stamps/handwriting) but NEVER
+      # re-transcribes the table rows openpyxl already extracted. Removes the
+      # xlsx Vision↔openpyxl duplication at the source (measured: foox 74% /
+      # moonmile 92% per-section re-transcription → eliminated). SAFE for body
+      # text: the table text lives in the openpyxl render, which supplement
+      # never touches, so it cannot be dropped. PDF/PPT deliberately do NOT set
+      # this (global supplement_only=false) — Docling fragments their 方眼紙
+      # tables, so they need full whole-page transcription to recover the body.
+      supplement_only: true
 
 # =============================================================================
 # Phase 2: Output Structure
