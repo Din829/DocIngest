@@ -165,11 +165,22 @@ langchain = [
                                # (lazy_load). API stable 0.3 → 1.4 (current);
                                # <2 guards against an unknown future 2.0 break.
 ]
+gui = [
+    # Desktop GUI shell (docingest.gui): pywebview opens a native window and
+    # loads the hand-written HTML/CSS/JS frontend. Core `docingest run` / CLI
+    # never imports this; it loads only when the GUI is launched.
+    # On Windows pywebview renders via the system Edge WebView2 (pythonnet
+    # bridge, pulled in automatically); Win10/11 ship it. macOS uses the
+    # bundled WebKit (pyobjc, auto-pulled). No Chromium bundled — small.
+    "pywebview>=6.2,<7",      # 6.2 is current stable; <7 guards an unknown
+                              # future major. We use the stable surface
+                              # (create_window / js_api / evaluate_js / start).
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
-# Install everything: pip install -e ".[nlp,mcp,audio,ocr,graph,langchain]"
+# Install everything: pip install -e ".[nlp,mcp,audio,ocr,graph,langchain,gui]"
 
 [project.scripts]
 docingest = "docingest.cli:app"

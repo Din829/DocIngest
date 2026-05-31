@@ -172,7 +172,11 @@ class DoclingParser(BaseParser):
         if self._converter is not None:
             return self._converter
 
-        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.document_converter import (
+            DocumentConverter,
+            PdfFormatOption,
+            ImageFormatOption,
+        )
         from docling.datamodel.pipeline_options import PdfPipelineOptions
         from docling.datamodel.base_models import InputFormat
 
@@ -219,12 +223,20 @@ class DoclingParser(BaseParser):
             image_dpi = get_nested(self.config, "parsing.vision.image_dpi", 180)
             pipeline_options.images_scale = image_dpi / 72.0
 
-        # Build converter with PDF options
+        # Build converter with PDF + IMAGE options sharing the same
+        # pipeline_options. Both formats run through StandardPdfPipeline, so
+        # injecting our pipeline_options (with do_ocr=False) into IMAGE too
+        # reaches image inputs — otherwise IMAGE falls back to Docling's
+        # default ImageFormatOption whose do_ocr defaults to True, re-enabling
+        # the CJK-mismatched RapidOCR we deliberately disabled. IMAGE uses
+        # ImageFormatOption (its ImageDocumentBackend) rather than
+        # PdfFormatOption to avoid Docling's deprecated-backend auto-correction.
+        # The other formats (DOCX / PPTX / XLSX / HTML / MD / CSV) use
+        # SimplePipeline, which has no OCR stage, so they need no options here.
         self._converter = DocumentConverter(
             format_options={
-                InputFormat.PDF: PdfFormatOption(
-                    pipeline_options=pipeline_options
-                ),
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+                InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline_options),
             }
         )
         return self._converter
@@ -334,6 +346,64 @@ class DoclingParser(BaseParser):
                 success=False,
                 error=f"Docling parse failed: {e}",
             )
+
+    def export_with_images(
+        self,
+        file_path: Path,
+        output_md_path: Path,
+        *,
+        image_mode: str = "referenced",
+    ) -> bool:
+        """
+        Export a document to Markdown WITH images, for human-facing preview only.
+
+        Independent of the main `parse()` path — the main pipeline keeps writing
+        image-free Markdown (``<!-- image -->`` placeholders) so the RAG product
+        stays clean. This method re-parses the file and uses Docling's native
+        ``ImageRefMode`` to emit images, then writes to ``output_md_path``.
+
+        Docling already extracts picture images (``generate_picture_images``),
+        so the only difference from the main export is the ``image_mode``
+        argument — no bbox cropping needed. Works uniformly for PDF / PPTX /
+        DOCX / HTML (every format Docling supports). xlsx is NOT routed here
+        (it uses the openpyxl renderer, not Docling export).
+
+        Args:
+            file_path: Input document.
+            output_md_path: Where to write the image-bearing Markdown. For
+                ``referenced`` mode Docling writes a sibling ``*_artifacts/``
+                image folder next to it; for ``embedded`` mode images are
+                inlined as base64 (no extra files).
+            image_mode: ``"referenced"`` (PNG files + ``![](path)``) or
+                ``"embedded"`` (base64 inline). Defaults to referenced.
+
+        Returns:
+            True on success, False on any failure (never raises — preview is
+            best-effort; a failure just means "no image-bearing preview").
+        """
+        try:
+            from docling_core.types.doc import ImageRefMode
+        except Exception as e:
+            logger.warning(f"ImageRefMode unavailable, cannot export with images: {e}")
+            return False
+
+        mode = (
+            ImageRefMode.EMBEDDED
+            if str(image_mode).lower() == "embedded"
+            else ImageRefMode.REFERENCED
+        )
+
+        try:
+            converter = self._get_converter()
+            doc = converter.convert(str(file_path)).document
+            output_md_path.parent.mkdir(parents=True, exist_ok=True)
+            doc.save_as_markdown(output_md_path, image_mode=mode)
+            return True
+        except Exception as e:
+            logger.warning(
+                f"export_with_images failed for {file_path.name}: {e}"
+            )
+            return False
 
     @staticmethod
     def _extract_bounding_boxes(doc) -> dict:

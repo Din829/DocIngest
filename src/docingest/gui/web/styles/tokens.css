@@ -1,0 +1,49 @@
+/*
+ * Design tokens — 1:1 mirror of GUI_DRAFT.pen variables.
+ * Single source of truth for color / spacing / type. Every screen reads
+ * these; never hardcode a hex or px that has a token here.
+ *
+ * Extracted via Pencil get_variables on GUI_DRAFT.pen. Keep names identical
+ * to the .pen variables (pen "$ink" -> CSS "--ink") so the design and the
+ * code stay legibly in sync.
+ */
+
+:root {
+  /* ---- Color ---- */
+  --bg: #FFFFFF;            /* page background — pure white */
+  --ink: #1A1815;          /* primary text / primary button (== accent) */
+  --accent: #1A1815;       /* primary action — same ink black, by design */
+  --ink-2: #6B6760;        /* secondary text */
+  --ink-3: #A8A399;        /* tertiary text, placeholders, icons */
+
+  --panel: #F6F7F8;        /* card / panel light fill */
+  --inset: #EEF0F2;        /* inset controls (dropdowns, tabs) */
+  --accent-soft: #ECE9DF;  /* warm beige soft fill */
+
+  --line: #E8EAED;         /* hairline divider */
+  --line-2: #DADDE1;       /* heavier border */
+
+  /* Status — the only saturated colors, reserved for things that matter */
+  --ok: #5A7355;           /* success (ink green) */
+  --ok-soft: #EAEFE6;
+  --warn: #9A6B1E;         /* warning (earth yellow) */
+  --warn-soft: #F4ECD9;
+  --alert: #A14A3A;        /* over-budget notice (brick) */
+  --danger: #9E4A3C;       /* parse failure ✗ (deep brick) */
+
+  /* ---- Type ---- */
+  --font-serif-jp: "Noto Serif JP", serif;  /* JP display headings */
+  --font-serif: "Newsreader", serif;        /* western serif (brand / preview body title) */
+  --font-sans: "Noto Sans JP", sans-serif;  /* body, buttons, captions */
+  --font-mono: "IBM Plex Mono", monospace;  /* numbers, filenames, costs, tech values */
+
+  /* ---- Spacing — 4px base ladder ---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+  --sp-8: 64px;
+}

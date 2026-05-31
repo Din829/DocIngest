@@ -1,0 +1,539 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DocIngest</title>
+
+  <!-- Fonts + icons. Loaded from CDN in dev; for the packaged exe (data must
+       not leave the machine) both get vendored locally and these links swapped
+       for local files — handled at packaging time. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Newsreader:wght@400;500&family=Noto+Sans+JP:wght@400;500;600&family=Noto+Serif+JP:wght@500&display=swap"
+    rel="stylesheet"
+  />
+
+  <link rel="stylesheet" href="styles/tokens.css" />
+  <link rel="stylesheet" href="styles/base.css" />
+  <link rel="stylesheet" href="styles/screens.css" />
+</head>
+<body data-home-state="empty">
+  <!-- App shell. Screens are pen top-level frames, swapped by toggling
+       .is-active. The home screen folds pen 01 (empty) + 02 (selected) into
+       one screen whose state is driven by body[data-home-state]; dialog
+       overlays (09/10) sit above as .overlay. -->
+  <div id="app">
+
+    <!-- HOME — pen 01 ホーム・空 / 02 ホーム・選択済み (one screen, two states) -->
+    <section class="screen is-active" data-screen="home">
+      <header class="topbar row between items-center">
+        <div class="brand row items-center gap-3">
+          <i data-lucide="asterisk" class="brand-mark"></i>
+          <span class="brand-name">DocIngest</span>
+        </div>
+        <div class="top-actions row items-center gap-1">
+          <button class="gear-btn" data-go="library" title="ライブラリ">
+            <i data-lucide="library"></i>
+          </button>
+          <button class="gear-btn" data-go="settings-env" title="設定">
+            <i data-lucide="settings"></i>
+          </button>
+        </div>
+      </header>
+
+      <main class="home-main col items-center">
+        <div class="center-col col gap-6" style="width: 640px;">
+          <!-- Hero — copy swaps by state -->
+          <div class="hero col gap-3 items-center">
+            <h1 class="hero-title" data-when="empty">何を準備しましょうか</h1>
+            <h1 class="hero-title" data-when="selected">ドキュメントを準備する</h1>
+            <p class="hero-sub" data-when="empty">処理したいファイルをドロップしてください</p>
+            <p class="hero-sub" data-when="selected">すべてこの端末内で処理されます</p>
+          </div>
+
+          <!-- FileCard: settings popover + dropzone + url hint + file list -->
+          <div class="file-card col gap-5">
+            <!-- Per-run processing settings — an icon button pinned to the
+                 input card's top-right corner (MinerU-style), opening a
+                 popover. Icon only (the topbar gear is the system settings;
+                 this sliders icon is the per-run knobs). Always present. -->
+            <div class="ps-anchor" id="ps-anchor">
+              <button class="ps-trigger" id="ps-toggle" title="処理設定">
+                <i data-lucide="sliders-horizontal"></i>
+              </button>
+              <div class="ps-popover col" id="proc-settings">
+                <div class="ps-body col" id="ps-body"></div>
+              </div>
+            </div>
+
+            <button id="dropzone" class="dropzone col gap-3 items-center center">
+              <i data-lucide="cloud-upload" class="dz-icon"></i>
+              <span class="dz-text">ファイルをドロップ または クリックで選択</span>
+            </button>
+
+            <div class="url-input row items-center gap-3">
+              <i data-lucide="link" class="ui-icon"></i>
+              <input
+                type="text"
+                class="url-field fill"
+                id="url-field"
+                placeholder="または URL を貼り付け（YouTube・Web ページなど）"
+              />
+              <button class="url-add" id="url-add" title="追加">
+                <i data-lucide="plus"></i>
+              </button>
+            </div>
+
+            <!-- Selected-file list (pen 02 ListWrap). Rows injected by JS. -->
+            <div class="list-wrap col gap-3" data-when="selected">
+              <div class="list-head row between items-center">
+                <span class="list-label" id="list-count">選択中 · 0 件</span>
+                <span class="list-clear clickable" id="list-clear">すべて削除</span>
+              </div>
+              <div class="file-list col" id="file-list"></div>
+            </div>
+          </div>
+
+          <!-- Actions — primary button is disabled (灰) in empty state -->
+          <div class="actions col gap-4">
+            <button id="btn-primary" class="btn-primary center items-center gap-2" disabled>
+              <span class="bp-text">処理を開始</span>
+              <i data-lucide="arrow-right" class="bp-icon"></i>
+            </button>
+            <div class="est-link row items-center gap-2" data-when="selected" id="est-link">
+              <i data-lucide="calculator" class="el-icon"></i>
+              <span class="el-text">処理コストを確認</span>
+            </div>
+          </div>
+        </div>
+      </main>
+    </section>
+
+    <!-- 03 処理中 — progress is file-level & completion-only (backend emits
+         one file_done event per file; no mid-file stage events). We render
+         completed files by real status, mark the current one 処理中, the rest
+         待機中. -->
+    <section class="screen" data-screen="processing">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="home"
+                data-back-confirm="処理を中止してホームに戻りますか？">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <div class="brand row items-center gap-3">
+          <i data-lucide="asterisk" class="brand-mark"></i>
+          <span class="brand-name">DocIngest</span>
+        </div>
+        <span class="topbar-spacer"></span>
+      </header>
+
+      <main class="proc-main col items-center">
+        <div class="center-col col gap-6" style="width: 600px;">
+          <div class="hero col gap-3 items-center">
+            <h1 class="hero-title">処理しています</h1>
+            <p class="hero-sub" id="proc-sub">0 / 0 件 完了</p>
+          </div>
+
+          <div class="progress-bar" id="proc-bar">
+            <div class="progress-fill" id="proc-fill"></div>
+          </div>
+
+          <div class="progress-list col" id="proc-list"></div>
+
+          <div class="stop-wrap row center">
+            <button class="stop-btn row items-center gap-2" id="proc-stop"
+                    data-back="home"
+                    data-back-confirm="ホームに戻ります。処理はバックグラウンドで続行し、完了後ライブラリ一覧に表示されます。よろしいですか？">
+              <i data-lucide="square" class="stop-icon"></i>
+              <span>処理を中止</span>
+            </button>
+          </div>
+        </div>
+      </main>
+    </section>
+    <!-- 04 完了・成果物 -->
+    <section class="screen" data-screen="done">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="home">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <div class="brand row items-center gap-3">
+          <i data-lucide="asterisk" class="brand-mark"></i>
+          <span class="brand-name">DocIngest</span>
+        </div>
+        <button class="gear-btn" data-go="settings-env" title="設定">
+          <i data-lucide="settings"></i>
+        </button>
+      </header>
+
+      <main class="done-main col items-center">
+        <div class="center-col col gap-6" style="width: 920px;">
+          <div class="hero col gap-3 items-center">
+            <h1 class="hero-title">準備が完了しました</h1>
+            <p class="hero-sub">ナレッジベースを生成しました</p>
+          </div>
+
+          <!-- Stats (pen Stats: 4 metrics, top+bottom hairline) -->
+          <div class="stats row between" id="done-stats">
+            <div class="metric col gap-2">
+              <span class="m-label">完了</span>
+              <span class="m-value mono is-ok" id="m-done">0</span>
+            </div>
+            <div class="metric col gap-2">
+              <span class="m-label">キャッシュ再利用</span>
+              <span class="m-value mono is-muted" id="m-cached">0</span>
+            </div>
+            <div class="metric col gap-2">
+              <span class="m-label">失敗</span>
+              <span class="m-value mono" id="m-failed">0</span>
+            </div>
+            <div class="metric col gap-2">
+              <span class="m-label">合計コスト</span>
+              <span class="m-value mono" id="m-cost">$0.0000</span>
+            </div>
+          </div>
+
+          <!-- NoticeBox (pen: warnings + unreadable notes; hidden if none) -->
+          <div class="notice-box col gap-3 is-hidden" id="done-notices"></div>
+
+          <!-- Two columns: left = artifacts + actions, right = preview -->
+          <div class="done-cols row gap-6">
+            <div class="left-col col gap-5" style="width: 300px;">
+              <div class="files-sec col gap-3">
+                <span class="sec-label">生成物</span>
+                <div class="art-row row items-center gap-3">
+                  <i data-lucide="folder" class="art-icon"></i>
+                  <div class="art-text col">
+                    <span class="art-name mono">sources/</span>
+                    <span class="art-desc" id="art-sources-desc">0 件の Markdown</span>
+                  </div>
+                </div>
+                <div class="art-row row items-center gap-3">
+                  <i data-lucide="braces" class="art-icon"></i>
+                  <div class="art-text col">
+                    <span class="art-name mono">chunks.jsonl</span>
+                    <span class="art-desc" id="art-chunks-desc">0 チャンク</span>
+                  </div>
+                </div>
+                <div class="art-row row items-center gap-3">
+                  <i data-lucide="list-tree" class="art-icon"></i>
+                  <div class="art-text col">
+                    <span class="art-name mono">index.json</span>
+                    <span class="art-desc">ファイル索引</span>
+                  </div>
+                </div>
+                <div class="art-row row items-center gap-3">
+                  <i data-lucide="compass" class="art-icon"></i>
+                  <div class="art-text col">
+                    <span class="art-name mono">knowledge_map</span>
+                    <span class="art-desc">検索ガイド</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="done-actions col gap-3">
+                <button class="open-btn row center items-center gap-2" id="done-open">
+                  <i data-lucide="folder-open"></i><span>フォルダを開く</span>
+                </button>
+                <button class="ghost-btn row center items-center gap-2" id="done-refine">
+                  <i data-lucide="sparkles"></i><span>読みやすく整形</span>
+                </button>
+                <button class="ghost-btn row center items-center gap-2" id="done-graph">
+                  <i data-lucide="share-2"></i><span>知識グラフを構築</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="preview-col col gap-3 fill">
+              <div class="pv-head row between items-center">
+                <span class="sec-label">プレビュー</span>
+                <select class="pv-select mono" id="pv-select"></select>
+              </div>
+              <div class="pv-body" id="pv-body"></div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </section>
+    <!-- 05 設定・環境チェック -->
+    <section class="screen" data-screen="settings-env">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="home">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <span class="settings-title">設定</span>
+        <span class="topbar-spacer"></span>
+      </header>
+      <div class="settings-body row gap-7">
+        <nav class="settings-nav col gap-1">
+          <button class="nav-item row items-center gap-3 is-active" data-go="settings-env">
+            <i data-lucide="activity" class="ni-icon"></i><span>環境チェック</span>
+          </button>
+          <button class="nav-item row items-center gap-3" data-go="settings-model">
+            <i data-lucide="cpu" class="ni-icon"></i><span>AI モデル</span>
+          </button>
+          <button class="nav-item row items-center gap-3" data-go="settings-cost">
+            <i data-lucide="shield" class="ni-icon"></i><span>コスト上限</span>
+          </button>
+        </nav>
+        <div class="settings-content col gap-6">
+          <div class="sec-head col gap-2">
+            <h2 class="sec-title">環境チェック</h2>
+            <p class="sec-sub">処理に必要な API キー・外部ツールの状態を確認します。</p>
+          </div>
+          <div class="check-group col gap-3">
+            <span class="grp-label">API キー</span>
+            <div class="check-list col" id="env-keys"></div>
+          </div>
+          <div class="check-group col gap-3">
+            <span class="grp-label">外部ツール</span>
+            <div class="check-list col" id="env-tools"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 06 設定・AIモデル -->
+    <section class="screen" data-screen="settings-model">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="home">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <span class="settings-title">設定</span>
+        <span class="topbar-spacer"></span>
+      </header>
+      <div class="settings-body row gap-7">
+        <nav class="settings-nav col gap-1">
+          <button class="nav-item row items-center gap-3" data-go="settings-env">
+            <i data-lucide="activity" class="ni-icon"></i><span>環境チェック</span>
+          </button>
+          <button class="nav-item row items-center gap-3 is-active" data-go="settings-model">
+            <i data-lucide="cpu" class="ni-icon"></i><span>AI モデル</span>
+          </button>
+          <button class="nav-item row items-center gap-3" data-go="settings-cost">
+            <i data-lucide="shield" class="ni-icon"></i><span>コスト上限</span>
+          </button>
+        </nav>
+        <div class="settings-content col gap-6">
+          <div class="sec-head col gap-2">
+            <h2 class="sec-title">AI モデル</h2>
+            <p class="sec-sub">解析に使う AI モデルと API キーを設定します。</p>
+          </div>
+
+          <div class="model-group col gap-3">
+            <span class="grp-label">Vision（画像解析）</span>
+            <div class="model-row row between items-center">
+              <span class="mr-label">画像・ドキュメント解析</span>
+              <select class="mr-select mono" id="model-vision"></select>
+            </div>
+          </div>
+
+          <div class="model-group col gap-3">
+            <span class="grp-label">音声文字起こし（ASR）</span>
+            <div class="model-row row between items-center">
+              <span class="mr-label">音声の文字起こし</span>
+              <select class="mr-select mono" id="model-asr"></select>
+            </div>
+          </div>
+
+          <div class="model-group col gap-3">
+            <span class="grp-label">API キー</span>
+            <div class="key-list col gap-3" id="model-keys"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 07 設定・コスト上限 -->
+    <section class="screen" data-screen="settings-cost">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="home">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <span class="settings-title">設定</span>
+        <span class="topbar-spacer"></span>
+      </header>
+      <div class="settings-body row gap-7">
+        <nav class="settings-nav col gap-1">
+          <button class="nav-item row items-center gap-3" data-go="settings-env">
+            <i data-lucide="activity" class="ni-icon"></i><span>環境チェック</span>
+          </button>
+          <button class="nav-item row items-center gap-3" data-go="settings-model">
+            <i data-lucide="cpu" class="ni-icon"></i><span>AI モデル</span>
+          </button>
+          <button class="nav-item row items-center gap-3 is-active" data-go="settings-cost">
+            <i data-lucide="shield" class="ni-icon"></i><span>コスト上限</span>
+          </button>
+        </nav>
+        <div class="settings-content col gap-6">
+          <div class="sec-head col gap-2">
+            <h2 class="sec-title">コスト上限</h2>
+            <p class="sec-sub">処理前のコスト確認で、これらの上限を超えると警告します。</p>
+          </div>
+
+          <div class="cost-group col gap-3">
+            <span class="grp-label">セーフティモード</span>
+            <div class="seg row" id="cost-mode"></div>
+          </div>
+
+          <div class="cost-group col gap-3">
+            <span class="grp-label">ファイル単位の上限</span>
+            <div class="limit-list col" id="cost-per-file"></div>
+          </div>
+
+          <div class="cost-group col gap-3">
+            <span class="grp-label">実行全体の上限</span>
+            <div class="limit-list col" id="cost-per-run"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <!-- 11 ナレッジグラフ・未構築 -->
+    <section class="screen" data-screen="graph-empty">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="done">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <div class="brand row items-center gap-3">
+          <i data-lucide="asterisk" class="brand-mark"></i>
+          <span class="brand-name">DocIngest</span>
+        </div>
+        <span class="topbar-spacer"></span>
+      </header>
+      <main class="graph-main col items-center">
+        <div class="graph-col col gap-6" style="width: 680px;">
+          <div class="hero col gap-3 items-center">
+            <h1 class="graph-title">知識グラフを構築する</h1>
+            <p class="hero-sub">文書をまたいだ質問に答えるための準備です</p>
+          </div>
+          <div class="build-card col gap-5 items-center">
+            <i data-lucide="share-2" class="bc-icon"></i>
+            <p class="bc-desc">このナレッジベースには、まだ知識グラフがありません。構築すると、複数の文書をまたいだ「関係」や「テーマ」を質問できるようになります。</p>
+            <div class="bc-cost row items-center gap-2">
+              <i data-lucide="info" class="bc-ci"></i>
+              <span>構築には LLM の利用料がかかります。</span>
+            </div>
+            <button class="build-btn row center items-center gap-2" id="graph-build">
+              <i data-lucide="sparkles"></i><span>知識グラフを構築</span>
+            </button>
+          </div>
+        </div>
+      </main>
+    </section>
+
+    <!-- 12 ナレッジグラフ・構築中 -->
+    <section class="screen" data-screen="graph-building">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="done"
+                data-back-confirm="構築を中止してライブラリに戻りますか？処理はバックグラウンドで続行します。">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <div class="brand row items-center gap-3">
+          <i data-lucide="asterisk" class="brand-mark"></i>
+          <span class="brand-name">DocIngest</span>
+        </div>
+        <span class="topbar-spacer"></span>
+      </header>
+      <main class="graph-main col items-center">
+        <div class="graph-col col gap-6" style="width: 600px;">
+          <div class="hero col gap-3 items-center">
+            <h1 class="graph-title">知識グラフを構築しています</h1>
+            <p class="hero-sub" id="graph-sub">準備中…</p>
+          </div>
+          <div class="progress-bar" id="graph-bar">
+            <div class="progress-fill" id="graph-fill"></div>
+          </div>
+          <p class="graph-note">完了まで数分かかることがあります。</p>
+        </div>
+      </main>
+    </section>
+
+    <!-- ライブラリ一覧 (history) — lists processed libraries under the GUI
+         output root via list_knowledge. Not in the pen (new); follows the
+         settings-screen shell style. Click a library → opens it in screen 04. -->
+    <section class="screen" data-screen="library">
+      <header class="topbar row between items-center">
+        <button class="back-btn row items-center gap-2" data-back="home">
+          <i data-lucide="arrow-left"></i><span>戻る</span>
+        </button>
+        <span class="settings-title">ライブラリ</span>
+        <span class="topbar-spacer"></span>
+      </header>
+      <main class="library-main col items-center">
+        <div class="library-col col gap-4" style="width: 720px;">
+          <div class="sec-head col gap-2">
+            <h2 class="sec-title">ナレッジベース</h2>
+            <p class="sec-sub">これまでに作成したナレッジベースの一覧です。</p>
+          </div>
+          <div class="lib-list col gap-3" id="lib-list"></div>
+        </div>
+      </main>
+    </section>
+
+    <!-- Dialog overlays -->
+    <!-- 09 ダイアログ・コスト確認 -->
+    <div class="overlay" data-overlay="cost-confirm">
+      <div class="dialog col gap-5">
+        <div class="dlg-head col gap-2">
+          <h2 class="dlg-title">処理コストの確認</h2>
+          <p class="dlg-sub">Vision API はページ単位で課金されます。開始前にご確認ください。</p>
+        </div>
+
+        <div class="mini-table col" id="cost-rows"></div>
+
+        <div class="cost-total row between items-center">
+          <span class="ct-label" id="cost-total-label">合計</span>
+          <span class="ct-value mono" id="cost-total">$0.0000</span>
+        </div>
+
+        <div class="warn-note row items-center gap-2 is-hidden" id="cost-warn">
+          <i data-lucide="triangle-alert" class="cw-icon"></i>
+          <span class="cw-text"></span>
+        </div>
+
+        <div class="dlg-actions row end gap-3">
+          <button class="btn-ghost" id="cost-cancel">キャンセル</button>
+          <button class="btn-accent" id="cost-confirm-btn">確認して処理を開始</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 10 ダイアログ・整形方式 -->
+    <div class="overlay" data-overlay="refine-style">
+      <div class="dialog col gap-5">
+        <h2 class="dlg-title-jp">整形のスタイルを選ぶ</h2>
+        <div class="refine-opts col gap-3" id="refine-opts">
+          <button class="refine-opt col gap-1 is-selected" data-skill="refine_faithful">
+            <span class="ro-title">原文に忠実</span>
+            <span class="ro-desc">言葉を変えず、重複の削除と整形のみ。契約書・規程など正確さ重視の文書に。</span>
+          </button>
+          <button class="refine-opt col gap-1" data-skill="refine_default">
+            <span class="ro-title">読みやすく書き換え</span>
+            <span class="ro-desc">意味を保ちつつ、より読みやすい文章に調整します。</span>
+          </button>
+          <button class="refine-opt col gap-1" data-skill="refine_html">
+            <span class="ro-title">HTML で出力</span>
+            <span class="ro-desc">忠実な内容を HTML 形式で書き出します。</span>
+          </button>
+        </div>
+        <div class="dlg-actions row end gap-3">
+          <button class="btn-ghost" id="refine-cancel">キャンセル</button>
+          <button class="btn-accent" id="refine-go">整形する</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- lucide icon font/SVG replacer (CDN in dev; vendored at packaging) -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- Markdown preview rendering. marked parses MD → HTML; DOMPurify sanitizes
+       it (marked doesn't sanitize — the MD comes from parsed documents, an
+       external-data boundary, so we clean it). CDN in dev; vendored at
+       packaging (data must not leave the machine). -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

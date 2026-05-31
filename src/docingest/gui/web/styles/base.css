@@ -1,0 +1,171 @@
+/*
+ * Base layer — reset + the pen→CSS translation rules.
+ *
+ * GUI_DRAFT.pen uses its own layout model; this file maps that model onto
+ * CSS once, so every screen below composes with the same primitives instead
+ * of re-deriving layout. The mapping (kept deliberately small):
+ *
+ *   pen                              CSS
+ *   ────────────────────────────     ───────────────────────────────────
+ *   frame layout:"vertical"          .col   (flex column)
+ *   frame layout:"horizontal"        .row   (flex row, default in pen)
+ *   gap: $sp-n                        gap: var(--sp-n)
+ *   padding: [v,h] / all-sides        padding utilities / inline style
+ *   width:"fill_container"            .fill  (flex: 1 1 0 along main axis)
+ *   width:"fit_content"              default (flex: 0 0 auto)
+ *   alignItems:"center"              .items-center  (cross-axis)
+ *   justifyContent:"space_between"   .between
+ *   justifyContent:"center"          .center
+ *   justifyContent:"end"             .end
+ *   cornerRadius: n                   border-radius: npx (inline)
+ *   fill: $token                      background: var(--token) (inline)
+ *   stroke {thickness,fill}           border (inline)
+ *
+ * Numeric one-off sizes from the pen (e.g. CenterCol width:600) stay inline
+ * on the element — they're layout facts of a specific screen, not tokens.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Whole-window scroll: content taller than the window scrolls; content that
+     fits stays put (screens use min-height:100% + flex centering below). */
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* pen frames are flex containers. Default pen direction is horizontal. */
+.row {
+  display: flex;
+  flex-direction: row;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+}
+
+/* width/height "fill_container" → grow to fill the parent's main axis */
+.fill {
+  flex: 1 1 0;
+  min-width: 0;   /* allow children to shrink below content size (text ellipsis) */
+  min-height: 0;
+}
+
+/* cross-axis + main-axis alignment helpers (pen alignItems / justifyContent) */
+.items-center { align-items: center; }
+.items-start  { align-items: flex-start; }
+.items-end    { align-items: flex-end; }
+.center  { justify-content: center; }
+.between { justify-content: space-between; }
+.end     { justify-content: flex-end; }
+
+/* gap ladder — mirrors the spacing tokens so markup reads like the pen */
+.gap-1 { gap: var(--sp-1); }
+.gap-2 { gap: var(--sp-2); }
+.gap-3 { gap: var(--sp-3); }
+.gap-4 { gap: var(--sp-4); }
+.gap-5 { gap: var(--sp-5); }
+.gap-6 { gap: var(--sp-6); }
+.gap-7 { gap: var(--sp-7); }
+
+/* Buttons/clickables get a pointer + reset native look; the pen styles the
+   rest (fill/radius/padding) per element. */
+button,
+.clickable {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  background: none;
+  color: inherit;
+}
+
+/* Inputs inherit the type system; per-screen styling adds borders/fills. */
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* App shell. min-height:100vh = the real viewport height, so child screens
+   have a concrete height to center against; content taller than the viewport
+   grows past it and the window scrolls. (min-height:100% fails here: a %
+   min-height has no definite parent height to resolve against, so the flex:1
+   main collapses and justify-content:center pushes the hero off-screen.) */
+#app {
+  position: relative;   /* overlays use fixed; this is just a containing box */
+  min-height: 100vh;
+  width: 100%;
+}
+
+/* Screen container: one app shell, screens swapped by toggling .is-active.
+   min-height:100vh → short content centers in the window; tall content grows
+   past it and the window scrolls (no clipping). */
+.screen {
+  display: none;
+  width: 100%;
+  min-height: 100vh;
+}
+.screen.is-active {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Dialog overlay screens (pen 09 / 10): dim backdrop + centered card.
+   Fixed to the viewport so the dialog stays centered and the backdrop covers
+   the whole window even when the screen behind it has scrolled. */
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: #1A181580;  /* pen dialog backdrop */
+  padding: var(--sp-8);
+  z-index: 10;
+}
+.overlay.is-active {
+  display: flex;
+}
+
+/* Mono numerals shouldn't wobble in tables / cost columns. */
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* State-driven visibility for the home screen's two states (pen 01 empty /
+   02 selected). Each element declares its state via data-when; app.js toggles
+   a single .is-hidden class so the shown element keeps its own display (block
+   for text, flex for .row/.col) — forcing a display value here would break
+   either the text nodes or the flex containers. .is-hidden wins on
+   specificity + !important so it reliably hides regardless of element type. */
+.is-hidden { display: none !important; }
+
+/* lucide swaps <i data-lucide> into an <svg>; size it to the icon box and
+   keep it baseline-neutral so icon+text rows align (svg defaults to baseline
+   alignment, which nudges adjacent text upward). */
+[data-lucide] {
+  width: 1em;
+  height: 1em;
+  stroke-width: 2;
+  vertical-align: middle;
+  flex-shrink: 0;
+}

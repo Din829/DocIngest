@@ -1,0 +1,798 @@
+/*
+ * Per-screen styles — each block restores one GUI_DRAFT.pen screen, named
+ * after its pen frame. Values trace back to the pen node tree (padding,
+ * radius, fill, stroke, font); tokens come from tokens.css.
+ *
+ * Built screen-by-screen. This pass: 01 ホーム・空 + shared chrome (topbar).
+ */
+
+/* ---- shared: topbar (pen Topbar, padding [$sp-5,$sp-8]) ---- */
+.topbar {
+  padding: var(--sp-5) var(--sp-8);
+  width: 100%;
+}
+.brand-mark {
+  font-size: 22px;
+  color: var(--ink);
+  line-height: 1;
+}
+.brand-name {
+  font-family: var(--font-serif);
+  font-size: 20px;
+  font-weight: 500;
+  color: var(--ink);
+  letter-spacing: -0.3px;
+}
+.gear-btn {
+  padding: var(--sp-2);
+  border-radius: 8px;
+  color: var(--ink-2);
+  font-size: 19px;
+  line-height: 1;
+}
+
+/* ---- 01 ホーム・空 ---- */
+/* Main: vertical, fills below topbar, content top-aligned (pen Main has
+   alignItems:center but NO justifyContent → defaults to start: content flows
+   from the top padding down, not vertically centered). The sp-7 top padding
+   is the intended breathing room. When content exceeds the viewport it grows
+   and the window scrolls — no clipping, because we don't center.
+   pen Main: padding [$sp-7,$sp-8,$sp-8,$sp-8], gap $sp-7, alignItems center. */
+.home-main {
+  flex: 1 1 0;
+  min-height: 0;
+  padding: var(--sp-7) var(--sp-8) var(--sp-8);
+}
+
+/* Hero (pen Hero, gap $sp-3) */
+.hero-title {
+  font-family: var(--font-serif-jp);
+  font-size: 34px;
+  font-weight: 500;
+  color: var(--ink);
+  text-align: center;
+}
+.hero-sub {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  text-align: center;
+  max-width: 400px;
+}
+
+/* FileCard (pen FileCard, gap $sp-5). Relative so the settings icon button
+   can pin to its top-right corner. */
+.file-card { position: relative; }
+.dropzone {
+  width: 100%;
+  /* min-height (not fixed height) keeps it roomy like MinerU's drop area while
+     staying flexible — it never collapses, and could grow if content needs. */
+  min-height: 240px;
+  padding: var(--sp-8);
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.dropzone.is-dragover {
+  border-color: var(--ink);
+  background: var(--inset);
+}
+.dz-icon {
+  font-size: 28px;
+  color: var(--ink-3);
+  line-height: 1;
+}
+.dz-text {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  color: var(--ink-2);
+}
+
+/* UrlInput (pen: padding [$sp-3,$sp-4], radius 10, panel fill). The URL text
+   is a static hint in the pen (announces the capability), not a live field. */
+.url-input {
+  width: 100%;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.ui-icon {
+  color: var(--ink-3);
+  font-size: 15px;
+}
+.url-field {
+  font-size: 13px;
+  color: var(--ink);
+  background: none;
+  border: none;
+  outline: none;
+}
+.url-field::placeholder { color: var(--ink-3); }
+.url-add {
+  color: var(--ink-3);
+  padding: var(--sp-1);
+  border-radius: 6px;
+  display: flex;
+}
+.url-add [data-lucide] { font-size: 16px; }
+.url-add:hover { color: var(--ink); background: var(--inset); }
+
+/* Primary action (pen BtnPrimary: fill $inset, radius 10, padding [$sp-4,0],
+   gap $sp-2, centered). pen's empty-state shows text+icon in $ink-3 (a muted,
+   not-yet-actionable look); selected state is ink. We model that with the
+   :disabled state so the look tracks whether a selection exists. */
+.btn-primary {
+  width: 100%;
+  padding: var(--sp-4) 0;
+  border-radius: 10px;
+  background: var(--inset);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.btn-primary .bp-icon {
+  font-size: 16px;
+}
+.btn-primary:disabled {
+  color: var(--ink-3);
+  cursor: default;
+}
+.btn-primary:not(:disabled):hover {
+  background: var(--line);
+}
+
+/* EstLink (pen 02 Dec8w: muted cost-check entry under the primary button) */
+.est-link {
+  align-self: center;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.el-icon { font-size: 14px; }
+.el-text { font-size: 13px; }
+
+/* ---- 02 selected state ---- */
+
+/* Selected-file list (pen 02 ListWrap) */
+.list-head { width: 100%; }
+.list-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--ink-3);
+}
+.list-clear {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+.file-list { width: 100%; }
+/* Row (pen FileRow: padding [$sp-3,0], bottom hairline; last row none) */
+.file-row {
+  width: 100%;
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--line);
+}
+.file-row:last-child { border-bottom: none; }
+.fr-icon { font-size: 15px; color: var(--ink-3); }
+.fr-name { font-size: 13px; color: var(--ink); }
+.fr-meta { font-size: 11px; color: var(--ink-3); }
+.fr-x { font-size: 13px; color: var(--ink-3); }
+.fr-x:hover { color: var(--ink); }
+
+/* Processing settings — an icon button pinned inside the input card's
+   top-right corner (MinerU-style), opening a popover. Icon only; the topbar
+   gear is the system settings, this is the per-run knobs. Always present.
+   .is-open lives on #proc-settings. */
+.ps-anchor {
+  position: absolute;
+  top: var(--sp-4);
+  right: var(--sp-4);
+  z-index: 5;
+}
+.ps-trigger {
+  padding: var(--sp-2);
+  border-radius: 8px;
+  color: var(--ink-2);
+  display: flex;
+}
+.ps-trigger:hover { background: var(--inset); }
+.ps-trigger [data-lucide] { font-size: 18px; }
+
+/* Popover card: anchored under the trigger, right-aligned, soft shadow.
+   Hidden unless #proc-settings has .is-open. */
+.ps-popover {
+  position: absolute;
+  top: calc(100% + var(--sp-2));
+  right: 0;
+  width: 320px;
+  border-radius: 12px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 32px #1A181524;
+  padding: var(--sp-2) var(--sp-4) var(--sp-4);
+  z-index: 20;
+  display: none;
+}
+.ps-popover.is-open { display: flex; }
+.ps-body { width: 100%; }
+/* Each option row (pen Row: padding-top $sp-3, label left / control right) */
+.ps-row {
+  width: 100%;
+  padding-top: var(--sp-3);
+}
+.ps-label { font-size: 13px; color: var(--ink); }
+
+/* Dropdown (pen DD: inset fill, radius 6, mono value, thin border) */
+.ps-select {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--inset);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: var(--sp-1) var(--sp-3);
+  cursor: pointer;
+}
+/* Number input shares the dropdown look */
+.ps-number {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--inset);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: var(--sp-1) var(--sp-3);
+  width: 96px;
+  text-align: right;
+  outline: none;
+}
+.ps-number::placeholder { color: var(--ink-3); }
+
+/* Switch (pen Switch: 34x18 track, 14 knob, line-2 off → ink on) */
+.ps-switch {
+  width: 34px;
+  height: 18px;
+  border-radius: 9px;
+  background: var(--line-2);
+  padding: 2px;
+  display: flex;
+  justify-content: flex-start;
+  transition: background 0.15s ease;
+}
+.ps-switch.is-on {
+  background: var(--ink);
+  justify-content: flex-end;
+}
+.ps-knob {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--panel);
+}
+
+/* ---- shared: back button (pen settings Topbar Back: arrow-left + 戻る) ---- */
+.back-btn {
+  color: var(--ink-2);
+  font-size: 14px;
+  padding: var(--sp-2) 0;
+}
+.back-btn [data-lucide] { font-size: 18px; }
+.back-btn:hover { color: var(--ink); }
+.topbar-spacer { width: 60px; } /* balances the back button so brand stays centered */
+
+/* ---- 03 処理中 ---- */
+/* Main: top-aligned (pen Main alignItems:center, no justifyContent → start),
+   same as home — never center vertically (clips on overflow). */
+.proc-main {
+  flex: 1 1 0;
+  min-height: 0;
+  padding: var(--sp-7) var(--sp-8) var(--sp-8);
+}
+
+/* ProgressBar (pen: line track, height 4, radius 2; accent fill) */
+.progress-bar {
+  width: 100%;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  width: 0%;
+  transition: width 0.3s ease;
+}
+
+/* ProgressList rows (pen PRow: padding [$sp-4,0], bottom hairline; last none) */
+.progress-list { width: 100%; }
+.p-row {
+  width: 100%;
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid var(--line);
+}
+.p-row:last-child { border-bottom: none; }
+.pr-icon { font-size: 15px; }
+.pr-name { font-size: 13px; color: var(--ink); }
+.pr-info { font-family: var(--font-mono); font-size: 11px; }
+/* State colors (mapped from backend status) */
+.p-row.is-done    .pr-icon { color: var(--ok); }
+.p-row.is-cached  .pr-icon { color: var(--ink-3); }
+.p-row.is-active  .pr-icon { color: var(--accent); }
+.p-row.is-failed  .pr-icon { color: var(--danger); }
+.p-row.is-waiting .pr-icon,
+.p-row.is-skipped .pr-icon { color: var(--ink-3); }
+.p-row.is-done    .pr-info { color: var(--ink-3); }
+.p-row.is-cached  .pr-info { color: var(--ink-3); }
+.p-row.is-active  .pr-info { color: var(--accent); }
+.p-row.is-failed  .pr-info { color: var(--danger); }
+.p-row.is-waiting .pr-info,
+.p-row.is-skipped .pr-info { color: var(--ink-3); }
+.p-row.is-waiting .pr-name { color: var(--ink-3); }
+
+/* StopBtn (pen: panel fill, line-2 border, radius 9, padding [$sp-3,$sp-5]) */
+.stop-wrap { width: 100%; padding-top: var(--sp-4); }
+.stop-btn {
+  padding: var(--sp-3) var(--sp-5);
+  border-radius: 9px;
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.stop-icon { font-size: 13px; }
+.stop-btn:hover { background: var(--line); }
+
+/* ---- 04 完了・成果物 ---- */
+.done-main {
+  flex: 1 1 0;
+  min-height: 0;
+  padding: var(--sp-7) var(--sp-8) var(--sp-8);
+}
+
+/* Stats (pen: 4 metrics across, top+bottom hairline, padding [$sp-5,0]) */
+.stats {
+  width: 100%;
+  padding: var(--sp-5) 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.metric { flex: 1 1 0; }
+.m-label { font-size: 12px; color: var(--ink-3); }
+.m-value { font-size: 22px; font-weight: 500; color: var(--ink); }
+.m-value.is-ok { color: var(--ok); }
+.m-value.is-muted { color: var(--ink-2); }
+
+/* NoticeBox (pen: panel card, padding $sp-4, gap $sp-3) */
+.notice-box {
+  width: 100%;
+  border-radius: 10px;
+  background: var(--panel);
+  padding: var(--sp-4);
+}
+.notice-row { width: 100%; }
+.nr-icon { font-size: 14px; }
+.nr-icon.is-warn { color: var(--warn); }
+.nr-icon.is-muted { color: var(--ink-3); }
+.nr-text { font-size: 12px; line-height: 1.5; color: var(--ink-2); }
+
+/* Two columns */
+.done-cols { width: 100%; align-items: flex-start; }
+.sec-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--ink-3);
+}
+
+/* Artifact rows (pen ArtRow: icon + name/desc) */
+.art-row { width: 100%; padding: var(--sp-2) 0; }
+.art-icon { font-size: 15px; color: var(--ink-3); }
+.art-name { font-size: 12px; color: var(--ink); }
+.art-desc { font-size: 11px; color: var(--ink-3); }
+
+/* Done actions (pen: accent open button + two ghost buttons) */
+.open-btn {
+  width: 100%;
+  padding: var(--sp-3) 0;
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 13px;
+  font-weight: 600;
+}
+.open-btn:hover { opacity: 0.92; }
+.ghost-btn {
+  width: 100%;
+  padding: var(--sp-3) 0;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line-2);
+  color: var(--ink-2);
+  font-size: 13px;
+}
+.ghost-btn:hover { background: var(--line); }
+
+/* Preview (pen PreviewC: header select + bordered panel body) */
+.preview-col { min-width: 0; }
+.pv-select {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.pv-body {
+  width: 100%;
+  height: 300px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: var(--sp-5);
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--ink-2);
+  word-break: break-word;
+}
+/* Rendered-markdown elements (pen preview: serif headings, clean body). */
+.pv-body h1, .pv-body h2, .pv-body h3 {
+  font-family: var(--font-serif);
+  color: var(--ink);
+  margin: var(--sp-4) 0 var(--sp-2);
+  line-height: 1.4;
+}
+.pv-body h1 { font-size: 18px; }
+.pv-body h2 { font-size: 14px; }
+.pv-body h3 { font-size: 13px; }
+.pv-body h1:first-child, .pv-body h2:first-child { margin-top: 0; }
+.pv-body p { margin: var(--sp-2) 0; }
+.pv-body ul, .pv-body ol { margin: var(--sp-2) 0; padding-left: var(--sp-5); }
+.pv-body li { margin: 2px 0; }
+.pv-body code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--inset);
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.pv-body pre {
+  background: var(--inset);
+  padding: var(--sp-3);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.pv-body pre code { background: none; padding: 0; }
+.pv-body table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: var(--sp-3) 0;
+  font-size: 11px;
+}
+.pv-body th, .pv-body td {
+  border: 1px solid var(--line);
+  padding: var(--sp-2);
+  text-align: left;
+}
+.pv-body th { background: var(--inset); color: var(--ink); }
+.pv-body img { max-width: 100%; }
+.pv-body a { color: var(--ink); text-decoration: underline; }
+
+/* ---- 05/06/07 設定 (shared shell) ---- */
+.settings-title {
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 500;
+  color: var(--ink);
+}
+/* Body: centered, left nav (200) + content (620), top-aligned (no vertical
+   center — content can grow and scroll). pen Body padding [$sp-6,...]. */
+.settings-body {
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+  padding: var(--sp-6) var(--sp-8) var(--sp-8);
+  justify-content: center;
+  align-items: flex-start;
+}
+.settings-nav { width: 200px; }
+.nav-item {
+  width: 100%;
+  padding: var(--sp-3);
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.nav-item .ni-icon { font-size: 15px; color: var(--ink-3); }
+.nav-item:hover { background: var(--panel); }
+.nav-item.is-active {
+  background: var(--inset);
+  color: var(--ink);
+  font-weight: 600;
+}
+.nav-item.is-active .ni-icon { color: var(--ink); }
+.settings-content { width: 620px; }
+.sec-title {
+  font-family: var(--font-serif-jp);
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--ink);
+}
+.sec-sub { font-size: 13px; line-height: 1.5; color: var(--ink-2); }
+.grp-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--ink-3);
+}
+
+/* Check rows (pen CheckRow: name+desc left / status right, bottom hairline;
+   last in a group has no border). */
+.check-list { width: 100%; }
+.check-row {
+  width: 100%;
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--line);
+}
+.check-row:last-child { border-bottom: none; }
+.cr-name { font-family: var(--font-mono); font-size: 13px; color: var(--ink); }
+.cr-desc { font-size: 11px; color: var(--ink-3); }
+.cr-status { font-size: 12px; }
+.cr-status .cs-icon { font-size: 15px; }
+.cr-status.is-ok { color: var(--ok); }
+.cr-status.is-ok .cs-icon { color: var(--ok); }
+.cr-status.is-missing { color: var(--alert); }
+.env-loading { font-size: 13px; color: var(--ink-3); padding: var(--sp-3) 0; }
+
+/* ---- 06 設定・AIモデル ---- */
+.model-row { width: 100%; padding: var(--sp-3) 0; }
+.mr-label { font-size: 13px; color: var(--ink); }
+/* Model dropdown (pen DD: panel fill, radius 8, mono, thin border) */
+.mr-select {
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: var(--sp-2) var(--sp-3);
+  cursor: pointer;
+}
+
+/* API key rows (pen KeyRow: label + boxed value, panel fill, radius 8) */
+.key-list { width: 100%; }
+.key-row { width: 100%; }
+.kr-label { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); }
+.kr-box {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: var(--sp-3);
+}
+.kr-input {
+  flex: 1 1 0;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+}
+.kr-input::placeholder { color: var(--ink-3); }
+.kr-state { font-size: 14px; }
+.kr-state.is-ok { color: var(--ok); }
+.kr-state.is-muted { color: var(--ink-3); }
+
+/* ---- 07 設定・コスト上限 ---- */
+/* Segmented control (pen Seg: panel track, radius 8, thin border; selected
+   tab = ink fill, white text). */
+.seg {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.seg-tab {
+  padding: var(--sp-2) var(--sp-5);
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.seg-tab.is-active {
+  background: var(--ink);
+  color: var(--bg);
+  font-weight: 600;
+}
+
+/* Limit rows (pen Row: label left / boxed value+unit right, bottom hairline;
+   last has none). */
+.limit-list { width: 100%; }
+.limit-row {
+  width: 100%;
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--line);
+}
+.limit-row:last-child { border-bottom: none; }
+.lr-label { font-size: 13px; color: var(--ink); }
+.lr-box {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: var(--sp-2) var(--sp-3);
+}
+.lr-input {
+  width: 64px;
+  background: none;
+  border: none;
+  outline: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink);
+  text-align: right;
+}
+.lr-unit { font-size: 11px; color: var(--ink-3); }
+
+/* ---- 10 ダイアログ・整形方式 ---- */
+.dlg-title-jp {
+  font-family: var(--font-serif-jp);
+  font-size: 22px;
+  font-weight: 500;
+  color: var(--ink);
+}
+.refine-opts { width: 100%; }
+/* Option card (pen Opt: radius 10, padding $sp-4; selected = inset fill + ink
+   border, others = line border). */
+.refine-opt {
+  width: 100%;
+  border-radius: 10px;
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  text-align: left;
+}
+.refine-opt.is-selected {
+  background: var(--inset);
+  border-color: var(--ink);
+}
+.ro-title { font-size: 14px; font-weight: 600; color: var(--ink); }
+.ro-desc { font-size: 12px; line-height: 1.5; color: var(--ink-2); }
+
+/* ---- ライブラリ一覧 (history) ---- */
+.library-main {
+  flex: 1 1 0;
+  min-height: 0;
+  padding: var(--sp-7) var(--sp-8) var(--sp-8);
+}
+.lib-list { width: 100%; }
+/* Library card: name + file/chunk counts + created time; whole card clickable. */
+.lib-card {
+  width: 100%;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: var(--sp-4) var(--sp-5);
+  cursor: pointer;
+}
+.lib-card:hover { border-color: var(--line-2); background: var(--inset); }
+.lib-name { font-size: 14px; font-weight: 600; color: var(--ink); }
+.lib-meta { font-family: var(--font-mono); font-size: 11px; color: var(--ink-3); }
+.lib-empty { font-size: 13px; color: var(--ink-3); padding: var(--sp-4) 0; }
+
+/* ---- 11/12 ナレッジグラフ ---- */
+.graph-main {
+  flex: 1 1 0;
+  min-height: 0;
+  padding: var(--sp-7) var(--sp-8) var(--sp-8);
+}
+.graph-title {
+  font-family: var(--font-serif-jp);
+  font-size: 30px;
+  font-weight: 500;
+  color: var(--ink);
+  text-align: center;
+}
+/* 11 build card (pen BuildCard: panel fill, radius 12, hairline, centered) */
+.build-card {
+  width: 100%;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: var(--sp-6);
+  text-align: center;
+}
+.bc-icon { font-size: 32px; color: var(--ink-3); }
+.bc-desc {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--ink-2);
+  max-width: 480px;
+}
+.bc-cost { color: var(--ink-2); font-size: 12px; }
+.bc-ci { font-size: 14px; color: var(--ink-3); }
+.build-btn {
+  padding: var(--sp-3) var(--sp-6);
+  border-radius: 10px;
+  background: var(--accent);
+  color: var(--bg);
+  font-size: 14px;
+  font-weight: 600;
+}
+.build-btn [data-lucide] { font-size: 15px; }
+.build-btn:hover { opacity: 0.92; }
+/* 12 building note */
+.graph-note { font-size: 12px; color: var(--ink-3); text-align: center; }
+
+/* ---- 09 ダイアログ・コスト確認 ---- */
+/* Dialog card (pen Dialog: width 560, padding $sp-7, radius 16, soft shadow) */
+.dialog {
+  width: 560px;
+  padding: var(--sp-7);
+  border-radius: 16px;
+  background: var(--bg);
+  box-shadow: 0 20px 60px #1A181540;
+}
+.dlg-title {
+  font-family: var(--font-serif-jp);
+  font-size: 24px;
+  font-weight: 500;
+  color: var(--ink);
+}
+.dlg-sub {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+/* MiniTable rows (pen MRow: padding [$sp-3,0], bottom hairline; last none) */
+.mini-table { width: 100%; }
+.cost-row {
+  width: 100%;
+  padding: var(--sp-3) 0;
+  border-bottom: 1px solid var(--line);
+}
+.cost-row:last-child { border-bottom: none; }
+.cr-name { font-size: 13px; color: var(--ink); }
+.cr-tag {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--alert);
+}
+.cr-meta { font-size: 11px; color: var(--ink-3); }
+.cr-cost { font-size: 13px; color: var(--ink); }
+
+/* Total (pen Total: top border line-2, padding-top $sp-4) */
+.cost-total {
+  width: 100%;
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--line-2);
+}
+.ct-label { font-size: 13px; font-weight: 600; color: var(--ink); }
+.ct-value { font-size: 18px; font-weight: 600; color: var(--ink); }
+
+/* Over-budget notice (pen WarnNote: alert color, icon + text) */
+.warn-note { width: 100%; }
+.cw-icon { font-size: 14px; color: var(--alert); }
+.cw-text { font-size: 12px; color: var(--alert); }
+
+/* Dialog actions (pen DActions: right-aligned ghost + accent) */
+.dlg-actions { width: 100%; padding-top: var(--sp-2); }
+.btn-ghost {
+  padding: var(--sp-3) var(--sp-5);
+  border-radius: 9px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.btn-ghost:hover { background: var(--panel); }
+.btn-accent {
+  padding: var(--sp-3) var(--sp-5);
+  border-radius: 9px;
+  background: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--bg);
+}
+.btn-accent:hover { opacity: 0.92; }
