@@ -19,6 +19,7 @@ from typing import Any
 from .config import get_nested
 from .models.provider import text_completion
 from .chunkers.base import BaseChunker
+from .utils.resources import resource_root
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +43,8 @@ def _load_skill(skill_name: str, config: dict[str, Any]) -> str:
     if local.exists():
         return local.read_text(encoding="utf-8")
 
-    # 2. Package-bundled (relative to project root)
-    package_root = Path(__file__).resolve().parent.parent.parent  # src/docingest → src → DocIngest
+    # 2. Package-bundled (project root in dev, sys._MEIPASS when frozen)
+    package_root = resource_root()
     bundled = package_root / skills_dir_name / f"{skill_name}.SKILL.md"
     if bundled.exists():
         return bundled.read_text(encoding="utf-8")
@@ -68,7 +69,7 @@ def list_refine_skills(config: dict[str, Any]) -> list[dict[str, str]]:
     discover the refine styles without reading the prompt bodies.
     """
     skills_dir_name = get_nested(config, "refine.skills_dir", "skills")
-    package_root = Path(__file__).resolve().parent.parent.parent
+    package_root = resource_root()
     search_dirs = [Path.cwd() / skills_dir_name, package_root / skills_dir_name]
 
     found: dict[str, dict[str, str]] = {}

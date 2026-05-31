@@ -19,13 +19,17 @@ from typing import Any
 
 import yaml
 
+from .utils.resources import resource_root
+
 
 # ---------------------------------------------------------------------------
 # Default config location (bundled with package)
 # ---------------------------------------------------------------------------
 
-_PACKAGE_DIR = Path(__file__).resolve().parent
-_PROJECT_ROOT = _PACKAGE_DIR.parent.parent  # src/docingest -> src -> DocIngest
+# Project root in dev, sys._MEIPASS when frozen (PyInstaller). Same value as
+# the old Path(__file__).parent.parent.parent in dev; only frozen differs, so
+# the bundled default.yaml is found whether running from source or an exe.
+_PROJECT_ROOT = resource_root()
 _DEFAULT_CONFIG_PATH = _PROJECT_ROOT / "config" / "default.yaml"
 
 
