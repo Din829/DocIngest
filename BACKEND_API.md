@@ -106,14 +106,38 @@ JS 界面（手写 HTML/CSS）
 | `get_settings()` / `save_settings()` + 用户配置持久化 | **config 层新增** | 设置屏要存模型 / 成本上限；现在只有读默认。存到 `~/.docingest/config.yaml`（用户级，跨项目） |
 | `gui_api.py` 桥类 + 进度 `evaluate_js` 推送 | GUI 层（前端落地时配套） | js_api 桥；适配层只收发 dict |
 
-## 五、边界 / 不做
+## 五、云部署（Azure / AWS / GCP）——能力已就位，配置驱动
+
+DocIngest 上云无阻塞性硬伤（源码实证；尚未真在云上跑过，真部署时按下方验证）。
+
+**已就位（源码证实）**：
+- **三大云 provider 都是一等公民**：`AzureOpenAIProvider` / `BedrockProvider` /
+  `VertexAIProvider`（api.py 导出）。Azure 认标准环境变量 `AZURE_API_KEY` /
+  `AZURE_API_BASE`(endpoint) / `AZURE_API_VERSION`，model 用 `azure/<deployment>`
+  格式（provider.py）。
+- **纯环境变量驱动，零文件**：`DOCINGEST__<段>__<键>` 前缀可覆盖任意配置
+  （`load_env_overrides`，config.py），容器靠注入环境变量即可全配；key 从
+  KeyVault / 容器 secret 注入到对应 env，不写死、不进代码。
+- **无绑死本地的假设**：核心是 IO + 调云端 LLM，无常驻本地模型；系统二进制
+  （LibreOffice/ffmpeg）在 Linux 云上 `apt install` 即可，不装则降级。
+
+**部署时必须配对（不改代码，配环境变量 / 挂卷即可）**：
+- **缓存目录**：默认 `.docingest_cache`（相对 cwd，cache.py）。云容器无状态、cwd 可能
+  不可写 → 指到持久卷：`DOCINGEST__cache__dir=/data/cache`（或挂载点）。功能不受影响
+  （缓存丢了重算），但不配会每次重启失缓存 / 可能写不进。
+- **输出目录**：同 `./knowledge` 相对问题 → CLI/API 传绝对路径，或
+  `DOCINGEST__output__dir=/data/knowledge` 指到挂载的持久存储 / 对象存储挂载点。
+
+**真部署时验证**：Azure 三件套注入 → 跑一次 ingest 出产物；缓存/输出落在持久卷。
+
+## 六、边界 / 不做
 
 - **检索 / 问答 API（query）不在此**：检索（含 graph query）归未来独立 web agent，
   本契约只到「造库 + 管理库 + 预览」。见 GUI_DESIGN「检索归未来 web agent」。
 - **不加 HTTP / 多用户**：本机单用户，js_api 桥足够；服务化是未来 web agent 的事。
 - **库管理 API 保持「数据层」纯净**：list/summary/meta 只读写产物，不含界面逻辑。
 
-## 六、待验（不假装）
+## 七、待验（不假装）
 - pywebview 后台线程跑 ingest + `evaluate_js` 推进度，UI 不卡 —— 真接前端时验。
 - `list_knowledge` 对现有混乱 `knowledge/`（含 `_` 前缀、撒根 assets）能否正确
   只挑出正式库 —— 实现后用现有目录实测。
