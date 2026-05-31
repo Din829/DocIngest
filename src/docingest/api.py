@@ -343,6 +343,18 @@ def ingest(
 
     wanted = _resolve_wanted(outputs)
     _populate_artefacts(result, output_dir_path, config, wanted)
+
+    # Write meta.json so the library list has a friendly name + provenance.
+    # Best-effort: a meta write failure must never fail a successful ingest.
+    try:
+        from .utils.library import write_library_meta
+        write_library_meta(
+            output_dir_path,
+            source_files=[str(p) for p in path_list],
+        )
+    except Exception:
+        pass
+
     return result
 
 
@@ -407,6 +419,29 @@ def refine(
         config_file=config_file,
     )
     return refine_files(file_paths, config, Path(output), skill)
+
+
+# ---------------------------------------------------------------------------
+# Library management (data-layer; used by GUI / CLI / future web agent)
+# ---------------------------------------------------------------------------
+
+def list_knowledge(root: str | Path | None = None) -> list[dict[str, Any]]:
+    """List processed knowledge libraries under ``root`` (default ./knowledge).
+
+    Each entry: ``{name, dir, display_name, files, chunks, created_at,
+    has_meta}``. ``has_meta`` lets a caller show only GUI-created libraries.
+    Tolerant — skips non-library / unreadable dirs, never raises.
+    """
+    from .utils.library import list_libraries
+    return list_libraries(root)
+
+
+def get_summary(library_dir: str | Path) -> dict[str, Any]:
+    """Summary of one library (index.json + quality_report.json) for a done
+    screen / library detail. ``{dir, exists, display_name, stats, files,
+    quality}``; ``exists=False`` when the dir isn't a library."""
+    from .utils.library import library_summary
+    return library_summary(library_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +692,8 @@ __all__ = [
     "ingest",
     "inspect",
     "refine",
+    "list_knowledge",
+    "get_summary",
     "build_config",
     "IngestResult",
 ]

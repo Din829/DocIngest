@@ -18,7 +18,15 @@ The names re-exported below form the stable surface. Everything else
 is internal and may change between releases without notice.
 """
 
-from .api import ingest, inspect, refine, IngestResult, build_config
+from .api import (
+    ingest,
+    inspect,
+    refine,
+    list_knowledge,
+    get_summary,
+    IngestResult,
+    build_config,
+)
 from .providers import (
     VisionProvider,
     AudioProvider,
@@ -40,6 +48,8 @@ __all__ = [
     "ingest",
     "inspect",
     "refine",
+    "list_knowledge",
+    "get_summary",
     "IngestResult",
     "build_config",
     # Provider base classes (for typing / custom subclasses)

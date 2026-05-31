@@ -331,3 +331,36 @@ def get_nested(config: dict, path: str, default: Any = None) -> Any:
         else:
             return default
     return current
+
+
+# ---------------------------------------------------------------------------
+# User settings persistence (GUI settings screens) — user-level, cross-project
+# ---------------------------------------------------------------------------
+#
+# load_config only READS layered config; the GUI's settings screens (model /
+# cost limits) need to PERSIST user choices. These store a small user-level
+# overrides file at ~/.docingest/config.yaml. They intentionally do NOT change
+# load_config's layering — the bridge/adapter passes get_settings() into
+# ingest as config_overrides, so the api default stays untouched (see
+# BACKEND_API.md). Read what you wrote; malformed file fails loud via load_yaml.
+
+_USER_SETTINGS_PATH = Path.home() / ".docingest" / "config.yaml"
+
+
+def get_settings() -> dict[str, Any]:
+    """Read the user-level settings overrides (~/.docingest/config.yaml).
+    Returns {} when none saved yet."""
+    if not _USER_SETTINGS_PATH.exists():
+        return {}
+    return load_yaml(_USER_SETTINGS_PATH) or {}
+
+
+def save_settings(settings: dict[str, Any]) -> Path:
+    """Persist the user-level settings overrides, replacing the file.
+    Creates ~/.docingest/ if absent. Returns the written path."""
+    _USER_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _USER_SETTINGS_PATH.write_text(
+        yaml.safe_dump(settings, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return _USER_SETTINGS_PATH
