@@ -425,23 +425,45 @@ def refine(
 # Library management (data-layer; used by GUI / CLI / future web agent)
 # ---------------------------------------------------------------------------
 
-def list_knowledge(root: str | Path | None = None) -> list[dict[str, Any]]:
+def list_knowledge(
+    root: str | Path | None = None,
+    *,
+    config_file: str | Path | None = None,
+) -> list[dict[str, Any]]:
     """List processed knowledge libraries under ``root`` (default ./knowledge).
 
     Each entry: ``{name, dir, display_name, files, chunks, created_at,
     has_meta}``. ``has_meta`` lets a caller show only GUI-created libraries.
-    Tolerant — skips non-library / unreadable dirs, never raises.
+    The index filename is read from config (``output.index_file``) so a
+    renamed index is still recognized. Tolerant — skips non-library /
+    unreadable dirs, never raises.
     """
+    from .config import load_config
     from .utils.library import list_libraries
-    return list_libraries(root)
+    cfg = load_config(project_config_path=config_file)
+    return list_libraries(
+        root,
+        index_name=get_nested(cfg, "output.index_file", "index.json"),
+    )
 
 
-def get_summary(library_dir: str | Path) -> dict[str, Any]:
-    """Summary of one library (index.json + quality_report.json) for a done
-    screen / library detail. ``{dir, exists, display_name, stats, files,
-    quality}``; ``exists=False`` when the dir isn't a library."""
+def get_summary(
+    library_dir: str | Path,
+    *,
+    config_file: str | Path | None = None,
+) -> dict[str, Any]:
+    """Summary of one library (index + quality report) for a done screen /
+    library detail. ``{dir, exists, display_name, stats, files, quality}``;
+    ``exists=False`` when the dir isn't a library. Index / quality filenames
+    are read from config (``output.index_file`` / ``quality.output_file``)."""
+    from .config import load_config
     from .utils.library import library_summary
-    return library_summary(library_dir)
+    cfg = load_config(project_config_path=config_file)
+    return library_summary(
+        library_dir,
+        index_name=get_nested(cfg, "output.index_file", "index.json"),
+        quality_name=get_nested(cfg, "quality.output_file", "quality_report.json"),
+    )
 
 
 # ---------------------------------------------------------------------------
