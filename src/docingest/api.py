@@ -482,6 +482,7 @@ def refine(
     text: ProviderArg = None,
     config_overrides: dict[str, Any] | None = None,
     config_file: str | Path | None = None,
+    acknowledge: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Refine sources/*.md into human-readable form via an LLM.
@@ -489,6 +490,12 @@ def refine(
     Same routing behaviour as the CLI: when ``output`` is None and the
     first file lives in a ``sources/`` directory, the knowledge-base root
     is used; otherwise the first file's parent directory.
+
+    Large files are split into pieces and refined in parallel (no longer
+    skipped). When ``refine.cost_check.mode`` is ``"strict"`` and the estimated
+    spend is over budget, the call returns a single ``{"blocked": True,
+    "estimate": ..., "reasons": [...]}`` result and processes nothing; review
+    it and re-call with ``acknowledge=True`` to proceed.
     """
     from .refine import refine_files
 
@@ -504,7 +511,7 @@ def refine(
         config_overrides=config_overrides,
         config_file=config_file,
     )
-    return refine_files(file_paths, config, Path(output), skill)
+    return refine_files(file_paths, config, Path(output), skill, acknowledge=acknowledge)
 
 
 # ---------------------------------------------------------------------------

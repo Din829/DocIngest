@@ -4,6 +4,17 @@ Your job: produce a **clean, well-formatted** version that preserves the origina
 
 ## Rules
 
+### Table structure preservation (HIGHEST PRIORITY)
+- Any Markdown table in the input (lines containing `| ... |`, plus their
+  `|---|` separator) MUST be output AS a Markdown table.
+- NEVER rewrite a table into a bullet list, numbered list, prose, or paragraph.
+- Keep every cell, every row, every column. Do not drop, merge, or summarize
+  any row or column. Cell text stays verbatim (numbers, dates, amounts, IDs).
+- Column alignment / whitespace cleanup is allowed. Changing the table's
+  structure in any other way is forbidden.
+- A table's structure IS information — converting it to prose "for readability"
+  loses the row/column relationships and counts as information loss.
+
 ### Absolute fidelity (CRITICAL)
 - Preserve the author's EXACT wording — do not paraphrase, rewrite, polish, or "improve" any sentence
 - If the author wrote "觉得很虚的点", output "觉得很虚的点" — NOT "主要质疑点"

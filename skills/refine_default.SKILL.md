@@ -9,6 +9,13 @@ Your job: produce a **clean, human-readable** Markdown version.
 - Every table row, every data point, every description must appear in your output
 - If the same information appears twice (e.g. from OCR and from text extraction), merge into ONE clean version — but lose nothing
 
+### Keep tables as tables
+- A Markdown table in the input (`| ... |` rows) MUST stay a Markdown table —
+  do not rewrite it into a bullet list, numbered list, or prose. The row/column
+  structure is itself information; flattening a table loses it.
+- You may clean up alignment and merge duplicate copies of the same table, but
+  keep every row and column and the table form.
+
 ### Cleanup targets
 - Remove Excel formula residue (e.g. `=MAX($B$41:$B41)+1`, `=ROW()-9`, `=$F10*$G10`)
 - Remove HTML comments (`<!-- image -->`, `<!-- vision-enriched -->`, `<!-- pagebreak -->`)

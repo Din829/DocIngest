@@ -750,6 +750,12 @@ def refine_cmd(
         "-c", "--config",
         help="Path to project config YAML.",
     ),
+    yes: bool = typer.Option(
+        False,
+        "-y", "--yes",
+        help="Acknowledge the refine cost estimate and proceed past a strict "
+             "cost block without the interactive confirm.",
+    ),
 ) -> None:
     """Refine Markdown files for human readability (AI-powered)."""
     from .refine import refine_files
@@ -771,7 +777,23 @@ def refine_cmd(
     console.print(f"  Output: {output_dir / config.get('refine', {}).get('output_dir', 'readable')}")
     console.print()
 
-    results = refine_files(files, config, output_dir, skill)
+    results = refine_files(files, config, output_dir, skill, acknowledge=yes)
+
+    # Strict cost gate fired and was not pre-acknowledged: show the estimate
+    # and offer an interactive confirm (then re-run with acknowledge=True).
+    if len(results) == 1 and results[0].get("blocked"):
+        est = results[0]["estimate"]
+        console.print("[yellow]⚠ コスト確認[/yellow]")
+        for reason in results[0]["reasons"]:
+            console.print(f"  • {reason}")
+        console.print(
+            f"  予想: ${est['est_cost_usd']:.4f} / {est['total_pieces']} 分割 "
+            f"({est['model']})"
+        )
+        if not typer.confirm("続行しますか?"):
+            console.print("[yellow]中止しました。[/yellow]")
+            raise typer.Exit(0)
+        results = refine_files(files, config, output_dir, skill, acknowledge=True)
 
     # Print results
     refined_count = sum(1 for r in results if not r["skipped"])

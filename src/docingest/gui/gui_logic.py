@@ -185,14 +185,34 @@ def preview_markdown(library_dir: str, filename: str) -> str:
 # Refine (04 → 10 dialog)
 # ---------------------------------------------------------------------------
 
-def refine(library_dir: str, files: list[str], skill: str) -> dict[str, Any]:
+def refine(
+    library_dir: str,
+    files: list[str],
+    skill: str,
+    acknowledge: bool = False,
+) -> dict[str, Any]:
     """Produce a human-readable copy via refine(). `files` are sources/*.md
     names; `skill` is one of refine_faithful / refine_default / refine_html.
     Output is passed explicitly as the library dir (GUI owns the location),
-    so refine writes readable/ under the library root."""
+    so refine writes readable/ under the library root.
+
+    Large files are split + refined in parallel by the core. When the cost
+    gate (refine.cost_check.mode=strict) trips, api.refine returns a single
+    {"blocked": True, "estimate": ...} result; we surface that as
+    {"blocked": True, ...} so the UI can confirm and re-call with
+    acknowledge=True. User settings layer in so the gate matches config."""
     src = Path(library_dir) / "sources"
     file_paths: list[str | Path] = [str(src / f) for f in files]
-    results = api.refine(file_paths, skill=skill, output=library_dir)
+    results = api.refine(
+        file_paths,
+        skill=skill,
+        output=library_dir,
+        config_overrides=get_settings() or None,
+        acknowledge=acknowledge,
+    )
+    # Cost gate blocked the run (strict mode, over budget, not acknowledged).
+    if len(results) == 1 and isinstance(results[0], dict) and results[0].get("blocked"):
+        return {"blocked": True, **results[0]}
     return {"files": results}
 
 

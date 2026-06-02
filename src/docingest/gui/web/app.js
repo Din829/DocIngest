@@ -124,7 +124,8 @@ const api = {
   listLibraries: () => window.pywebview.api.list_libraries(),
   getSummary: (dir) => window.pywebview.api.get_summary(dir),
   previewMarkdown: (dir, file) => window.pywebview.api.preview_markdown(dir, file),
-  startRefine: (dir, files, skill) => window.pywebview.api.start_refine(dir, files, skill),
+  startRefine: (dir, files, skill, ack) =>
+    window.pywebview.api.start_refine(dir, files, skill, !!ack),
   doctor: () => window.pywebview.api.doctor(),
   getSettings: () => window.pywebview.api.get_settings(),
   saveSettings: (s) => window.pywebview.api.save_settings(s),
@@ -885,20 +886,29 @@ document.getElementById("refine-cancel")?.addEventListener("click", () =>
 );
 
 const refineGoBtn = document.getElementById("refine-go");
+
+// Remember the last refine request so __onRefineBlocked can re-issue it with
+// acknowledge=true after the user confirms the cost.
+let _lastRefine = null;
+
+async function _startRefine(dir, file, skill, ack) {
+  _lastRefine = { dir, file, skill };
+  refineGoBtn.disabled = true;
+  refineGoBtn.textContent = "整形中…";
+  try {
+    await api.startRefine(dir, [file], skill, ack);
+  } catch (err) {
+    console.error("start refine failed", err);
+    resetRefineButton();
+  }
+}
+
 refineGoBtn?.addEventListener("click", async () => {
   const selected = document.querySelector("#refine-opts .refine-opt.is-selected");
   const skill = selected ? selected.dataset.skill : "refine_faithful";
   const file = currentPreviewFile();
   if (!file || !state.currentLibraryDir) return;
-
-  refineGoBtn.disabled = true;
-  refineGoBtn.textContent = "整形中…";
-  try {
-    await api.startRefine(state.currentLibraryDir, [file], skill);
-  } catch (err) {
-    console.error("start refine failed", err);
-    resetRefineButton();
-  }
+  await _startRefine(state.currentLibraryDir, file, skill, false);
 });
 
 function resetRefineButton() {
@@ -919,6 +929,22 @@ window.__onRefineDone = function (result) {
   // Best-effort: tell the user it's done. readable/ output now exists on disk.
   const n = (result && result.files && result.files.length) || 0;
   window.alert(`整形が完了しました（${n} 件）。readable フォルダに保存されました。`);
+};
+
+// Cost gate (refine.cost_check.mode=strict) blocked the run. Show the estimate
+// and let the user confirm; on yes, re-issue the SAME refine with ack=true.
+window.__onRefineBlocked = function (info) {
+  resetRefineButton();
+  const est = (info && info.estimate) || {};
+  const reasons = (info && info.reasons) || [];
+  const cost = est.est_cost_usd != null ? `$${Number(est.est_cost_usd).toFixed(4)}` : "—";
+  const msg =
+    "コスト確認\n\n" +
+    reasons.map((r) => "• " + r).join("\n") +
+    `\n\n予想: ${cost} / ${est.total_pieces || "?"} 分割（${est.model || ""}）\n\n続行しますか？`;
+  if (window.confirm(msg) && _lastRefine) {
+    _startRefine(_lastRefine.dir, _lastRefine.file, _lastRefine.skill, true);
+  }
 };
 
 window.__onRefineError = function (message) {

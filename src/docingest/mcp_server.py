@@ -363,6 +363,7 @@ def refine(
     output_dir: str | None = None,
     skill: str | None = None,
     config_overrides: dict[str, Any] | None = None,
+    acknowledge: bool = False,
 ) -> list[dict[str, Any]]:
     """
     AI-powered cleanup of Markdown for human readability.
@@ -433,6 +434,7 @@ def refine(
         output=output_dir,
         skill=skill,
         config_overrides=config_overrides,
+        acknowledge=acknowledge,
     )
 
 

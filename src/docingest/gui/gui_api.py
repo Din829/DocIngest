@@ -63,18 +63,31 @@ class Api:
     def preview_markdown(self, library_dir: str, filename: str) -> str:
         return gui_logic.preview_markdown(library_dir, filename)
 
-    def start_refine(self, library_dir: str, files: list[str], skill: str) -> dict[str, Any]:
+    def start_refine(
+        self,
+        library_dir: str,
+        files: list[str],
+        skill: str,
+        acknowledge: bool = False,
+    ) -> dict[str, Any]:
         """Refine on a background thread (it calls an LLM per file — slow).
         refine_files has no per-file progress callback, so the frontend shows
         a single "整形中…" state, then a terminal result. Returns immediately.
 
+        Large files split + refine in parallel. When the cost gate trips
+        (refine.cost_check.mode=strict, over budget), the run is blocked and the
+        UI gets __onRefineBlocked with the estimate; it confirms with the user
+        and re-calls start_refine(acknowledge=True).
+
         Event channels:
-          window.__onRefineDone(result)   — {files:[...]}
-          window.__onRefineError(message) — unexpected failure
+          window.__onRefineDone(result)    — {files:[...]}
+          window.__onRefineBlocked(info)   — {estimate, reasons} (cost gate)
+          window.__onRefineError(message)  — unexpected failure
         """
         lib = str(library_dir)
         file_list = list(files)
         sk = str(skill)
+        ack = bool(acknowledge)
 
         def _push(fn: str, payload: Any) -> None:
             if self._window is not None:
@@ -82,8 +95,14 @@ class Api:
 
         def _worker() -> None:
             try:
-                result = gui_logic.refine(lib, file_list, sk)
-                _push("__onRefineDone", result)
+                result = gui_logic.refine(lib, file_list, sk, acknowledge=ack)
+                if result.get("blocked"):
+                    _push("__onRefineBlocked", {
+                        "estimate": result.get("estimate"),
+                        "reasons": result.get("reasons", []),
+                    })
+                else:
+                    _push("__onRefineDone", result)
             except Exception as e:
                 _push("__onRefineError", str(e))
 
