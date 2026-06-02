@@ -312,8 +312,8 @@ def describe_image(
     for model_entry in models_to_try:
         _set_api_key(model_entry)
         model_name = _resolve_model_name(
-            model_entry.get("provider", "openai"),
-            model_entry.get("model", "gpt-5.4-mini"),
+            model_entry["provider"],
+            model_entry["model"],
         )
         try:
             response = litellm.completion(
@@ -422,8 +422,8 @@ def describe_images_batched(
     for model_entry in models_to_try:
         _set_api_key(model_entry)
         model_name = _resolve_model_name(
-            model_entry.get("provider", "openai"),
-            model_entry.get("model", "gpt-5.4-mini"),
+            model_entry["provider"],
+            model_entry["model"],
         )
         try:
             response = litellm.completion(
@@ -508,8 +508,8 @@ def text_completion(
     for model_entry in models_to_try:
         _set_api_key(model_entry)
         model_name = _resolve_model_name(
-            model_entry.get("provider", "openai"),
-            model_entry.get("model", "gpt-5.4-mini"),
+            model_entry["provider"],
+            model_entry["model"],
         )
         try:
             response = litellm.completion(
@@ -575,20 +575,42 @@ def _build_model_chain(model_config: dict[str, Any] | None) -> list[dict[str, An
         model_config: Config dict with 'primary' and optional 'fallback' keys.
 
     Returns:
-        List of model entry dicts to try in order.
+        List of model entry dicts to try in order. Every entry is guaranteed
+        to carry both 'provider' and 'model'.
+
+    Raises:
+        ValueError: when no usable model entry can be built, or an entry is
+            missing provider/model. We FAIL LOUD rather than substituting a
+            hard-coded model name — the model is defined in exactly one place
+            (config/default.yaml's models.defaults, inherited by every task),
+            so a missing model here means a real config error that a silent
+            fallback would only mask (and would contradict a unified-model
+            config by quietly using a different model).
     """
-    if not model_config:
-        # No config → use default
-        return [{"provider": "openai", "model": "gpt-5.4-mini"}]
+    chain: list[dict[str, Any]] = []
+    if model_config:
+        if "primary" in model_config:
+            chain.append(model_config["primary"])
+        if "fallback" in model_config:
+            chain.append(model_config["fallback"])
+        # Flat format: config carries provider/model directly (no primary key).
+        if not chain and "provider" in model_config:
+            chain.append(model_config)
 
-    chain = []
-    if "primary" in model_config:
-        chain.append(model_config["primary"])
-    if "fallback" in model_config:
-        chain.append(model_config["fallback"])
+    if not chain:
+        raise ValueError(
+            "No model configured for this task. Expected a 'primary' (and "
+            "optional 'fallback') entry — these are inherited from "
+            "models.defaults in config/default.yaml unless the task overrides "
+            "them. Check your config: models.defaults.primary must define "
+            "provider + model."
+        )
 
-    # If config has provider/model directly (flat format), use it
-    if not chain and "provider" in model_config:
-        chain.append(model_config)
-
-    return chain if chain else [{"provider": "openai", "model": "gpt-5.4-mini"}]
+    for entry in chain:
+        if not isinstance(entry, dict) or not entry.get("provider") or not entry.get("model"):
+            raise ValueError(
+                f"Invalid model entry {entry!r}: every model entry must define "
+                f"both 'provider' and 'model'. The model name lives only in "
+                f"config (models.defaults / a per-task primary), never in code."
+            )
+    return chain

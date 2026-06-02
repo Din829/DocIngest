@@ -286,13 +286,26 @@ def load_config(
 
 def _inject_model_defaults(config: dict) -> None:
     """
-    Inject `models.defaults` into every sibling task dict as `_defaults`.
+    Inject `models.defaults` into every sibling task dict as `_defaults`, and
+    make each task INHERIT the default model chain (primary / fallback) when
+    it doesn't declare its own.
 
-    After this, any `models.<task>` dict (vision, chunking_assist, ...) can be
-    passed to an LLM helper and resolve_max_tokens() will fall through to
-    models.defaults.max_response_tokens when the task has no explicit override.
-    This means future tasks inherit the global cap with zero new code —
-    the only place a token cap is defined is config/default.yaml.
+    Two things happen here, both so that config/default.yaml is the SINGLE
+    source of truth for "which model":
+
+    1. ``_defaults`` injection — any ``models.<task>`` dict can resolve
+       max_response_tokens / retry / max_retries through models.defaults.
+
+    2. Model-chain inheritance — if ``models.defaults`` defines a ``primary``
+       (and optionally ``fallback``), every task that omits its own ``primary``
+       inherits it. This lets "one model to rule them all" be expressed by
+       editing ONLY models.defaults.primary, while any task can still override
+       by declaring its own primary/fallback. No model name is hard-coded in
+       code (provider.py fails loud instead of substituting one).
+
+    Applies to every model task in two places: the ``models.*`` sub-dicts AND
+    ``graph.llm`` (the graph subpackage's LLM task, which lives outside
+    ``models`` but follows the same primary/fallback shape).
 
     Safe to call multiple times (idempotent). Does nothing if models.defaults
     is missing (respects user configs that strip it out).
@@ -303,12 +316,34 @@ def _inject_model_defaults(config: dict) -> None:
     defaults = models.get("defaults")
     if not isinstance(defaults, dict):
         return
-    for task_name, task_cfg in models.items():
-        if task_name == "defaults" or not isinstance(task_cfg, dict):
-            continue
+
+    default_primary = defaults.get("primary")
+    default_fallback = defaults.get("fallback")
+
+    def _apply(task_cfg: dict) -> None:
         # Overwrite rather than merge — _defaults must reflect the current
         # resolved global defaults, not a stale copy from a previous load.
         task_cfg["_defaults"] = defaults
+        # Model-chain inheritance: only fill what the task didn't declare.
+        # A task that sets its own primary keeps full control (incl. choosing
+        # to have NO fallback by setting primary but not fallback — we only
+        # inject the default fallback when the task also inherited primary).
+        if "primary" not in task_cfg and isinstance(default_primary, dict):
+            task_cfg["primary"] = default_primary
+            if "fallback" not in task_cfg and isinstance(default_fallback, dict):
+                task_cfg["fallback"] = default_fallback
+
+    for task_name, task_cfg in models.items():
+        if task_name == "defaults" or not isinstance(task_cfg, dict):
+            continue
+        _apply(task_cfg)
+
+    # graph.llm follows the same model-task shape but lives under `graph`,
+    # not `models` — inherit the unified default there too so the graph layer
+    # isn't a second, divergent source of "which model".
+    graph_llm = get_nested(config, "graph.llm")
+    if isinstance(graph_llm, dict):
+        _apply(graph_llm)
 
 
 # ---------------------------------------------------------------------------

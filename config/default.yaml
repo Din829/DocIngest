@@ -11,6 +11,31 @@ models:
   # Set explicitly because litellm injects max_tokens=4096 by default for both
   # Gemini and Claude when omitted (https://github.com/BerriAI/litellm/issues/8835).
   defaults:
+    # ── ONE MODEL TO RULE THEM ALL ──────────────────────────────────────────
+    # Single source of truth for "which LLM". Every text/vision task (vision /
+    # chunking_assist / contextual_summary / knowledge_map summary / refine /
+    # graph.llm) INHERITS this primary+fallback unless it declares its own.
+    # Change the model once here → it changes everywhere. To use a different
+    # model for one task, add a `primary:` (and optional `fallback:`) under
+    # that task below — an explicit per-task block always wins over this.
+    #
+    # NOT covered (these are role-specific models, intentionally separate):
+    #   - models.audio_transcription  → ASR (Qwen3-ASR / Whisper)
+    #   - graph.embedding             → embedding model (text-embedding-3-small)
+    #
+    # There is NO hard-coded model name in code — provider.py fails loud if a
+    # task somehow has no model, rather than silently substituting one. So this
+    # YAML is the only place a model name lives ("env flexible, config not
+    # silently overridden by a hard-coded default").
+    primary:
+      provider: "google"
+      model: "gemini-3-flash-preview"
+      api_key_env: "GEMINI_API_KEY"
+    fallback:
+      provider: "openai"
+      model: "gpt-5.4-mini"
+      api_key_env: "OPENAI_API_KEY"
+
     # Output budget for every LLM call. Set to 65536 (Gemini 3 Flash /
     # 3.1 Pro hard ceiling per https://ai.google.dev/gemini-api/docs/models).
     # Gemini's per-request default is only 8192 if maxOutputTokens is omitted,
@@ -29,6 +54,9 @@ models:
     max_retries: 2
 
   vision:
+    # primary / fallback INHERITED from models.defaults (one-model-to-rule).
+    # To pin Vision to a different model, add a `primary:` block here.
+    #
     # Per-task override; falls through to models.defaults.max_response_tokens
     # when unset. Kept explicit at the provider ceiling (65536 = Gemini 3 Flash
     # / 3.1 Pro hard limit) so dense PDF / multi-page sheet / 方眼紙 仕様書
@@ -39,30 +67,15 @@ models:
     # Independent of litellm's network-level retry — this bounds the
     # whole call (incl. retries) at the application layer.
     timeout_sec: 180
-    primary:
-      provider: "google"
-      model: "gemini-3-flash-preview"
-      api_key_env: "GEMINI_API_KEY"
-    fallback:
-      provider: "openai"
-      model: "gpt-5.4-mini"
-      api_key_env: "OPENAI_API_KEY"
 
   chunking_assist:
-    primary:
-      provider: "google"
-      model: "gemini-3-flash-preview"
-      api_key_env: "GEMINI_API_KEY"
-    fallback:
-      provider: "openai"
-      model: "gpt-5.4-mini"
-      api_key_env: "OPENAI_API_KEY"
+    # primary / fallback INHERITED from models.defaults.
+    {}
 
   contextual_summary:  # Only used when enrichment.contextual_summary = true
-    primary:
-      provider: "openai"
-      model: "gpt-5.4-mini"
-      api_key_env: "OPENAI_API_KEY"
+    # primary / fallback INHERITED from models.defaults. (Previously pinned to
+    # gpt-5.4-mini with no fallback; now follows the unified default chain.)
+    {}
 
   # Audio transcription (ASR) — used by MediaParser for audio/video files
   # when no subtitle file is available. Same primary/fallback chain as Vision.
@@ -1029,7 +1042,34 @@ incremental:
 refine:
   output_dir: "readable"          # output subdirectory inside knowledge/
   model: "chunking_assist"        # reuse models.chunking_assist config
-  max_input_tokens: 50000         # skip files larger than this (with warning)
+  max_input_tokens: 50000         # files larger than this are auto-split into
+                                  # heading-aligned pieces, refined in parallel,
+                                  # then stitched back (see split_target_tokens).
+                                  # Previously these were skipped outright.
+  split_target_tokens: 8000       # when splitting, target tokens per piece.
+                                  # Measured sweet spot: at ~8k–10k/piece a flash
+                                  # model keeps tables AS tables (89% table / 98%
+                                  # fact fidelity on a 100k-token doc); bigger
+                                  # pieces let the model rewrite tables into prose.
+                                  # Cuts fall only on heading boundaries and never
+                                  # inside a protected block (table/code), so a
+                                  # table is never split across pieces.
+  split_parallel: true            # refine pieces concurrently (workers =
+                                  # performance.parallel_files). false → serial
+                                  # (lower peak API concurrency on shared keys).
+  cost_check:                     # pre-flight spend gate (refine calls a paid
+                                  # LLM per piece; a big file fans out into many
+                                  # calls). Same off/warn/strict idea as
+                                  # safety.mode, but scoped to refine.
+    mode: "warn"                  # off → never check; warn (default) → log a
+                                  # notice over budget then run (minimal
+                                  # intrusion, existing callers unaffected);
+                                  # strict → BLOCK over budget until the user
+                                  # acknowledges (CLI --yes / acknowledge=True).
+    max_est_cost_usd: 0.50        # trip when the whole refine run is estimated
+                                  # to cost more than this. null = no cost gate.
+    max_pieces: 50                # trip when total pieces across all files
+                                  # exceeds this (fan-out guard). null = off.
   max_output_tokens: 65536        # LLM response cap (raised to provider ceiling —
                                   # 8000 was a 2024 leftover that truncated long
                                   # refines silently; refine.py already retries
@@ -1172,19 +1212,15 @@ graph:
     min_chunk_tokens: 50
 
   # LLM for entity / relation extraction + community summaries.
-  # Independent from models.vision / models.chunking_assist — graph is a
-  # separate task that often wants a cheaper / smaller model. The shape
-  # mirrors models.<task> exactly (primary / fallback / max_response_tokens
-  # / max_retries) so the same provider.py code paths apply.
+  # primary / fallback INHERITED from models.defaults (one-model-to-rule) — the
+  # graph layer is NOT a second source of "which model". Previously this pinned
+  # gpt-5.4-mini as primary (the inverse of every other task's gemini-primary),
+  # an inconsistency with no real benefit; it now follows the unified default.
+  # To give graph extraction a different (e.g. cheaper) model, add a `primary:`
+  # block here — an explicit per-task block always wins over the default.
+  # The shape mirrors models.<task> (primary / fallback / max_response_tokens /
+  # max_retries) so the same provider.py code paths apply.
   llm:
-    primary:
-      provider: "openai"
-      model: "gpt-5.4-mini"
-      api_key_env: "OPENAI_API_KEY"
-    fallback:
-      provider: "google"
-      model: "gemini-3-flash-preview"
-      api_key_env: "GEMINI_API_KEY"
     max_response_tokens: 65536         # entity extraction returns structured JSON.
                                        # Raised to provider ceiling — 8K silently
                                        # truncated dense chunks with many entities,
