@@ -176,6 +176,20 @@ const SAFETY_MODES = [
   { value: "off", label: "確認なし" },
 ];
 
+// Output purpose preset — maps to the api `purpose` arg. Plain-language
+// labels (GUI_DESIGN: speak plainly, hide file names / internal terms). The
+// user picks WHAT THEY WANT IT FOR; the backend decides which files to keep.
+//   full     → everything (default, "一式そろえる")
+//   markdown → clean Markdown only (index/assets cleaned up after the run)
+//   rag      → Markdown + chunks + index (chunking auto-on, for vector RAG)
+//   agentic  → Markdown + index + search guide (for agent grep/read)
+const OUTPUT_PURPOSES = [
+  { value: "full", label: "一式そろえる（標準）" },
+  { value: "markdown", label: "Markdown のみ" },
+  { value: "rag", label: "RAG 用（チャンク付き）" },
+  { value: "agentic", label: "エージェント検索用" },
+];
+
 // Live option state. (No max-pages knob: parsing.vision.max_pages defaults to
 // null on purpose — a hard cap silently drops pages = information loss. Page/
 // cost control is the job of the cost dialog + safety thresholds, not a risky,
@@ -183,7 +197,7 @@ const SAFETY_MODES = [
 const options = {
   strategy: "auto",
   safetyMode: "strict",
-  markdownOnly: false,
+  purpose: "full",
 };
 
 // Build the config the bridge passes to ingest(). Only non-default choices are
@@ -198,8 +212,9 @@ function buildIngestOptions() {
   }
   const result = {};
   if (Object.keys(overrides).length) result.config_overrides = overrides;
-  // markdown-only → produce only markdown (drops chunks.jsonl).
-  if (options.markdownOnly) result.outputs = ["markdown"];
+  // Output purpose preset → the api `purpose` arg. "full" is the default
+  // (produce everything), so only emit when the user narrowed it.
+  if (options.purpose && options.purpose !== "full") result.purpose = options.purpose;
   return result;
 }
 
@@ -220,8 +235,8 @@ function renderProcSettings() {
     })
   );
   body.appendChild(
-    optRowSwitch("Markdown のみ出力", options.markdownOnly, (v) => {
-      options.markdownOnly = v;
+    optRowSelect("出力する内容", OUTPUT_PURPOSES, options.purpose, (v) => {
+      options.purpose = v;
     })
   );
 }

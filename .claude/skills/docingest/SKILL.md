@@ -29,7 +29,7 @@ for the refine styles) — when in doubt, run those rather than trusting this co
 
 | Command | What it does | When to use / skip | Key flags |
 |---|---|---|---|
-| `run` | Process docs → Markdown + chunks + index | Main command. Run after `inspect` for large/unknown inputs; directly for small trusted ones. Re-running the same `-o` is cheap (incremental cache). | `-o/--output` (REQUIRED for multi-input); `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet`; `--parallel N` (Vision/ASR workers); `--force`; `-y/--yes`; `--json`; `--verbose/-v`; `-c/--config` |
+| `run` | Process docs → Markdown + chunks + index | Main command. Run after `inspect` for large/unknown inputs; directly for small trusted ones. Re-running the same `-o` is cheap (incremental cache). | `-o/--output` (REQUIRED for multi-input); `--purpose markdown\|rag\|agentic\|full`; `--outputs md,chunks,index,...`; `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet`; `--parallel N` (Vision/ASR workers); `--force`; `-y/--yes`; `--json`; `--verbose/-v`; `-c/--config` |
 | `inspect` | Estimate size/pages/cost — **no parsing** | ALWAYS first for large/unknown/expensive inputs (Vision is 1 API call per page). Skip only for a few small text files. | `--json`; `-c/--config` |
 | `refine` | Rewrite a Markdown file into a human-readable version | ONLY when the user wants a readable/published version. **NOT** a RAG step — RAG consumes the raw `sources/*.md`. | `--skill refine_default\|refine_faithful\|refine_html`; `-o/--output`; `-c/--config` |
 | `doctor` | Check environment: packages, external tools, API keys | After install, or when something fails unexpectedly. | (none) |
@@ -70,7 +70,7 @@ your own Grep/Read on `sources/*.md`.
 - **Exit codes**: `0` success · `1` failures · `2` safety abort (re-run with `--yes` after reviewing).
 - **Incremental**: `run` skips unchanged files by content hash. Don't pass `--force` "to be safe" — it's expensive.
 - **Safety**: by default (`safety.mode=strict`) over-budget runs abort. Surface the cost to the user, then proceed with `--yes` (CLI) / `acknowledge_large=True` (Python/MCP).
-- **Fine-grained output control**: to produce only some artefacts (and skip their LLM cost), the Python API has `outputs=["markdown","chunks",...]`; CLI/MCP expose only the coarse `--no-chunks` / `no_chunks`, otherwise pass `config_overrides` to disable stages (`knowledge_map.enabled`, etc.).
+- **Fine-grained output control**: produce exactly the artefacts you want on disk (nothing extra). Easiest is a `purpose` preset — `markdown` (clean Markdown only), `rag` (Markdown + chunks + index, chunking auto-on), `agentic` (Markdown + index + search guide), or `full` (everything, default). For precise control use the `outputs` whitelist: `markdown`, `chunks`, `index`, `assets`, `knowledge_map`, `quality_report`, `run_log` (wins over `purpose`). Excluded artefacts are not produced, or produced-then-deleted for runtime deps (`index`/`assets`); `.cache/` always survives so incremental still works. All three channels: CLI `--purpose` / `--outputs md,chunks`; MCP `purpose=` / `outputs=`; Python `purpose=` / `outputs=`. Legacy `--no-chunks` / `no_chunks` still works (drops only chunks.jsonl).
 - **Credentials**: inject via Provider classes (`docingest.GeminiProvider(api_key=...)`, also Azure/Bedrock/Vertex/OpenAI/Anthropic/DashScope), env vars, or `config_overrides` — pick one.
 
 ## Typical agent workflow

@@ -142,6 +142,27 @@ def main(
         "--no-chunks",
         help="Disable chunking (only output Markdown files).",
     ),
+    purpose: Optional[str] = typer.Option(
+        None,
+        "--purpose",
+        help=(
+            "Output preset: 'markdown' (clean Markdown only), 'rag' "
+            "(Markdown + chunks + index, chunking auto-on), 'agentic' "
+            "(Markdown + index + search guide), or 'full' (everything, "
+            "default). A friendlier alternative to --outputs."
+        ),
+    ),
+    outputs: Optional[str] = typer.Option(
+        None,
+        "--outputs",
+        help=(
+            "Comma-separated whitelist of artefacts to KEEP on disk, e.g. "
+            "'markdown,chunks,index'. Valid: markdown, chunks, index, "
+            "assets, knowledge_map, quality_report, run_log. Excluded "
+            "artefacts are not produced (or produced-then-deleted for "
+            "runtime deps). Wins over --purpose if both given."
+        ),
+    ),
     strategy: Optional[str] = typer.Option(
         None,
         "--strategy",
@@ -255,6 +276,29 @@ def main(
 
     if no_chunks:
         cli_overrides.setdefault("chunking", {})["enabled"] = False
+
+    # Artefact control (--purpose / --outputs). Reuse the facade's resolver +
+    # whitelist applier so CLI, library and MCP share ONE translation of
+    # purpose/outputs → config (single source of truth, ARCHITECTURE §3.3).
+    # The resolved overrides are deep-merged into cli_overrides so they
+    # compose with --no-chunks / --strategy etc. set above.
+    if purpose is not None or outputs is not None:
+        from .api import _resolve_outputs, _apply_output_whitelist
+        from .config import deep_merge
+
+        outputs_list = [o.strip() for o in outputs.split(",") if o.strip()] if outputs else None
+        try:
+            resolved = _resolve_outputs(outputs_list, purpose)
+            if resolved is not None:
+                artefact_layer: dict = {}
+                _apply_output_whitelist(artefact_layer, resolved)
+                cli_overrides = deep_merge(cli_overrides, artefact_layer)
+        except ValueError as e:
+            # Both _resolve_outputs (bad purpose) and _apply_output_whitelist
+            # (bad output name) raise ValueError — surface either as a clean
+            # one-line error + exit 1, not a traceback.
+            err_console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1)
 
     if strategy:
         cli_overrides.setdefault("chunking", {})["strategy"] = strategy

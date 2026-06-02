@@ -187,6 +187,8 @@ def run(
     paths: list[str],
     output_dir: str = "./knowledge",
     no_chunks: bool = False,
+    purpose: str | None = None,
+    outputs: list[str] | None = None,
     strategy: str | None = None,
     force: bool = False,
     acknowledge_large: bool = False,
@@ -209,9 +211,26 @@ def run(
 
     HOW TO CHOOSE THE ARGUMENTS
 
-    `no_chunks=True` — produce ONLY clean Markdown, skip chunks.jsonl.
-        Use when the downstream consumer only needs human-readable docs,
-        NOT a RAG vector store. Saves time on large corpora.
+    `purpose` — high-level output preset (the easy way to control artefacts):
+        - "markdown" : clean Markdown ONLY. The output dir ends up with just
+                       sources/*.md (index/assets produced for the run then
+                       deleted). Best when a consumer needs readable docs.
+        - "rag"      : Markdown + chunks.jsonl + index.json. Chunking is
+                       auto-enabled. Best when feeding a vector RAG store.
+        - "agentic"  : Markdown + index.json + knowledge_search guide. No
+                       chunks (agents grep/read files directly).
+        - "full" / omitted : produce everything (legacy default).
+
+    `outputs` — explicit whitelist of artefacts to KEEP, e.g.
+        ["markdown","chunks","index"]. Valid: markdown, chunks, index,
+        assets, knowledge_map, quality_report, run_log. Use this for precise
+        control; it WINS over `purpose` if both are given. Excluded artefacts
+        are not produced (or produced-then-deleted for runtime deps like
+        index/assets). `.cache/` always survives so incremental keeps working.
+
+    `no_chunks=True` — legacy narrow flag: drop chunks.jsonl, keep everything
+        else. Applied ONLY when neither `purpose` nor `outputs` is set, so
+        old callers are unchanged. Prefer `purpose`/`outputs` for new code.
 
     `strategy` — override chunking strategy. Default "auto" is usually right.
         Override only when you know the document structure:
@@ -251,7 +270,11 @@ def run(
         output_dir: Base output directory. Default "./knowledge". The
             incremental cache lives under output_dir/.cache — re-using
             the same output_dir is how you hit the cache.
-        no_chunks: If True, skip chunks.jsonl. See above.
+        no_chunks: Legacy "drop chunks.jsonl only" flag. See above.
+        purpose: Output preset — "markdown" / "rag" / "agentic" / "full".
+            See above. Friendlier than `outputs`.
+        outputs: Explicit artefact whitelist to keep. Wins over `purpose`.
+            See above.
         strategy: Override chunking strategy. None keeps config default
             (auto). See above for valid values.
         force: Ignore incremental cache. See above.
@@ -276,20 +299,23 @@ def run(
     """
     from .api import ingest
 
-    # Translate MCP's positional-ish args into the facade's `outputs` and
-    # `config_overrides` forms. The MCP contract stays identical; the
-    # facade handles the heavy lifting.
+    # Translate MCP's args into the facade's `outputs` / `purpose` /
+    # `config_overrides`. The facade handles the heavy lifting.
     extra: dict[str, Any] = {}
     if strategy:
         extra["chunking.strategy"] = strategy
-    outputs: list[str] | None = None
-    if no_chunks:
-        # Legacy flag: "Markdown only". We do not include "chunks" in the
-        # whitelist so chunking is disabled AND the chunks reader is skipped.
-        # Other optional outputs (index, knowledge_map, quality_report,
-        # run_log) remain enabled to match the historical MCP behaviour
-        # (no_chunks was narrowly about chunks.jsonl, not broad pruning).
-        outputs = ["markdown", "index", "knowledge_map", "quality_report", "run_log"]
+
+    # Artefact control precedence: explicit `outputs` (most precise) >
+    # `purpose` (preset) > legacy `no_chunks`. `outputs` and `purpose` are
+    # passed straight through to the facade, which owns their resolution.
+    # no_chunks keeps its historical narrow meaning ("only drop chunks.jsonl,
+    # keep everything else") — handled here ONLY when neither new arg is set,
+    # so old callers are 100% unchanged.
+    eff_outputs = outputs
+    eff_purpose = purpose
+    if eff_outputs is None and eff_purpose is None and no_chunks:
+        # Legacy flag: drop chunks.jsonl, keep all other artefacts.
+        eff_outputs = ["markdown", "index", "knowledge_map", "quality_report", "run_log"]
 
     merged_overrides: dict[str, Any] = dict(config_overrides) if config_overrides else {}
     merged_overrides.update(extra)
@@ -297,7 +323,8 @@ def run(
     result = ingest(
         paths,
         output=output_dir,
-        outputs=outputs,
+        outputs=eff_outputs,
+        purpose=eff_purpose,
         config_overrides=merged_overrides or None,
         force=force,
         acknowledge_large=acknowledge_large,

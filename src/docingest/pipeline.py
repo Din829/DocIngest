@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2418,6 +2419,118 @@ def _collect_asset_rels_for_file(
     return sorted(rels)
 
 
+def _finalize_artifacts(output_dir: Path, config: dict[str, Any]) -> None:
+    """
+    Post-run cleanup of runtime-dependency artefacts the caller did NOT ask
+    to keep.
+
+    Some artefacts (assets/, index.json) cannot be skipped at generation
+    time because the pipeline itself consumes them mid-run — assets feed
+    Vision, index.json is read by knowledge_map and built incrementally. So
+    the facade's outputs whitelist marks them for *cleanup*: produce as
+    usual, delete here once everything that needed them has run.
+
+    The cleanup set is passed via ``output._cleanup`` (a list of tokens set
+    by api._apply_output_whitelist). Tokens: "index" / "assets" / "errors".
+    Absent / empty → this function is a no-op (legacy behaviour, full output).
+
+    Invariants:
+      * ``.cache/`` is NEVER touched — deleting it would break incremental.
+      * Deleting assets/ also clears ``outputs.assets`` in every meta.json so
+        the next incremental run's is_cache_valid() asset-existence check
+        passes (otherwise every cached file would invalidate → full re-run,
+        re-burning Vision cost on repeated markdown-only runs).
+      * Best-effort: a cleanup failure logs a warning, never raises — a
+        successful ingest must not be turned into a failure by tidy-up.
+    """
+    cleanup = get_nested(config, "output._cleanup", None)
+    if not cleanup:
+        return
+    cleanup_set = set(cleanup)
+
+    # --- assets/ : delete dir + clear meta references ---
+    if "assets" in cleanup_set:
+        assets_dir = output_dir / get_nested(config, "output.assets_dir", "assets")
+        if assets_dir.exists():
+            try:
+                shutil.rmtree(assets_dir)
+            except OSError as e:
+                _pipeline_logger.warning(f"Could not remove assets dir: {e}")
+        # Keep meta.json consistent with the now-empty assets so incremental
+        # cache stays valid on the next run (see is_cache_valid asset check).
+        cache_dir = output_dir / get_nested(config, "incremental.cache_dir", ".cache")
+        if cache_dir.exists():
+            for meta_path in cache_dir.glob("*.meta.json"):
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                outputs = meta.get("outputs")
+                if isinstance(outputs, dict) and outputs.get("assets"):
+                    outputs["assets"] = []
+                    try:
+                        meta_path.write_text(
+                            json.dumps(meta, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                    except OSError as e:
+                        _pipeline_logger.warning(
+                            f"Could not update meta {meta_path.name} after "
+                            f"assets cleanup: {e}"
+                        )
+
+    # --- index.json : safe to delete (cache stores index_entry in meta) ---
+    if "index" in cleanup_set:
+        index_file = output_dir / get_nested(config, "output.index_file", "index.json")
+        if index_file.exists():
+            try:
+                index_file.unlink()
+            except OSError as e:
+                _pipeline_logger.warning(f"Could not remove index.json: {e}")
+
+    # --- chunks.jsonl : built only because a dependency (knowledge_map)
+    # needed it, but the user didn't ask to keep it → delete + clear the
+    # cached chunk_ids so the next incremental run's is_cache_valid()
+    # chunk-presence check passes (same consistency rule as assets above). ---
+    if "chunks" in cleanup_set:
+        chunks_file = output_dir / get_nested(config, "chunking.output_file", "chunks.jsonl")
+        if chunks_file.exists():
+            try:
+                chunks_file.unlink()
+            except OSError as e:
+                _pipeline_logger.warning(f"Could not remove chunks.jsonl: {e}")
+        cache_dir = output_dir / get_nested(config, "incremental.cache_dir", ".cache")
+        if cache_dir.exists():
+            for meta_path in cache_dir.glob("*.meta.json"):
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                outputs = meta.get("outputs")
+                if isinstance(outputs, dict) and outputs.get("chunk_ids"):
+                    outputs["chunk_ids"] = []
+                    try:
+                        meta_path.write_text(
+                            json.dumps(meta, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                    except OSError as e:
+                        _pipeline_logger.warning(
+                            f"Could not update meta {meta_path.name} after "
+                            f"chunks cleanup: {e}"
+                        )
+
+    # --- errors.json : companion of structural artefacts; drop on minimal runs ---
+    if "errors" in cleanup_set:
+        report_file = get_nested(config, "error_handling.report_file", "errors.json")
+        errors_path = output_dir / report_file
+        if errors_path.exists():
+            try:
+                errors_path.unlink()
+            except OSError as e:
+                _pipeline_logger.warning(f"Could not remove errors.json: {e}")
+
+
 def _parse_frontmatter(markdown: str) -> dict[str, Any]:
     """
     Extract YAML frontmatter from a Markdown string written by our pipeline.
@@ -3047,5 +3160,11 @@ def run_pipeline(
             )
         except Exception as e:
             _pipeline_logger.warning(f"Run log append failed: {e}")
+
+    # Final cleanup of runtime-dependency artefacts the caller didn't keep
+    # (index / assets / errors). Runs LAST — after every consumer (Vision,
+    # knowledge_map, quality_report) has used them. No-op when the facade
+    # didn't set output._cleanup (legacy full-output runs). Never raises.
+    _finalize_artifacts(output_dir, config)
 
     return pipeline_result

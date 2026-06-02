@@ -61,22 +61,87 @@ _ALL_OUTPUTS: tuple[str, ...] = (
     "markdown",         # sources/*.md files
     "chunks",           # chunks.jsonl
     "index",            # index.json
+    "assets",           # assets/ (page images + embedded images)
     "knowledge_map",    # knowledge_map.yaml + knowledge_search.SKILL.md
     "quality_report",   # quality_report.json
     "run_log",          # log.md (append-only run history)
 )
 
-# When ``outputs`` is a proper subset of _ALL_OUTPUTS, we turn off the
-# items NOT in the subset by pushing these config keys to False. Items
-# with None don't need a config toggle (they're always produced) — the
-# whitelist only controls whether the reader runs.
-_OUTPUT_DISABLE_KEYS: dict[str, str | None] = {
-    "markdown": None,                          # markdown is always written per file
-    "chunks": "chunking.enabled",
-    "index": None,                             # index.json is always written
-    "knowledge_map": "knowledge_map.enabled",
-    "quality_report": "quality_report.enabled",
-    "run_log": "run_log.enabled",
+# Each output maps to how it is suppressed when NOT requested in the
+# whitelist. Two suppression modes — because outputs fall into two classes:
+#
+#   * "generate"  — controlled by a config flag set to False so the pipeline
+#                   simply never produces it (saves work / LLM cost).
+#                   e.g. chunks / knowledge_map / quality_report / run_log.
+#
+#   * "cleanup"   — the artefact is a RUNTIME dependency the pipeline needs
+#                   while running (assets feed Vision; index.json is read by
+#                   knowledge_map and built incrementally), so it is always
+#                   produced, then DELETED after the run when not wanted.
+#                   pipeline._finalize_artifacts honours the cleanup set.
+#                   e.g. index / assets / errors.
+#
+#   * None        — always kept, no suppression (markdown — the product).
+#
+# Value shape: (mode, key) where key is the config flag for "generate",
+# or the cleanup-set token for "cleanup", or None for always-keep.
+_OUTPUT_SUPPRESS: dict[str, tuple[str, str] | None] = {
+    "markdown": None,                                   # the product — always kept
+    "chunks": ("generate", "chunking.enabled"),         # generate-off when unwanted;
+                                                        # but if a dependency (knowledge_map)
+                                                        # forces it on while the user doesn't
+                                                        # want to KEEP it, _finalize_artifacts
+                                                        # deletes chunks.jsonl post-run (the
+                                                        # cleanup token is the name "chunks").
+    "index": ("cleanup", "index"),                      # runtime dep → produce then delete
+    "assets": ("cleanup", "assets"),                    # Vision input → produce then delete
+    "knowledge_map": ("generate", "knowledge_map.enabled"),
+    "quality_report": ("generate", "quality_report.enabled"),
+    "run_log": ("generate", "run_log.enabled"),
+}
+
+# errors.json is not an opt-in artefact users pick — it only appears on
+# failure. It is cleaned up alongside index/assets when the whitelist
+# excludes the structural artefacts (a "markdown-only" run shouldn't leave
+# errors.json behind either). It has no whitelist token of its own; it is
+# added to the cleanup set whenever neither index nor chunks is kept.
+_CLEANUP_CONFIG_KEY = "output._cleanup"  # internal channel → pipeline
+
+# Build-time dependencies between artefacts. If the user asks for an artefact
+# whose generation reads OTHER artefacts, those dependencies must EXIST at
+# generation time — even if the user didn't list them. We satisfy this by
+# auto-adding the dependency to the "effective" whitelist for the *generate*
+# decision (so it is not turned off), while still cleaning it up afterwards
+# if the user didn't actually ask to keep it (runtime-need ≠ keep-on-disk).
+#
+# knowledge_map generation reads chunks.jsonl + index.json
+# (pipeline.generate_knowledge_map(index_path=..., chunks_path=...)). Without
+# this, `outputs=["knowledge_map"]` would disable chunking and the map would
+# be built from a missing/partial chunks file. index is already a "cleanup"
+# artefact (always produced) so only chunks needs forcing on.
+_OUTPUT_REQUIRES: dict[str, tuple[str, ...]] = {
+    "knowledge_map": ("chunks", "index"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Purpose presets — high-level "what do you want this for" → concrete outputs.
+# ---------------------------------------------------------------------------
+# A friendlier entry point than listing files: the caller states intent and
+# DocIngest picks the right artefact set (and auto-enables chunking for RAG).
+# Pure sugar over the outputs whitelist — every preset just expands to an
+# ``outputs`` list, so the same suppression machinery applies and there is
+# one source of truth. ``None`` / "full" → produce everything (legacy).
+_PURPOSE_PRESETS: dict[str, list[str]] = {
+    # Clean Markdown only — nothing else on disk. For plain text extraction
+    # / hand-off. index + assets are produced for the run then cleaned up.
+    "markdown": ["markdown"],
+    # Vector RAG — Markdown + semantic chunks + file index. chunking is
+    # auto-enabled because "chunks" is in the list.
+    "rag": ["markdown", "chunks", "index"],
+    # Agentic Search — Markdown for grep/glob + index for discovery +
+    # the search guide. No chunks (agents read files directly).
+    "agentic": ["markdown", "index", "knowledge_map"],
 }
 
 
@@ -142,6 +207,7 @@ def build_config(
     *,
     output: str | Path | None = None,
     outputs: list[str] | None = None,
+    purpose: str | None = None,
     vision: ProviderArg = None,
     audio: ProviderArg = None,
     text: ProviderArg = None,
@@ -161,6 +227,11 @@ def build_config(
     Args:
         output: Output directory override (→ ``output.dir``).
         outputs: Whitelist of outputs to produce. See ``_ALL_OUTPUTS``.
+        purpose: High-level preset that expands to an ``outputs`` list — one
+                of ``"markdown"`` / ``"rag"`` / ``"agentic"`` (or ``"full"``
+                / ``None`` for everything). A friendlier alternative to
+                listing files. If BOTH ``purpose`` and ``outputs`` are given,
+                ``outputs`` wins (it is more explicit) and a warning is logged.
         vision: Vision provider / raw model_config dict for
                 ``models.vision``.
         audio: Audio provider / raw model_config dict for
@@ -189,8 +260,11 @@ def build_config(
     if output is not None:
         _set_dotted(layered, "output.dir", str(output))
 
-    if outputs is not None:
-        _apply_output_whitelist(layered, outputs)
+    # purpose is sugar over outputs — resolve to a concrete whitelist (or
+    # None = produce everything) and apply via the SAME machinery.
+    resolved_outputs = _resolve_outputs(outputs, purpose)
+    if resolved_outputs is not None:
+        _apply_output_whitelist(layered, resolved_outputs)
 
     if vision is not None:
         _merge_provider(layered, "models.vision", vision)
@@ -227,6 +301,7 @@ def ingest(
     *,
     output: str | Path | None = None,
     outputs: list[str] | None = None,
+    purpose: str | None = None,
     vision: ProviderArg = None,
     audio: ProviderArg = None,
     text: ProviderArg = None,
@@ -249,9 +324,19 @@ def ingest(
             refuse to auto-name in that case, matching CLI behaviour).
         outputs: Whitelist of outputs to produce / read back. Elements
             must come from: ``"markdown"``, ``"chunks"``, ``"index"``,
-            ``"knowledge_map"``, ``"quality_report"``, ``"run_log"``.
-            ``None`` (default) means "everything the config enables",
-            preserving legacy behaviour.
+            ``"assets"``, ``"knowledge_map"``, ``"quality_report"``,
+            ``"run_log"``. ``None`` (default) means "everything the config
+            enables", preserving legacy behaviour. Artefacts excluded from
+            the list are either not produced (chunks / knowledge_map /
+            quality_report / run_log) OR produced-then-deleted after the run
+            when they are a runtime dependency (index / assets) — so the
+            final on-disk directory contains exactly the requested set
+            (``.cache/`` always survives so incremental keeps working).
+        purpose: High-level preset, a friendlier alternative to ``outputs``:
+            ``"markdown"`` (clean Markdown only), ``"rag"`` (Markdown +
+            chunks + index, chunking auto-enabled), ``"agentic"`` (Markdown
+            + index + search guide). ``"full"`` / ``None`` = everything.
+            If both ``purpose`` and ``outputs`` are passed, ``outputs`` wins.
         vision: Vision provider. Typically one of the provider classes
             from ``docingest.providers`` (e.g. ``GeminiProvider(api_key=...)``).
             ``None`` keeps the YAML/env configuration unchanged.
@@ -303,6 +388,7 @@ def ingest(
     config = build_config(
         output=output,
         outputs=outputs,
+        purpose=purpose,
         vision=vision,
         audio=audio,
         text=text,
@@ -341,7 +427,7 @@ def ingest(
     if pipeline_result.safety.get("aborted"):
         return result
 
-    wanted = _resolve_wanted(outputs)
+    wanted = _resolve_wanted(_resolve_outputs(outputs, purpose))
     _populate_artefacts(result, output_dir_path, config, wanted)
 
     # Write meta.json so the library list has a friendly name + provenance.
@@ -515,11 +601,53 @@ def _normalize_overrides(raw: dict[str, Any]) -> dict[str, Any]:
     return nested
 
 
+def _resolve_outputs(
+    outputs: list[str] | None,
+    purpose: str | None,
+) -> list[str] | None:
+    """
+    Collapse the (outputs, purpose) pair into a single whitelist, or None
+    (= produce everything). Precedence: an explicit ``outputs`` list always
+    wins over ``purpose`` (it is the more precise statement of intent); if
+    both are given we warn so the caller knows ``purpose`` was ignored.
+
+    ``purpose`` accepts the preset names in _PURPOSE_PRESETS plus ``"full"``
+    (an explicit alias for "produce everything" → None). Unknown purpose
+    raises ValueError, mirroring the unknown-output behaviour — a typo here
+    would otherwise silently produce the wrong artefact set.
+    """
+    if outputs is not None:
+        if purpose is not None:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Both `outputs` and `purpose=%r` given; using `outputs` "
+                "(more explicit) and ignoring `purpose`.", purpose
+            )
+        return outputs
+
+    if purpose is None or purpose == "full":
+        return None
+
+    if purpose not in _PURPOSE_PRESETS:
+        raise ValueError(
+            f"Unknown purpose: {purpose!r}. "
+            f"Valid options: {sorted(_PURPOSE_PRESETS)} or 'full'."
+        )
+    # Return a copy so callers can't mutate the shared preset list.
+    return list(_PURPOSE_PRESETS[purpose])
+
+
 def _apply_output_whitelist(layered: dict[str, Any], outputs: list[str]) -> None:
     """
-    Translate the outputs whitelist into config toggles (deep-merged into
-    ``layered``). Unknown output names raise ValueError — fails fast
-    rather than silently ignoring typos that would cost users API $$.
+    Translate the outputs whitelist into config (deep-merged into ``layered``).
+
+    Two suppression channels, per _OUTPUT_SUPPRESS:
+      * "generate" → set the artefact's config flag to False (never produced).
+      * "cleanup"  → add a token to output._cleanup so the pipeline deletes
+                     the runtime-dependency artefact after the run.
+
+    Unknown output names raise ValueError — fails fast rather than silently
+    ignoring typos that would cost users API $$.
     """
     unknown = set(outputs) - set(_ALL_OUTPUTS)
     if unknown:
@@ -527,12 +655,58 @@ def _apply_output_whitelist(layered: dict[str, Any], outputs: list[str]) -> None
             f"Unknown output(s): {sorted(unknown)}. "
             f"Valid options: {list(_ALL_OUTPUTS)}"
         )
+    # `wanted` = what the user asked to KEEP on disk.
+    # `needed` = wanted PLUS every build-time dependency (transitive). An
+    # artefact in `needed` must EXIST during the run; an artefact in `wanted`
+    # must additionally survive to the final directory. Dependencies that the
+    # user didn't ask to keep are produced then cleaned up (runtime-need ≠
+    # keep-on-disk) — same principle as index/assets.
     wanted = set(outputs)
-    for name, cfg_path in _OUTPUT_DISABLE_KEYS.items():
-        if cfg_path is None:
+    needed = _expand_dependencies(wanted)
+
+    cleanup: list[str] = []
+    for name, suppress in _OUTPUT_SUPPRESS.items():
+        if suppress is None:
             continue
-        if name not in wanted:
-            _set_dotted(layered, cfg_path, False)
+        mode, token = suppress
+        if mode == "generate":
+            # Generate it unless it is neither wanted NOR needed as a dep.
+            if name not in needed:
+                _set_dotted(layered, token, False)
+            elif name not in wanted:
+                # Forced on by a dependency but not wanted for keeps → produce
+                # then delete. The cleanup token is the artefact NAME (what
+                # _finalize_artifacts recognises), not the config flag.
+                cleanup.append(name)
+        else:  # "cleanup": always produced; keep only if wanted
+            if name not in wanted:
+                cleanup.append(token)
+
+    # errors.json rides along: a run that keeps neither the index nor the
+    # chunks (i.e. a markdown-only / minimal run) shouldn't leave errors.json
+    # behind either. When index or chunks IS kept, errors.json stays so the
+    # structural artefacts have their companion failure log.
+    if "index" not in wanted and "chunks" not in wanted:
+        cleanup.append("errors")
+
+    if cleanup:
+        # de-dup while preserving order
+        seen: set[str] = set()
+        ordered = [c for c in cleanup if not (c in seen or seen.add(c))]
+        _set_dotted(layered, _CLEANUP_CONFIG_KEY, ordered)
+
+
+def _expand_dependencies(wanted: set[str]) -> set[str]:
+    """Transitive closure of wanted ∪ their build-time dependencies."""
+    needed = set(wanted)
+    frontier = list(wanted)
+    while frontier:
+        item = frontier.pop()
+        for dep in _OUTPUT_REQUIRES.get(item, ()):
+            if dep not in needed:
+                needed.add(dep)
+                frontier.append(dep)
+    return needed
 
 
 def _merge_provider(

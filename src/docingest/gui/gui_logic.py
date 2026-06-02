@@ -104,23 +104,26 @@ def run_ingest(
     """Process documents into a library and return a summary dict for the
     done screen.
 
-    `options` carries the advanced-panel choices (chunk strategy, max pages,
-    safety mode, markdown-only) already shaped as config_overrides /
-    outputs. User settings are merged underneath the per-run options so a
+    `options` carries the advanced-panel choices (chunk strategy, safety
+    mode, output purpose) already shaped as config_overrides / outputs /
+    purpose. User settings are merged underneath the per-run options so a
     one-off choice on screen 02 wins over the saved default.
     """
     output = resolve_output_dir(library_name)
 
     overrides = dict(get_settings() or {})
     outputs = None
+    purpose = None
     if options:
         overrides.update(options.get("config_overrides") or {})
         outputs = options.get("outputs")
+        purpose = options.get("purpose")
 
     result = api.ingest(
         list(paths),
         output=output,
         outputs=outputs,
+        purpose=purpose,
         config_overrides=overrides or None,
         acknowledge_large=acknowledge_large,
         on_progress=on_progress,
