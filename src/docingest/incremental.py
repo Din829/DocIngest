@@ -190,6 +190,10 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.audio.prefer_subtitles",      # #5: subtitle vs ASR path
     "parsing.audio.language",              # #5: language affects ASR output
     "parsing.audio.include_timestamps",    # #5: timestamp format in output
+    "parsing.audio.video_frames",          # #5: video frame sampling subtree —
+                                           # enabled / interval_sec / max_frames all
+                                           # change what visual content lands in the
+                                           # transcript, so a change must re-run.
     "parsing.url.enabled",                 # #5: URL resolution toggle
     "models.audio_transcription.primary.provider",   # #5: ASR engine
     "models.audio_transcription.primary.model",      # #5: ASR model

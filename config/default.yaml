@@ -457,6 +457,23 @@ parsing:
                                            # 150s (2.5min) is the safe default
                                            # (same as qwen_asr.py's DEFAULT_SEGMENT_DURATION)
 
+    # Video frame understanding (画面理解) — the audio track is always
+    # transcribed via ASR above; this ADDS visual understanding by sampling
+    # frames and feeding them through the SAME per-page Vision pipeline that
+    # PDF/PPT pages use (frames become PageData entries → Phase 1.5 Vision).
+    # No new model interface: a frame is just an image. Works with any Vision
+    # provider (Gemini/Qwen/GPT/Claude all accept images).
+    video_frames:
+      enabled: true                        # sample video frames for visual understanding
+                                           # (false = transcript-only, the old behaviour)
+      interval_sec: 10                     # sample one frame every N seconds. Slides /
+                                           # lectures change slowly → sparse default.
+                                           # Lower it for fast-cut footage.
+      max_frames: null                     # cap on frames per video. null = inherit the
+                                           # global parsing.vision.max_pages cap, so a
+                                           # video costs no more Vision than a same-length
+                                           # text document of equivalent page count.
+
   # URL resolution (yt-dlp)
   # When users pass an http/https URL as input, DocIngest downloads the
   # media + subtitles + metadata via yt-dlp (supports 1000+ sites).

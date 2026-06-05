@@ -15,6 +15,21 @@ Strategy (priority order — subtitle-first guarantees maximum precision):
   3. **Video files** (.mp4 / .mkv / ...): extract audio track with ffmpeg
      first, then apply 1→2 above on the extracted .wav.
 
+Video frame understanding (画面理解):
+  The strategy above only "listens" — the picture (slides, charts, whiteboard)
+  is lost. When ``parsing.audio.video_frames.enabled`` is on (default), we ALSO
+  sample frames with ffmpeg and attach them as ``ParseResult.pages`` so the
+  pipeline's existing per-page Vision step (Phase 1.5) describes each frame —
+  the very same path PDF/PPT page images take. A frame is just an image, so no
+  new model interface is introduced and any Vision provider works. To keep the
+  visual descriptions aligned with the spoken timeline, a ``<!-- pagebreak -->``
+  is inserted into the transcript at each frame's timestamp; Vision then injects
+  each frame's description into the matching time section (Mode A alignment),
+  giving interleaved picture + speech instead of a wall of descriptions at the
+  end. Frame count is capped by ``video_frames.max_frames`` (or, when null, the
+  global ``parsing.vision.max_pages``) so a video costs no more Vision than a
+  text document of equivalent page count.
+
 Output: `ParseResult(markdown=..., metadata={...})` — plugs directly into
 the existing pipeline (frontmatter → chunks → index → knowledge_map).
 
@@ -45,7 +60,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from .base import BaseParser, ParseResult
+from .base import BaseParser, PageData, ParseResult
 from ..config import get_nested
 
 logger = logging.getLogger(__name__)
@@ -108,15 +123,23 @@ class MediaParser(BaseParser):
                 # If extraction fails, try ASR on the video file directly
                 # (some ASR APIs accept video files)
 
-            # Step 2: Check for subtitle file (subtitle-first strategy)
+            # Step 2: Transcribe the audio track — subtitle-first, ASR fallback.
             prefer_subs = get_nested(self.config, "parsing.audio.prefer_subtitles", True)
-            if prefer_subs:
-                subtitle_path = self._find_subtitle(file_path)
-                if subtitle_path:
-                    return self._parse_from_subtitle(file_path, subtitle_path)
+            subtitle_path = self._find_subtitle(file_path) if prefer_subs else None
+            if subtitle_path:
+                result = self._parse_from_subtitle(file_path, subtitle_path)
+            else:
+                result = self._parse_from_asr(file_path, audio_path)
 
-            # Step 3: ASR transcription
-            return self._parse_from_asr(file_path, audio_path)
+            # Step 3: Video frame understanding (画面理解). The transcript only
+            # carries speech; sample frames so the existing per-page Vision step
+            # (pipeline Phase 1.5) describes the picture too. Audio-only files
+            # and failed transcripts skip this entirely. Best-effort: any frame
+            # failure leaves the transcript untouched (never raises).
+            if is_video and result.success:
+                self._attach_video_frames(file_path, result)
+
+            return result
 
         except Exception as e:
             logger.error(f"Media parse failed for {file_path.name}: {e}")
@@ -571,6 +594,139 @@ class MediaParser(BaseParser):
         return ParseResult(markdown=markdown, metadata=metadata, success=True)
 
     # ------------------------------------------------------------------
+    # Video frame understanding (画面理解)
+    # ------------------------------------------------------------------
+
+    def _attach_video_frames(self, video_path: Path, result: ParseResult) -> None:
+        """Sample frames and attach them for Vision enrichment (in place).
+
+        Fills result.pages (one PageData per frame → pipeline Phase 1.5 Vision
+        describes each) and splices a pagebreak into the transcript at each
+        frame's timestamp so Vision aligns the description to the matching time
+        section (Mode A), interleaving picture with speech. Best-effort: config
+        off / no ffmpeg / zero frames leave result untouched. Never raises."""
+        cfg = get_nested(self.config, "parsing.audio.video_frames", {}) or {}
+        if not cfg.get("enabled", True):
+            return
+        frames = self._extract_frames(video_path)
+        if not frames:
+            return
+        # num_pictures=1 keeps triage from skipping a frame as "text-only";
+        # text="" lets the full-page Vision prompt describe the whole frame.
+        result.pages = [
+            PageData(page_no=i + 1, text="", image_path=str(fp), num_pictures=1)
+            for i, (fp, _ts) in enumerate(frames)
+        ]
+        result.markdown = self._splice_frame_pagebreaks(
+            result.markdown, [ts for _fp, ts in frames]
+        )
+        result.metadata["has_video_frames"] = True
+        result.metadata["frames_extracted"] = len(frames)
+
+    def _extract_frames(self, video_path: Path) -> list[tuple[Path, float]]:
+        """Sample frames every interval_sec via ffmpeg, capped by max_frames
+        (null → inherit parsing.vision.max_pages). Returns [(path, ts_sec), ...]
+        in time order, or [] when ffmpeg/duration unavailable. Frames written as
+        <stem>_frame####.jpg next to the video and reused on re-run."""
+        from ..utils.binary_finder import find_binary
+
+        cfg = get_nested(self.config, "parsing.audio.video_frames", {}) or {}
+        interval = float(cfg.get("interval_sec", 10) or 10)
+        if interval <= 0:
+            interval = 10.0
+        max_frames = cfg.get("max_frames")
+        if max_frames is None:
+            max_frames = get_nested(self.config, "parsing.vision.max_pages", 50)
+        max_frames = int(max_frames) if max_frames is not None else None
+
+        total_sec = self._duration_seconds(video_path)
+        if not total_sec:
+            logger.debug(f"Cannot read duration of {video_path.name}; skip frames")
+            return []
+        ffmpeg = find_binary("ffmpeg", self.config)
+        if not ffmpeg:
+            logger.debug("ffmpeg not found; cannot sample video frames")
+            return []
+
+        # interval/2 first (mid-interval avoids a black/title frame at t=0).
+        timestamps: list[float] = []
+        t = interval / 2.0
+        while t < total_sec:
+            timestamps.append(round(t, 2))
+            t += interval
+        if max_frames is not None and len(timestamps) > max_frames:
+            logger.info(
+                f"Video {video_path.name}: {len(timestamps)} frames at "
+                f"{interval}s exceeds cap {max_frames} — resampling evenly."
+            )
+            # Resample evenly across the whole duration (not just the head).
+            step = total_sec / max_frames
+            timestamps = [round(step * (i + 0.5), 2) for i in range(max_frames)]
+
+        frames: list[tuple[Path, float]] = []
+        for idx, ts in enumerate(timestamps):
+            out_path = video_path.with_name(f"{video_path.stem}_frame{idx:04d}.jpg")
+            if out_path.exists() and out_path.stat().st_size > 0:
+                frames.append((out_path, ts))
+                continue
+            try:
+                subprocess.run(
+                    [ffmpeg, "-y", "-ss", str(ts), "-i", str(video_path),
+                     "-frames:v", "1", "-q:v", "3", str(out_path)],
+                    capture_output=True, timeout=60,
+                )
+                if out_path.exists() and out_path.stat().st_size > 0:
+                    frames.append((out_path, ts))
+            except Exception as e:
+                logger.debug(f"Frame extraction at {ts}s failed: {e}")
+
+        if frames:
+            logger.info(
+                f"Sampled {len(frames)} frame(s) from {video_path.name} "
+                f"(every {interval}s, {total_sec:.0f}s total)"
+            )
+        return frames
+
+    @staticmethod
+    def _splice_frame_pagebreaks(markdown: str, frame_times: list[float]) -> str:
+        """Insert one PAGEBREAK_MARKER per frame at its timestamp position so
+        per-frame Vision results align to the matching transcript time section.
+        Emits exactly len(frame_times) markers, in order. Lines without a
+        leading [MM:SS]/[H:MM:SS] timestamp pass through untouched."""
+        from .base import PAGEBREAK_MARKER
+
+        if not frame_times:
+            return markdown
+
+        ts_re = re.compile(r"^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]")
+
+        def line_time(line: str) -> float | None:
+            m = ts_re.match(line.strip())
+            if not m:
+                return None
+            parts = [int(x) for x in m.groups() if x is not None]
+            if len(parts) == 3:
+                return parts[0] * 3600 + parts[1] * 60 + parts[2]
+            return parts[0] * 60 + parts[1]
+
+        out: list[str] = []
+        frame_idx = 0
+        n_frames = len(frame_times)
+        for line in markdown.split("\n"):
+            lt = line_time(line)
+            if lt is not None:
+                while frame_idx < n_frames and frame_times[frame_idx] <= lt:
+                    out.append(PAGEBREAK_MARKER)
+                    frame_idx += 1
+            out.append(line)
+        # Frames past the last timestamp: append remaining markers at the end so
+        # every frame still gets a section.
+        while frame_idx < n_frames:
+            out.append(PAGEBREAK_MARKER)
+            frame_idx += 1
+        return "\n".join(out)
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -625,6 +781,25 @@ class MediaParser(BaseParser):
             return f"{m}:{s:02d}"
         except Exception:
             return ""
+
+    def _duration_seconds(self, file_path: Path) -> float:
+        """Media duration in seconds via ffprobe, or 0.0 if unavailable."""
+        from ..utils.binary_finder import find_binary
+
+        ffprobe = find_binary("ffprobe", self.config)
+        if not ffprobe:
+            return 0.0
+        try:
+            result = subprocess.run(
+                [ffprobe, "-v", "quiet",
+                 "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1",
+                 str(file_path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            return float(result.stdout.strip())
+        except Exception:
+            return 0.0
 
     @staticmethod
     def _load_info_json(file_path: Path) -> dict[str, Any] | None:
