@@ -19,31 +19,82 @@ Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → pa
 
 ## Install
 
-Use the helper script — it installs **CPU-only torch first** (docling drags the
-~5.6GB CUDA wheel otherwise; DocIngest is CPU inference only), then a
-lightweight default extras set (`mcp,audio,nlp,graph` — no GPU libraries):
+**Prerequisites:** Python 3.10+ and git. (DocIngest installs everything else; it
+can't install Python or git for you.)
+
+Two helper scripts do the whole install — one for Python packages, one for the
+system binaries DocIngest shells out to (LibreOffice / ffmpeg / poppler). Run
+both, fill in your API keys, verify. Five steps:
+
+**Linux / macOS:**
 
 ```bash
-git clone https://github.com/Din829/DocIngest.git
-cd DocIngest
-
-./scripts/install_python_deps.sh      # Linux / macOS
-.\scripts\install_python_deps.ps1     # Windows (PowerShell)
-
-cp .env.example .env                  # Fill in API keys
-docingest doctor                      # Check what's missing
-python scripts/verify_deps.py         # Build gate — also flags a CUDA torch
+git clone https://github.com/Din829/DocIngest.git && cd DocIngest
+python -m venv .venv && source .venv/bin/activate     # 1. isolated env
+./scripts/install_python_deps.sh                       # 2. CPU torch + DocIngest
+./scripts/install_system_deps.sh                       # 3. LibreOffice / ffmpeg / poppler
+cp .env.example .env                                   # 4. add GEMINI_API_KEY (see below)
+python scripts/verify_deps.py                          # 5. confirm everything is reachable
 ```
 
-> **Why not a plain `pip install -e .`?** docling pulls torch transitively, and
-> on Linux the default PyPI wheel is the ~5.6GB CUDA build that DocIngest never
-> uses. The script forces the CPU wheel up front so the install stays small.
-> If you must install by hand, run the CPU-torch line FIRST:
-> `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu`
-> then `pip install -e .`. `verify_deps.py` will tell you if a CUDA torch slipped in.
+**Windows (PowerShell):**
 
-Optional extras — add **one** only when you need that specific feature (there is
-no "install everything" path: it would pull GPU torch + backends you don't use):
+```powershell
+git clone https://github.com/Din829/DocIngest.git ; cd DocIngest
+python -m venv .venv ; .\.venv\Scripts\Activate.ps1    # 1. isolated env
+.\scripts\install_python_deps.ps1                      # 2. CPU torch + DocIngest
+.\scripts\install_system_deps.ps1                      # 3. LibreOffice / ffmpeg / poppler
+Copy-Item .env.example .env                            # 4. add GEMINI_API_KEY (see below)
+# 5. The system-deps step adds poppler / Node.js to PATH — OPEN A NEW PowerShell,
+#    re-activate the venv, then verify (a fresh shell is required to see the new PATH):
+python scripts\verify_deps.py
+```
+
+> If PowerShell blocks the `.ps1` with an execution-policy error, run it as
+> `powershell -ExecutionPolicy Bypass -File .\scripts\install_python_deps.ps1`.
+
+That's it. Now fill in `.env` and you're ready — `docingest run ./docs/`.
+
+### API keys
+
+Only two, both optional (set only what you use):
+
+| Key | For | Needed when |
+|---|---|---|
+| `GEMINI_API_KEY` | Vision AI (reads charts / scans / images per page) | Almost always — it's the default Vision engine |
+| `DASHSCOPE_API_KEY` | Audio/video transcription (Qwen3-ASR) | Only if you ingest audio / video |
+
+Library users can inject keys at call time via Provider classes instead of `.env`
+— see [Python Library](#python-library).
+
+### doctor vs verify_deps
+
+Two health checks, different jobs:
+
+- **`docingest doctor`** — friendly table for humans, always exits 0. Run it
+  anytime to see what's installed.
+- **`python scripts/verify_deps.py`** — the real gate: exits non-zero when a
+  required dep is missing (and flags a CUDA torch). Use it after install and in
+  CI / Docker, where a non-zero exit must fail the build.
+
+### Why the scripts, and not a plain `pip install -e .`
+
+docling pulls `torch` transitively, and on Linux the default PyPI wheel is the
+~5.6GB **CUDA** build that DocIngest never uses (it's CPU inference only). The
+`install_python_deps` script forces the CPU wheel up front so the install stays
+small. Installing by hand works too — just run the CPU-torch line FIRST:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+pip install -e .
+```
+
+`verify_deps.py` will tell you if a CUDA torch slipped in either way.
+
+### Optional extras
+
+Add **one** only when you need that feature — there is deliberately no
+"install everything" path (it would pull GPU torch + backends you don't use):
 
 ```bash
 pip install -e ".[nlp]"              # Japanese keyword extraction (SudachiPy)
@@ -54,40 +105,19 @@ pip install -e ".[graph-local]"      # Local embedding model — adds ~2GB torch
 pip install -e ".[graph-gemini]"     # Gemini embeddings for GraphRAG (google-genai SDK)
 ```
 
-Optional system tools (auto-detected, gracefully skipped if absent):
+The `install_python_deps` script flags select these too: `--minimal` (core only),
+`--no-graph`, `--full` (adds `graph-local`). System tools have an OCR opt-in
+(`--with-ocr` / `-WithOcr`) — off by default since per-page Vision reads images
+more accurately than docling's built-in OCR.
 
-```bash
-# LibreOffice — enables Vision enrichment for Excel/Word/PPT
-winget install TheDocumentFoundation.LibreOffice   # Windows
-brew install --cask libreoffice                    # macOS
-sudo apt install libreoffice                       # Linux
-
-# ffmpeg — enables video audio extraction + long audio segmentation
-winget install Gyan.FFmpeg                         # Windows
-brew install ffmpeg                                # macOS
-
-# yt-dlp — enables YouTube/Bilibili/video URL processing
-pip install yt-dlp
-
-# magika — enables content-based file type detection (optional, ~25MB)
-pip install magika
-```
-
-Run `docingest doctor` at any time to check your environment.
-
-For automated deployment (CI / Docker / new machine), see [`scripts/`](scripts/):
-
-```bash
-./scripts/install_python_deps.sh        # pip extras wrapper
-./scripts/install_system_deps.sh        # Linux/macOS — soffice/ffmpeg/poppler/exiftool/node
-./scripts/install_system_deps.ps1       # Windows — same via winget + manual poppler
-python scripts/verify_deps.py           # true gate (exits non-zero on missing deps —
-                                        # docingest doctor never does, so CI can't use it)
-```
+### Docker / CI
 
 `Dockerfile.example` at the repo root is a single-stage production template that
-wires these scripts together (system bins layer → pip layer → OCR model pre-download
-as root → `verify_deps.py` build gate → non-root user).
+wires these same scripts together (system bins layer → CPU-torch + pip layer →
+optional OCR model pre-download as root → `verify_deps.py` build gate → non-root
+user). The scripts auto-detect the platform: `install_system_deps.sh` covers
+apt / dnf / yum / pacman / zypper / brew; `.ps1` uses winget plus a manual
+poppler download.
 
 ### Use as a dependency of another project
 
@@ -344,124 +374,34 @@ without updating the table and the test goes red.
 
 ### MCP Server (for AI Agents)
 
-Thin MCP wrapper — exposes DocIngest as tools for AI Agents (Claude / GPT / etc.).
-`mcp_server.py` is a transport layer only; every tool is a ~10-line wrapper around the corresponding DocIngest Python API.
+Thin MCP wrapper exposing DocIngest as tools for AI agents. `mcp_server.py` is a transport layer only — every tool is a ~10-line wrapper around the corresponding Python API, so MCP and library callers share identical behaviour.
 
-**Install:**
 ```bash
 pip install -e ".[mcp]"
+python -m docingest.mcp_server                    # stdio (Claude Desktop / Code, VS Code Copilot)
+python -m docingest.mcp_server --transport http   # Streamable HTTP (web clients)
 ```
 
-**Run:**
-```bash
-python -m docingest.mcp_server                    # stdio (Claude Desktop, Claude Code, VS Code Copilot)
-python -m docingest.mcp_server --transport http   # Streamable HTTP (web clients — recommended)
-python -m docingest.mcp_server --transport sse    # SSE (legacy in fastmcp v3; kept for back-compat)
-```
+**Tools** (each accepts optional `config_overrides`):
 
-**Available tools** (every tool accepts optional `config_overrides` for dynamic behavior). Tools that process documents route through the public Python facade so MCP and library callers always share the same behaviour:
+| Tool | Purpose |
+|---|---|
+| `inspect` | Pre-flight check (size, pages, cost estimate) |
+| `run` | Process documents → knowledge base |
+| `refine` | AI-powered Markdown cleanup |
+| `build_graph` / `query_graph` / `graph_status` / `enrich_chunks` | Graph layer — registered only when `[graph]` extras are installed |
 
-| Tool | Purpose | Backed by |
-|---|---|---|
-| `inspect` | Pre-flight check (size, pages, cost estimate) | `docingest.inspect()` |
-| `run` | Process documents → knowledge base | `docingest.ingest()` |
-| `refine` | AI-powered Markdown cleanup | `docingest.refine()` |
-| `build_graph` | Build / extend knowledge graph (opt-in, requires `[graph]`) | `docingest.graph.build()` |
-| `query_graph` | Query the graph (local / global / hybrid / mix / naive) | `docingest.graph.query()` |
-| `graph_status` | Inspect graph build state + entity / relation / community counts | `docingest.graph.status()` |
-| `enrich_chunks` | Replay graph entities into `chunks_enriched.jsonl` so traditional vector RAG also benefits | `docingest.graph.enrich_chunks()` |
+Browsing / searching the knowledge base is **deliberately NOT an MCP tool** — DocIngest is a preprocessing engine, not a retrieval engine. Agents use their own native Grep / Read / Glob on the artefacts (`sources/*.md`, `index.json`, `chunks.jsonl`); each knowledge base ships an auto-generated `knowledge_search.SKILL.md` with the corpus summary, file index, and a language-routed search protocol to read first.
 
-Browsing / searching / reading the produced knowledge base is **NOT exposed as MCP tools by design** — DocIngest is a preprocessing engine, not a retrieval engine. Use your agent's native Grep / Read / Glob on the on-disk artefacts (`sources/*.md`, `index.json`, `chunks.jsonl`). Each knowledge base ships an auto-generated `knowledge_search.SKILL.md` — Read it once at the start of a session and you have the corpus's summary, file index, keyword index, and a language-routed search protocol.
-
-The four graph tools are registered **only when `lightrag-hku` is installed** (`pip install -e ".[graph]"`); without the extras they don't appear in the tool listing and the rest of the server is unaffected.
-
-**Client configuration:**
-
-*Claude Desktop* — edit `claude_desktop_config.json` (Settings > Developer > Edit Config), restart Claude fully (quit, not just close window):
-```json
-{
-  "mcpServers": {
-    "docingest": {
-      "command": "python",
-      "args": ["-m", "docingest.mcp_server"],
-      "cwd": "/path/to/DocIngest"
-    }
-  }
-}
-```
-
-*Claude Code* — add to `.mcp.json` at project root (shared via git) or `~/.claude.json` (personal, all projects):
-```json
-{
-  "mcpServers": {
-    "docingest": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["-m", "docingest.mcp_server"]
-    }
-  }
-}
-```
-
-*VS Code (Copilot)* — add to `.vscode/mcp.json` (key is `servers`, **not** `mcpServers`):
-```json
-{
-  "servers": {
-    "docingest": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["-m", "docingest.mcp_server"]
-    }
-  }
-}
-```
-MCP tools appear in Copilot Agent mode (Ctrl+Alt+I).
-
-**Typical Agent workflow:**
-```
-1. inspect(["./new_docs/"])                      → size / pages / cost estimate (MCP tool)
-2. run(["./new_docs/"])                          → incremental processing      (MCP tool)
-3. Read  ./knowledge/knowledge_search.SKILL.md   → summary + search protocol   (native Read)
-4. Read  ./knowledge/index.json                  → file inventory              (native Read)
-5. Grep  "契約" ./knowledge/sources/             → find by keyword             (native Grep)
-6. Read  ./knowledge/sources/contract.md         → read full file              (native Read)
-7. refine(["./knowledge/sources/contract.md"])   → optional AI cleanup         (MCP tool)
-```
-
-Steps 3-6 use the agent's own Grep / Read tools — DocIngest deliberately does not wrap them, so each agent (Claude Code / Cursor / Codex / Copilot / ...) gets to use the file-exploration tooling it already has, with whatever flags / context / output formatting it does best.
-
-**Config overrides from Agent** — override any config path per call without touching files. Two equivalent forms, mix freely:
-
-```python
-# Nested dict form (verbose, groups well when you override several keys under one section)
-run(["docs/"], config_overrides={
-    "parsing": {"vision": {"max_pages": 200, "triage": {"enabled": True}}},
-    "chunking": {"strategy": "heading", "max_tokens": 1024},
-    "sanitize": {"enabled": True},
-})
-
-# Flat dot-path form (compact, one line per override)
-run(["docs/"], config_overrides={
-    "parsing.vision.max_pages": 200,
-    "parsing.vision.triage.enabled": True,
-    "chunking.strategy": "heading",
-    "chunking.max_tokens": 1024,
-    "sanitize.enabled": True,
-})
-```
-
-**Adding a new tool** — open `src/docingest/mcp_server.py`, add a `@mcp.tool` function that delegates to a function in `docingest.api` (keep MCP a thin transport layer — the facade is the single source of truth for processing logic). FastMCP auto-generates the schema from type hints + docstring. See ARCHITECTURE.md §3.3 for the public-API contract and §3.2 for the wider code map.
-
-**Troubleshooting:**
-- "Module not found" → `pip install -e ".[mcp]"`
-- API key errors → set `GEMINI_API_KEY` / `DASHSCOPE_API_KEY` in `.env` or environment. As an alternative, library callers can inject keys directly via Provider classes (`docingest.GeminiProvider(api_key="...")`) without touching env vars — see the Python Library section above.
-- Large files hang → run `inspect` first and use `config_overrides` to raise `max_pages`
+**Client configuration** (Claude Desktop / Claude Code / VS Code Copilot), the agent workflow, per-call `config_overrides`, and troubleshooting are in [INTEGRATION.md §4 (Agent via MCP)](docs/INTEGRATION.md). To add a tool, see ARCHITECTURE.md §3.3.
 
 ## GraphRAG (optional)
 
 Build an entity / relation knowledge graph on top of an existing knowledge base, then run global / local / hybrid queries via [LightRAG](https://github.com/HKUDS/LightRAG). **Strictly opt-in** — `docingest run` never touches it, and the import path `docingest.graph` only loads when explicitly imported.
 
-> **Note on communities** — LightRAG ≥ 1.4 no longer generates community reports automatically during `ainsert`; the build step produces entities + relations + per-entity / per-relation embeddings. The `global` query mode still works (it falls back to relation-level retrieval), but you won't see community summaries in `status` output — `Communities = 0` is expected, not a bug.
+This section covers **how to use** the graph layer. For the architecture (module
+boundaries, three-tier caching, why LightRAG, the `Communities = 0` behaviour on
+LightRAG ≥ 1.4, swapping backends), see [ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-graphrag-子模块docingestgraph可选).
 
 ```bash
 # 1. Install the optional extras (LightRAG + OpenAI embedding client)
@@ -575,25 +515,21 @@ graph:
     inject_into_metadata: true
 ```
 
-### Speed vs. precision — two knobs that matter
+### Speed vs. precision — two knobs
 
-Graph build is dominated by LLM calls during entity extraction — each chunk gets sent to the LLM at least once with a ~16K-character prompt (LightRAG's own template + few-shot examples + your chunk content, ~88% of which is the fixed template overhead). Two YAML knobs let you trade speed against extraction recall:
+Graph build is dominated by LLM calls during entity extraction. Two YAML knobs trade speed against recall:
 
 ```yaml
 graph:
   lightrag:
-    entity_extract_max_gleaning: 0  # DocIngest default: skip the 2nd "did you miss anything?" pass
-    max_parallel_insert: 4          # chunks processed in parallel; LightRAG's own default is 2
+    entity_extract_max_gleaning: 0  # 0 (DocIngest default): skip the 2nd extraction pass.
+                                    # Raise to 1 for prose / academic / legal corpora where
+                                    # the first pass misses ~10-15% of edge entities (doubles cost).
+    max_parallel_insert: 4          # chunks processed in parallel (LightRAG's own default is 2).
+                                    # 6-8 if your LLM tier has high RPM; 1-2 on a shared tier-1 key.
 ```
 
-| Knob | Default | When to raise | When to lower |
-|---|---|---|---|
-| `entity_extract_max_gleaning` | **0** | Set to `1` (or `2`) for **prose / academic / legal** corpora where the first extraction misses ~10-15% of edge entities. Doubles LLM cost per chunk. | Already at floor. |
-| `max_parallel_insert` | **4** | `6-8` if your LLM tier supports high RPM (helps wall-clock proportionally). Zero effect on precision — pure throughput knob. | `1-2` if you share an OpenAI tier-1 key with other workloads (avoids rate-limit retries). |
-
-Why the DocIngest default for gleaning is **0** (different from LightRAG's `1`): the typical input here is a **structured document** — DB design sheets, API specs, Q&A tables, contracts — where the first extraction already captures 95%+ of meaningful entities. Gleaning doubles LLM calls for a marginal recall bump that's mostly irrelevant on this input shape. If you're feeding free-flowing prose, raise it back to `1`.
-
-A small (~50 chunk) corpus typically rebuilds in **2-3 minutes** with these defaults vs. **6-8 minutes** at LightRAG's defaults — same precision on structured input, half the LLM bill.
+DocIngest defaults gleaning to **0** (vs LightRAG's 1) because the typical input is structured (DB sheets, API specs, contracts) where one pass already captures 95%+ of entities — halving the LLM bill with no precision loss. Raise it for free-flowing prose. (~50-chunk corpus: 2-3 min at these defaults vs 6-8 min at LightRAG's.)
 
 ## Configuration
 
@@ -605,93 +541,38 @@ CLI args  >  environment variables  >  project docingest.yaml  >  config/default
 
 ### YAML
 
+[`config/default.yaml`](config/default.yaml) is the single source of truth — every
+knob is there with inline comments. Drop a `docingest.yaml` in your project root to
+override only what you need (everything else inherits the default). A taste:
+
 ```yaml
 chunking:
-  strategy: "heading"
+  strategy: "heading"             # auto | heading | recursive | slide | sheet | timestamp | whole
   max_tokens: 1024
-
-  # Heading merge behaviour — all three policies are independently tunable
-  # so different document types (legal contracts, tech reports, tutorials)
-  # can use different trade-offs without code changes.
-  heading:
-    prelude_policy: "attach_to_first"     # attach_to_first | standalone | drop
-    orphan_heading_policy: "merge_forward" # merge_forward | keep
-    title_path_strategy: "deepest"         # deepest | first | join_all
-
-  protection:
-    # What to do when a protected block (table/code/list/quote) exceeds
-    # its allowed_overflow × max_tokens budget. Per-block-type control.
-    on_overflow:
-      table: "row_split"      # split giant tables at data-row boundaries,
-                              # repeat header in every sub-chunk
-      code_block: "bypass"    # don't split code — breaks syntax
-      list: "bypass"
-      default: "bypass"
-    table_split:
-      keep_header_in_every_chunk: true
-      max_rows_per_chunk: null  # null = only token budget applies
 
 models:
   defaults:
-    max_response_tokens: 32768  # Global fallback — every LLM task inherits this
-                                # (vision / chunking_assist / contextual_summary / ...)
-                                # unless it sets its own max_response_tokens.
-    retry_on_truncation: true   # Retry once when finish_reason=="length"
-    retry_max_tokens: 65536
-  vision:
-    max_response_tokens: 32768  # Per-task override (optional — inherits defaults if unset)
     primary: { provider: "google", model: "gemini-3-flash-preview" }
-  audio_transcription:
-    primary: { provider: "dashscope", model: "qwen3-asr-flash" }
-    fallback: { provider: "openai", model: "whisper-1" }
+    # One model for every text/vision task; override a single task under its own key.
 
 parsing:
   vision:
     image_dpi: 180
-    supplement_only: false      # Global default: Vision transcribes the whole page.
-                                # xlsx flips to true below (supplement only —
-                                # openpyxl already has the table, Vision just adds
-                                # visuals → no Docling↔Vision dup). PDF/PPT stay
-                                # false: Docling fragments 方眼紙 tables, so they
-                                # need full transcription to recover the body.
-    triage:
-      enabled: true             # Skip pure-text pages (saves Vision API cost)
-  pdf:
-    hidden_text_detection:
-      enabled: true             # Detect invisible/background content
-    vision:                     # Optional per-format Vision override (model / max_response_tokens / image_dpi).
-      image_dpi: 220            # Unset fields fall through to global models.vision.* / parsing.vision.*.
-  xlsx:
-    vision:
-      supplement_only: true     # Vision adds visuals only, never re-transcribes
-                                # the openpyxl-rendered table (removes xlsx dup).
-  pptx:
-    vision:
-      max_response_tokens: 8192 # PPT pages are content-light — cap output to save cost.
-  audio:
-    prefer_subtitles: true
-    language: "auto"
-    max_segment_seconds: 150
-  url:
-    enabled: true
-  zip:
-    enabled: true
-  magika:
-    enabled: true
-
-output:
-  include_bounding_boxes: true  # Per-element coordinates for RAG citation
+    triage: { enabled: true }     # skip pure-text pages → saves Vision API cost
 
 sanitize:
-  enabled: true                 # PII masking (email, URL, credit card, IP, phone)
-
-incremental:
-  enabled: true
+  enabled: false                  # PII masking (email / card / IP / phone), default OFF
 ```
+
+The most-tuned sections — `chunking.heading.*` / `chunking.protection.*` (merge & overflow
+policy), per-format `parsing.<pdf|xlsx|pptx>.vision.*` overrides, `models.*` retry/token
+budgets — are all documented inline in `config/default.yaml`. Read it there rather than
+duplicating the full reference here.
 
 ### Environment variables
 
-Any config value can be overridden by `DOCINGEST__<path>` env variables:
+Any config value can be overridden by `DOCINGEST__<path>` env variables (double
+underscore separates levels):
 
 ```bash
 export DOCINGEST__chunking__max_tokens=1024
@@ -744,7 +625,7 @@ index.json + chunks.jsonl + knowledge_map.yaml + quality_report.json
 LightRAG entity / relation extraction → graph/  (graphml + entity vdb + chunk vdb)
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rationale, and how to add new formats / hooks / chunkers. The optional graph layer is documented in [ARCHITECTURE.md §10](ARCHITECTURE.md#10-graphrag-子模块docingestgraph可选).
+See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Phase breakdown, design rationale, and how to add new formats / hooks / chunkers. The optional graph layer is documented in [ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-graphrag-子模块docingestgraph可选).
 
 ## Key Features
 
@@ -784,7 +665,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full Phase breakdown, design rati
 
 ## Project Layout
 
-See [ARCHITECTURE.md §3.1](ARCHITECTURE.md) for the full annotated directory tree and §3.2 for a "I want to look at X → find it at Y" quick-navigation table.
+See [ARCHITECTURE.md §3.1](docs/ARCHITECTURE.md) for the full annotated directory tree and §3.2 for a "I want to look at X → find it at Y" quick-navigation table.
 
 ## Testing
 
@@ -824,5 +705,5 @@ your own changes.
 
 ## Documentation
 
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt. **§10** covers the optional `docingest.graph` layer (boundaries, module layout, three-tier caching, swapping backends).
-- **[INTEGRATION.md](INTEGRATION.md)** — How to integrate DocIngest into your own system (CLI subprocess / Python library / MCP), per-scenario recipes, cross-cutting concerns
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt. **§10** covers the optional `docingest.graph` layer (boundaries, module layout, three-tier caching, swapping backends).
+- **[INTEGRATION.md](docs/INTEGRATION.md)** — How to integrate DocIngest into your own system (CLI subprocess / Python library / MCP), per-scenario recipes, cross-cutting concerns

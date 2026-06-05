@@ -2,7 +2,7 @@
 
 一份文档讲清楚：项目怎么跑 + 我要改/加该怎么做。给接手开发者和维护 Agent 用。
 
-用户文档见 [README.md](README.md)。
+用户文档见 [README.md](../README.md)。
 
 ---
 
@@ -1099,7 +1099,7 @@ chunks.jsonl  ──►  chunks_enriched.jsonl
 ## 附：文档维护
 
 - 架构 / Phase / 扩展点变更 → 本文档
-- 用户指南（装、跑、MCP 配置）→ [README.md](README.md)
+- 用户指南（装、跑、MCP 配置）→ [README.md](../README.md)
 - 集成指南（嵌入到别的系统）→ [INTEGRATION.md](INTEGRATION.md)
 
 改 pipeline.py 或扩展机制时同步更新 Phase 表（§2.2）和 代码地图（§3）。

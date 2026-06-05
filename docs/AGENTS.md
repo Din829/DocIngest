@@ -57,4 +57,4 @@ For unknown / large inputs, **inspect for cost first, then run**:
 violation summary to the user FIRST — don't blindly retry with `--yes` /
 `acknowledge_large=True`.
 
-Full features, config, Python API, MCP client setup: [README.md](README.md).
+Full features, config, Python API, MCP client setup: [README.md](../README.md).

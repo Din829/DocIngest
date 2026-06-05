@@ -102,7 +102,30 @@ Claude / Cursor / Copilot agents talking to DocIngest as a tool.
 
 Stdio is the default transport. For browser-side / web clients, run `python -m docingest.mcp_server --transport sse` and connect over SSE instead.
 
+**Other clients:**
+
+```jsonc
+// Claude Desktop: claude_desktop_config.json (Settings > Developer > Edit Config),
+// then fully restart Claude (quit, not just close the window).
+{ "mcpServers": { "docingest": {
+    "command": "python", "args": ["-m", "docingest.mcp_server"], "cwd": "/path/to/DocIngest" } } }
+
+// VS Code (Copilot): .vscode/mcp.json — note the key is `servers`, NOT `mcpServers`.
+// Tools appear in Copilot Agent mode (Ctrl+Alt+I).
+{ "servers": { "docingest": {
+    "type": "stdio", "command": "python", "args": ["-m", "docingest.mcp_server"] } } }
+```
+
 Tools exposed: `inspect`, `run`, `refine`. Plus optional graph tools (`build_graph`, `query_graph`, `graph_status`, `enrich_chunks`) when `pip install -e ".[graph]"` extras are installed — without them the four graph tools simply don't appear in the listing. Every tool docstring spells out WHEN TO USE / TYPICAL WORKFLOW / how to interpret the result — agents read those at startup. The MCP layer is a thin transport wrapper around the same Python facade, so tool behaviour mirrors `docingest.ingest()` exactly.
+
+**Per-call `config_overrides`** — every tool accepts a `config_overrides` dict to change behaviour without touching files. Nested or flat dot-path form, mix freely:
+
+```python
+run(["docs/"], config_overrides={"parsing": {"vision": {"max_pages": 200}}, "chunking": {"max_tokens": 1024}})
+run(["docs/"], config_overrides={"parsing.vision.max_pages": 200, "chunking.max_tokens": 1024})
+```
+
+**Troubleshooting:** `Module not found` → `pip install -e ".[mcp]"`. API-key errors → set `GEMINI_API_KEY` / `DASHSCOPE_API_KEY` in `.env`, or inject via Provider classes. Large files hang → `inspect` first, then raise `max_pages` via `config_overrides`.
 
 Browsing / searching / reading the produced knowledge base is **deliberately NOT exposed as MCP tools** — DocIngest is a preprocessing engine, not a retrieval engine. Each agent already has Grep / Read / Glob that out-perform any wrapper we could ship, and the auto-generated `<output_dir>/knowledge_search.SKILL.md` gives them the corpus summary, file index, keyword index, and a language-routed search protocol in one Read. This keeps DocIngest as the universal upstream layer — every agent uses its own native tooling on the produced artefacts.
 
@@ -447,7 +470,7 @@ tracebacks during integration work; switch back to `INFO` in prod.
 
 ### Cloud LLM providers
 
-See [README → Python Library](README.md#python-library) for one-block
+See [README → Python Library](../README.md#python-library) for one-block
 examples of `AzureOpenAIProvider` / `BedrockProvider` / `VertexAIProvider`
 / `GeminiProvider` / `OpenAIProvider` / `AnthropicProvider`. The Provider
 classes are intentionally thin — they shape a config dict and write the
@@ -499,5 +522,5 @@ finished cleanly".
 - **Field-level config reference** → `config/default.yaml` (every knob has an inline comment)
 - **API signatures and behaviour** → docstrings on `docingest.ingest`, `docingest.inspect`, `docingest.refine`, `docingest.run_pipeline`
 - **Internal architecture (Phase / hooks / parsers / chunkers)** → [ARCHITECTURE.md](ARCHITECTURE.md)
-- **Install / CLI / YAML examples** → [README.md](README.md)
+- **Install / CLI / YAML examples** → [README.md](../README.md)
 - **Agent-side workflow advice** → [AGENTS.md](AGENTS.md)

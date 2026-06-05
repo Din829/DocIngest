@@ -13,7 +13,7 @@ costs they paid to learn them. It is intentionally a **decision frame**,
 not a recipe: the right config depends on your host's constraints, not
 on a one-size-fits-all template.
 
-For the underlying mechanics, follow the links to [README.md](README.md),
+For the underlying mechanics, follow the links to [README.md](../README.md),
 [INTEGRATION.md](INTEGRATION.md), and [ARCHITECTURE.md](ARCHITECTURE.md).
 Don't paraphrase those — link them and add value on top.
 
@@ -34,7 +34,7 @@ Don't paraphrase those — link them and add value on top.
 
 1. **Which LLM provider?** OpenAI direct / Azure / Bedrock / Vertex / Gemini
    / Anthropic? → Pick the matching Provider class from
-   [README → Python Library](README.md#python-library). Don't roll your own
+   [README → Python Library](../README.md#python-library). Don't roll your own
    credential plumbing — DocIngest already mirrors the right env vars per
    provider.
 
@@ -239,12 +239,12 @@ Synchronous, no feeder thread, exit is clean.
 
 | Topic | Source |
 |---|---|
-| Public API surface (function signatures, return shapes) | `docingest.{ingest,inspect,refine}` docstrings + [README → Python Library](README.md#python-library) |
+| Public API surface (function signatures, return shapes) | `docingest.{ingest,inspect,refine}` docstrings + [README → Python Library](../README.md#python-library) |
 | Every config knob + comment | [config/default.yaml](config/default.yaml) |
 | Phase ordering, hooks, extension points | [ARCHITECTURE.md](ARCHITECTURE.md) |
 | Integration scenarios (FastAPI / MCP / shell / daemon) | [INTEGRATION.md](INTEGRATION.md) — "Scenarios" |
 | Container/cloud deployment | [INTEGRATION.md](INTEGRATION.md) — "Deployment" |
-| Provider cheatsheet (Azure / Bedrock / Vertex / OpenAI / Gemini / Anthropic) | [README → Python Library](README.md#python-library) |
+| Provider cheatsheet (Azure / Bedrock / Vertex / OpenAI / Gemini / Anthropic) | [README → Python Library](../README.md#python-library) |
 | Cost-incurring switches audit | `docingest doctor` |
 
 If you need a fact this skill doesn't cover, **read the source of truth
