@@ -96,6 +96,39 @@ def _check_js_runtime() -> str | None:
     return None
 
 
+def _check_torch_variant() -> dict[str, Any]:
+    """
+    Detect whether the installed torch is the CPU build or a CUDA/ROCm build.
+
+    DocIngest does CPU inference only — docling drags torch in transitively,
+    and on Linux the default PyPI wheel is the ~5.6GB CUDA build (none of which
+    DocIngest uses). A CUDA torch is not "broken", but it bloats every install
+    by gigabytes for zero benefit, so we surface it as a build-gate error: the
+    fix is a one-line reinstall from the CPU index.
+
+    Returns a dict:
+        installed : bool   — torch importable at all
+        is_cpu    : bool   — True when this is the CPU-only build
+        variant   : str    — "cpu" | "cuda <ver>" | "rocm <ver>" | "unknown"
+
+    torch.version.cuda is None on the CPU wheel and a version string ("12.1")
+    on a CUDA wheel — the canonical, build-baked signal (not a runtime GPU
+    probe, so it works identically on a GPU-less CI box).
+    """
+    try:
+        import torch  # noqa: PLC0415 — intentional lazy import (heavy)
+    except Exception:
+        return {"installed": False, "is_cpu": False, "variant": "unknown"}
+
+    cuda_ver = getattr(torch.version, "cuda", None)
+    hip_ver = getattr(torch.version, "hip", None)
+    if cuda_ver:
+        return {"installed": True, "is_cpu": False, "variant": f"cuda {cuda_ver}"}
+    if hip_ver:
+        return {"installed": True, "is_cpu": False, "variant": f"rocm {hip_ver}"}
+    return {"installed": True, "is_cpu": True, "variant": "cpu"}
+
+
 # ---------------------------------------------------------------------------
 # Install hints (platform-aware)
 # ---------------------------------------------------------------------------
@@ -200,7 +233,7 @@ def _collect_status() -> dict[str, Any]:
         "ffprobe": {"ok": _check_binary("ffprobe") is not None, "path": _check_binary("ffprobe")},
     }
 
-    return {"doctor": doctor, "extras": extras}
+    return {"doctor": doctor, "extras": extras, "torch": _check_torch_variant()}
 
 
 def _is_ok(status: dict[str, Any], kind: str, name: str) -> bool:
@@ -249,6 +282,21 @@ def _evaluate(
     for name, info in status["doctor"]["core"].items():
         if not info["ok"]:
             errors.append(f"core pkg [{name}] missing → {info['hint'] or 'pip install ' + name}")
+
+    # torch variant — ALWAYS checked (independent of profile). DocIngest is
+    # CPU-only; a CUDA/ROCm torch bloats the install by ~5GB for zero benefit.
+    # Treated as an error so the build gate refuses a wrong-variant install and
+    # prints the one-line fix. torch missing entirely → silent (docling pulls
+    # it transitively, so a real install always has it; if it's absent the core
+    # pkg check above already fires).
+    torch_info = status.get("torch", {})
+    if torch_info.get("installed") and not torch_info.get("is_cpu"):
+        errors.append(
+            f"torch is the {torch_info.get('variant', 'non-CPU')} build "
+            f"(~5GB, DocIngest uses CPU inference only) → reinstall the CPU "
+            f"wheel: pip install torch torchvision "
+            f"--index-url https://download.pytorch.org/whl/cpu --force-reinstall"
+        )
 
     # Required groups → errors if missing
     for group in required_groups:

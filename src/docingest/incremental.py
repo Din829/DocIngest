@@ -162,6 +162,8 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.xls.auto_convert_to_xlsx",    # flipping decides whether a .xls
                                            # goes through the full xlsx path
                                            # or falls through to TextParser
+    "parsing.doc.auto_convert_to_docx",    # same for legacy .doc → .docx
+    "parsing.ppt.auto_convert_to_pptx",    # same for legacy .ppt → .pptx
     "output.markdown.include_metadata_header",
     "output.dedup.enabled",                # Vision/Docling dedup toggle —
                                            # disabling it keeps both versions in sources/*.md

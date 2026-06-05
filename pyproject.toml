@@ -180,7 +180,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
-# Install everything: pip install -e ".[nlp,mcp,audio,ocr,graph,langchain,gui]"
+# Recommended install: run scripts/install_python_deps.{sh,ps1} — it installs
+# CPU-only torch FIRST (docling drags the ~5.6GB CUDA wheel otherwise; DocIngest
+# is CPU inference only), then a lightweight extras set. Add a single optional
+# extra only when you need that feature; there is no "install everything" path
+# by design (it would pull GPU torch + every optional backend you don't use).
 
 [project.scripts]
 docingest = "docingest.cli:app"

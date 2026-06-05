@@ -465,14 +465,20 @@ parsing:
     download_dir: "_media"                 # relative to output.dir/.cache/
     yt_dlp_extra_args: []                  # additional yt-dlp flags (advanced)
 
-  # Legacy .xls (BIFF) — converted to .xlsx via LibreOffice before the
-  # rest of the pipeline sees the file. Once converted it goes through
-  # the full xlsx path (openpyxl renderer + Vision + chunking) with the
-  # original .xls filename / mimetype / binary_hash preserved in
+  # Legacy binary Office (pre-2007 BIFF/CFB: .xls / .doc / .ppt) — converted to
+  # their modern OOXML form (.xlsx / .docx / .pptx) via LibreOffice before the
+  # rest of the pipeline sees the file. Docling only accepts the OOXML forms, so
+  # without this the legacy file fails at parse. Once converted it flows through
+  # the full modern-format path (Docling/openpyxl + Vision + chunking) with the
+  # original filename / mimetype / binary_hash preserved in
   # metadata.lineage.original_input. LibreOffice missing → degrades to
   # TextParser fallback (gibberish, but pipeline never raises).
   xls:
     auto_convert_to_xlsx: true
+  doc:
+    auto_convert_to_docx: true
+  ppt:
+    auto_convert_to_pptx: true
 
   # Excel-specific
   xlsx:

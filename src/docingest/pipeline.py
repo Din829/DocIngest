@@ -690,30 +690,48 @@ def _downscale_image(image_path: str, max_pixels: int) -> None:
         _pipeline_logger.debug(f"Image downscale failed: {e}")
 
 
-def _maybe_convert_xls(
+# Legacy binary Office formats → their modern OOXML equivalents via
+# LibreOffice. Docling only accepts the OOXML forms (.docx/.pptx/.xlsx); the
+# pre-2007 BIFF/CFB forms (.xls/.doc/.ppt) must be converted first, after which
+# every downstream Phase (parser / page-image / chunking) flows through the
+# modern-format path unchanged. Map: legacy suffix → (target ext, config key).
+_LEGACY_OFFICE_CONVERSIONS: dict[str, tuple[str, str]] = {
+    ".xls": ("xlsx", "parsing.xls.auto_convert_to_xlsx"),
+    ".doc": ("docx", "parsing.doc.auto_convert_to_docx"),
+    ".ppt": ("pptx", "parsing.ppt.auto_convert_to_pptx"),
+}
+
+
+def _maybe_convert_legacy_office(
     file_path: Path,
     config: dict[str, Any],
     output_dir: Path,
 ) -> tuple[Path, dict[str, Any] | None]:
     """
-    Legacy .xls (BIFF) → .xlsx via LibreOffice, so the rest of the pipeline
-    can use the full xlsx path (openpyxl renderer + Vision + chunking).
+    Legacy binary Office (.xls / .doc / .ppt) → modern OOXML (.xlsx / .docx /
+    .pptx) via LibreOffice, so the rest of the pipeline can use the full modern
+    path (Docling / openpyxl renderer + Vision + chunking). Docling rejects the
+    pre-2007 binary forms outright, so without this they fail at parse.
 
     Returns (effective_path, transformation_record):
-      - non-.xls or disabled → (file_path, None) untouched
+      - non-legacy suffix or disabled → (file_path, None) untouched
       - LibreOffice missing  → (file_path, None) + warning, caller falls
                                 through to TextParser
       - conversion failure   → (file_path, None) + warning, same fallback
-      - success              → (cached_xlsx_path, {"step": "format_convert", ...})
+      - success              → (cached_modern_path, {"step": "format_convert", ...})
 
-    Cache: {output_dir}/.cache/_xls_convert/<sha256_of_original>.xlsx
-    Keyed on the original .xls bytes so the same file is converted exactly
-    once per output directory across runs.
+    Cache: {output_dir}/.cache/_legacy_convert/<sha256_of_original>.<target>
+    Keyed on the original bytes so the same file is converted exactly once per
+    output directory across runs.
     """
-    if file_path.suffix.lower() != ".xls":
+    conversion = _LEGACY_OFFICE_CONVERSIONS.get(file_path.suffix.lower())
+    if conversion is None:
         return file_path, None
-    if not get_nested(config, "parsing.xls.auto_convert_to_xlsx", True):
+    target_ext, config_key = conversion
+    if not get_nested(config, config_key, True):
         return file_path, None
+
+    src_suffix = file_path.suffix.lower()  # e.g. ".xls"
 
     import hashlib
     import shutil
@@ -724,15 +742,15 @@ def _maybe_convert_xls(
     soffice = find_binary("soffice", config)
     if not soffice:
         _pipeline_logger.warning(
-            f".xls input {file_path.name}: LibreOffice not found, cannot "
-            f"convert to .xlsx — will fall through to TextParser "
-            f"(likely gibberish). Install LibreOffice or set "
-            f"parsing.xls.auto_convert_to_xlsx: false to silence this."
+            f"{src_suffix} input {file_path.name}: LibreOffice not found, "
+            f"cannot convert to .{target_ext} — will fall through to "
+            f"TextParser (likely gibberish). Install LibreOffice or set "
+            f"{config_key}: false to silence this."
         )
         return file_path, None
 
     try:
-        # Stream-hash the source to avoid loading huge .xls into memory
+        # Stream-hash the source to avoid loading huge files into memory
         h = hashlib.sha256()
         with file_path.open("rb") as f:
             for block in iter(lambda: f.read(65536), b""):
@@ -740,47 +758,48 @@ def _maybe_convert_xls(
         digest = h.hexdigest()
     except OSError as e:
         _pipeline_logger.warning(
-            f".xls input {file_path.name}: cannot read for hashing ({e}) — "
-            f"skipping conversion"
+            f"{src_suffix} input {file_path.name}: cannot read for hashing "
+            f"({e}) — skipping conversion"
         )
         return file_path, None
 
-    cache_dir = output_dir / ".cache" / "_xls_convert"
+    cache_dir = output_dir / ".cache" / "_legacy_convert"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cached_xlsx = cache_dir / f"{digest}.xlsx"
+    cached_modern = cache_dir / f"{digest}.{target_ext}"
 
-    if not cached_xlsx.exists():
+    if not cached_modern.exists():
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 proc = run_soffice_convert(
-                    file_path, tmpdir, "xlsx", config=config, timeout=180,
+                    file_path, tmpdir, target_ext, config=config, timeout=180,
                 )
-                produced = list(Path(tmpdir).glob("*.xlsx"))
+                produced = list(Path(tmpdir).glob(f"*.{target_ext}"))
                 if proc is None:
                     # soffice unavailable — same degrade as a failed convert.
                     _pipeline_logger.warning(
-                        f".xls → .xlsx conversion skipped for "
+                        f"{src_suffix} → .{target_ext} conversion skipped for "
                         f"{file_path.name}: LibreOffice not found"
                     )
                     return file_path, None
                 if proc.returncode != 0 or not produced:
                     _pipeline_logger.warning(
-                        f".xls → .xlsx conversion failed for "
+                        f"{src_suffix} → .{target_ext} conversion failed for "
                         f"{file_path.name} (exit={proc.returncode}): "
                         f"{proc.stderr.decode('utf-8', errors='replace')[:200]}"
                     )
                     return file_path, None
-                shutil.move(str(produced[0]), cached_xlsx)
+                shutil.move(str(produced[0]), cached_modern)
         except (subprocess.TimeoutExpired, OSError) as e:
             _pipeline_logger.warning(
-                f".xls → .xlsx conversion error for {file_path.name}: {e}"
+                f"{src_suffix} → .{target_ext} conversion error for "
+                f"{file_path.name}: {e}"
             )
             return file_path, None
 
-    return cached_xlsx, {
+    return cached_modern, {
         "step": "format_convert",
-        "from": "xls",
-        "to": "xlsx",
+        "from": src_suffix.lstrip("."),
+        "to": target_ext,
         "tool": "libreoffice",
     }
 
@@ -1999,14 +2018,14 @@ def process_single_file(
     """
     result = FileResult(original_file=str(file_path))
 
-    # --- Phase 0.5: Legacy format convert (.xls → .xlsx via LibreOffice) ---
-    # When this fires, `file_path` is rebound to the cached .xlsx so every
+    # --- Phase 0.5: Legacy format convert (.xls/.doc/.ppt → OOXML via LibreOffice) ---
+    # When this fires, `file_path` is rebound to the cached modern file so every
     # downstream Phase (hooks / parser / page-image / metadata) flows
-    # through the xlsx path unchanged. The ORIGINAL .xls path is held in
-    # `result.original_file` (set above) and reused for lineage below, so
+    # through the modern-format path unchanged. The ORIGINAL legacy path is held
+    # in `result.original_file` (set above) and reused for lineage below, so
     # `metadata.lineage.original_input` still points at the user's input.
-    xls_convert_record: dict[str, Any] | None = None
-    file_path, xls_convert_record = _maybe_convert_xls(
+    legacy_convert_record: dict[str, Any] | None = None
+    file_path, legacy_convert_record = _maybe_convert_legacy_office(
         file_path, config, output_dir,
     )
 
@@ -2063,11 +2082,11 @@ def process_single_file(
 
     # Lineage record — provenance order is the order things ran:
     #   format_convert (Phase 0.5) → pre_parse hook (Phase 1.0) → parser.
-    # xls_convert_record is prepended so the lineage trail starts at the
-    # user's original .xls input, then shows the conversion, then the
-    # rest of the pipeline operating on the converted .xlsx.
-    if xls_convert_record is not None:
-        parse_result.transformations.insert(0, xls_convert_record)
+    # legacy_convert_record is prepended so the lineage trail starts at the
+    # user's original legacy input, then shows the conversion, then the
+    # rest of the pipeline operating on the converted modern file.
+    if legacy_convert_record is not None:
+        parse_result.transformations.insert(0, legacy_convert_record)
     if pre_parse_hook_name:
         parse_result.transformations.append({
             "step": "hook",
@@ -2083,12 +2102,12 @@ def process_single_file(
         "format": result.format,
     })
 
-    # Phase 0.5 aftermath: when a .xls was auto-converted upstream, the parser
-    # saw the cached file (stem = sha256). Restore the user's original stem
-    # so derived metadata (frontmatter title, derive_aliases_hook output)
+    # Phase 0.5 aftermath: when a legacy file was auto-converted upstream, the
+    # parser saw the cached file (stem = sha256). Restore the user's original
+    # stem so derived metadata (frontmatter title, derive_aliases_hook output)
     # reflects the input file. Done BEFORE Phase 1.6 pre_write hooks so
     # derive_aliases_hook reads the corrected title and produces clean aliases.
-    if xls_convert_record is not None:
+    if legacy_convert_record is not None:
         parse_result.metadata["title"] = Path(result.original_file).stem
 
     # --- Phase 1.1: Garbled text detection + pymupdf fallback ---

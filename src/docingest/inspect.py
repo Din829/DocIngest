@@ -40,6 +40,32 @@ logger = logging.getLogger(__name__)
 # dimension" — the safety layer treats absent metrics as "don't check".
 
 
+# Pre-2007 binary Office formats can't be read by python-docx / python-pptx /
+# openpyxl (those only accept OOXML). They are NOT broken: the pipeline's Phase
+# 0.5 auto-converts them to OOXML via LibreOffice at run time. inspect runs
+# BEFORE that conversion, so instead of letting the library raise a misleading
+# "Package not found" error (which makes a perfectly processable file look
+# unsupported), we short-circuit with a friendly note. Maps legacy suffix →
+# the modern format it converts to.
+_LEGACY_OFFICE_TARGET: dict[str, str] = {".doc": "docx", ".ppt": "pptx", ".xls": "xlsx"}
+
+
+def _legacy_office_note(file_path: Path) -> dict[str, Any] | None:
+    """Return a friendly pre-flight dict for a legacy binary Office file, or
+    None when the file isn't one (caller proceeds with normal introspection)."""
+    target = _LEGACY_OFFICE_TARGET.get(file_path.suffix.lower())
+    if target is None:
+        return None
+    return {
+        "pages": None,  # unknown until LibreOffice converts it at run time
+        "note": (
+            f"legacy binary {file_path.suffix.lower()} — will auto-convert to "
+            f".{target} via LibreOffice during `docingest run` "
+            f"(page/char counts unavailable until then)"
+        ),
+    }
+
+
 def _pick_sample_indices(total: int, n: int) -> list[int]:
     """
     Pick up to n representative page indices for sampling.
@@ -96,8 +122,12 @@ def _inspect_pdf(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _inspect_pptx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    """PPTX: slide count + aggregated text from every shape.text_frame."""
+    """PPTX: slide count + aggregated text from every shape.text_frame.
+    Legacy .ppt short-circuits to a friendly note (python-pptx can't read it)."""
     _ = config  # sampling not applicable — slide counts are small
+    legacy = _legacy_office_note(file_path)
+    if legacy is not None:
+        return legacy
     try:
         from pptx import Presentation
         prs = Presentation(str(file_path))
@@ -118,8 +148,12 @@ def _inspect_pptx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
 
 def _inspect_xlsx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     """XLSX: sheet count + total row count (char estimation skipped —
-    total_rows is the stronger processing-cost signal for spreadsheets)."""
+    total_rows is the stronger processing-cost signal for spreadsheets).
+    Legacy .xls short-circuits to a friendly note (openpyxl can't read it)."""
     _ = config
+    legacy = _legacy_office_note(file_path)
+    if legacy is not None:
+        return legacy
     try:
         from openpyxl import load_workbook
         wb = load_workbook(str(file_path), read_only=True, data_only=True)
@@ -136,8 +170,12 @@ def _inspect_xlsx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _inspect_docx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    """DOCX: approximate page count + character count from paragraphs."""
+    """DOCX: approximate page count + character count from paragraphs.
+    Legacy .doc short-circuits to a friendly note (python-docx can't read it)."""
     _ = config
+    legacy = _legacy_office_note(file_path)
+    if legacy is not None:
+        return legacy
     try:
         from docx import Document
         doc = Document(str(file_path))
@@ -301,7 +339,11 @@ def _recommend(info: dict[str, Any], config: dict[str, Any]) -> str:
         warnings.append(f"Inspection error: {info['error']}")
 
     if not warnings:
-        return "Ready"
+        # An informational note (e.g. legacy-format auto-convert) is surfaced
+        # as the recommendation when there are no real warnings — it tells the
+        # caller the file IS processable, just not introspectable pre-convert.
+        note = info.get("note")
+        return f"Ready ({note})" if note else "Ready"
     return "; ".join(warnings)
 
 

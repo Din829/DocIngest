@@ -255,23 +255,28 @@ cloud LLMs, persistent caches, non-root users — is the integrator's job.
 This section captures the patterns that work and the traps that don't,
 without prescribing one Dockerfile to rule them all.
 
-### Image size — decide what you actually need
+### Image size — torch is the only thing that matters
 
-docling >=2.95 keeps `torch` (and its CUDA wheels) in the `[models-local]`
-extras. That means **what you install controls how big the image gets**:
+DocIngest depends on the standard `docling` meta-package, which **pulls `torch`
+transitively** (its `DocumentConverter` imports torch at module load — this is
+NOT confined to a `[models-local]` extra). On Linux the default PyPI wheel is
+the ~5.6GB **CUDA** build, of which DocIngest uses none (CPU inference only).
+So the whole image-size question reduces to *which torch wheel you let in*:
 
-| You want | Install | Approx. extra size |
+| How you install | torch wheel | Approx. size |
 |---|---|---|
-| Vision API does all the OCR/layout (no local fallback) | `pip install docingest` | ~50–80 MB docling base |
-| Local layout/OCR as fallback when Vision is off / fails | `pip install docingest && pip install torch --extra-index-url https://download.pytorch.org/whl/cpu` | ~200 MB CPU torch |
-| GPU-accelerated local inference | `pip install docingest[models-local]` (default CUDA wheels) | ~5–6 GB (only if you actually have a GPU) |
+| **CPU torch first, then DocIngest** (the scripts / Dockerfile.example do this) | CPU-only | ~200 MB torch |
+| Plain `pip install -e .` on **Linux** (no CPU-torch step) | CUDA (default PyPI) | ~5–6 GB — wasted, DocIngest never uses the GPU |
+| Plain `pip install -e .` on **Windows / macOS** | CPU (PyPI default there) | ~200 MB torch |
 
-Most cloud-LLM deployments fall in row 1 — Vision handles everything,
-local models are dead weight. Row 2 is the safe middle for offline /
-restricted-egress environments. Row 3 only earns its keep with a GPU
-attached.
+The lesson: **always install the CPU torch wheel before DocIngest** (or use
+`scripts/install_python_deps.{sh,ps1}` / `Dockerfile.example`, which do it for
+you). A Linux box that skips that step silently grows the image by ~5GB of
+unused GPU libraries. Run `python scripts/verify_deps.py` after install — it
+fails the build and prints the one-line fix if a CUDA torch slipped in.
 
-A typical slim Dockerfile pattern (illustrative, adapt as needed):
+A typical slim Dockerfile pattern (illustrative — `Dockerfile.example` at the
+repo root is the maintained version):
 
 ```dockerfile
 FROM python:3.11-slim
@@ -281,9 +286,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice ffmpeg exiftool \
     && rm -rf /var/lib/apt/lists/*
 
-# CPU-only torch (skip entirely for Vision-only deployments)
-RUN pip install --no-cache-dir torch \
-    --extra-index-url https://download.pytorch.org/whl/cpu
+# CPU-only torch FIRST — use --index-url (NOT --extra-index-url) so the CUDA
+# wheel from PyPI can't sneak in. docling reuses this CPU torch instead of
+# dragging the ~5.6GB CUDA build.
+RUN pip install --no-cache-dir torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
 
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir -e .
