@@ -15,7 +15,7 @@
 - **RAG**：`chunks.jsonl` 做向量检索
 - **Agentic Search**：`sources/*.md` 做 grep / glob
 
-核心思想：**Markdown 作为唯一中间格式**。不自己搞检索，不管 embedding，不做 UI。
+核心思想：**Markdown 作为唯一中间格式**。不自己搞检索，不管 embedding。核心引擎本身不含 UI 逻辑——可选的桌面 GUI（`docingest.gui`，pywebview）是独立的工具壳，通过三层解耦直调 `api.py`，核心零感知（见 [GUI_DESIGN.md](GUI_DESIGN.md)）。
 
 ### 1.2 核心设计原则
 
@@ -37,7 +37,6 @@
 | Late Chunking / 多粒度索引 | 依赖 embedding 模型，下游职责 |
 | Web 爬虫 | 只处理本地文件 + 明确的 URL |
 | 实时监控 | 批处理工具 |
-| GUI | CLI + MCP server 够了 |
 
 **`docingest.graph` 子包的边界规则**（重要）：
 
@@ -175,19 +174,24 @@ DocIngest/
 │  ├─ integrations/                  可选下游框架适配（独立 import，不进主 pipeline）
 │  │  ├─ __init__.py                 包标记（不 import 任何子模块，避免拉可选依赖）
 │  │  └─ langchain.py                chunks.jsonl → LangChain Document（DocIngestLoader，opt-in）
-│  └─ graph/                         可选 GraphRAG 子模块（独立 import，不进主 pipeline）
-│     ├─ __init__.py                 public API: build / query / status / enrich_chunks / EmbeddingProvider / GraphBackend
-│     ├─ api.py                      facade：build / query / status / enrich_chunks + Result dataclass + 配置合并
-│     ├─ providers.py                EmbeddingProvider 基类 + OpenAI / Gemini / SentenceTransformer
-│     ├─ enricher.py                 chunks.jsonl + graph 实体 → chunks_enriched.jsonl（纯文件回放，无 LLM）
-│     ├─ cache.py                    chunk 级抽取缓存（chunk_id → content_hash + llm_config_hash）
-│     ├─ cli.py                      typer 子命令组：graph build / query / enrich / status（被主 cli.py 条件挂载）
-│     ├─ adapters/
-│     │  ├─ chunks_loader.py         chunks.jsonl → LoadedChunk（filter + path_injection 协调）
-│     │  └─ llm_adapter.py           sync text_completion → async LightRAG llm_model_func
-│     └─ backends/
-│        ├─ base.py                  GraphBackend ABC + BuildOutcome / QueryOutcome / StatusOutcome
-│        └─ lightrag_backend.py      LightRAG 实现 + force scrub + auto language resolver
+│  ├─ graph/                         可选 GraphRAG 子模块（独立 import，不进主 pipeline）
+│  │  ├─ __init__.py                 public API: build / query / status / enrich_chunks / EmbeddingProvider / GraphBackend
+│  │  ├─ api.py                      facade：build / query / status / enrich_chunks + Result dataclass + 配置合并
+│  │  ├─ providers.py                EmbeddingProvider 基类 + OpenAI / Gemini / SentenceTransformer
+│  │  ├─ enricher.py                 chunks.jsonl + graph 实体 → chunks_enriched.jsonl（纯文件回放，无 LLM）
+│  │  ├─ cache.py                    chunk 级抽取缓存（chunk_id → content_hash + llm_config_hash）
+│  │  ├─ cli.py                      typer 子命令组：graph build / query / enrich / status（被主 cli.py 条件挂载）
+│  │  ├─ adapters/
+│  │  │  ├─ chunks_loader.py         chunks.jsonl → LoadedChunk（filter + path_injection 协调）
+│  │  │  └─ llm_adapter.py           sync text_completion → async LightRAG llm_model_func
+│  │  └─ backends/
+│  │     ├─ base.py                  GraphBackend ABC + BuildOutcome / QueryOutcome / StatusOutcome
+│  │     └─ lightrag_backend.py      LightRAG 实现 + force scrub + auto language resolver
+│  └─ gui/                           可选桌面 GUI（pywebview + 手写前端，独立工具壳，三层解耦直调 api.py）
+│     ├─ gui_app.py                  ① 界面层：pywebview 窗口 + 加载手写前端 + 拖拽（唯一认识 pywebview 的文件）
+│     ├─ gui_api.py                  js_api 桥：JS↔Python，长任务后台线程 + evaluate_js 推进度
+│     ├─ gui_logic.py                ② 适配层：界面输入 → api.py 调用，结果整理成易显示 dict（不含框架类型）
+│     └─ web/                        手写前端：index.html + app.js + styles/*.css（9 屏，每页带返回）
 └─ tests/
 ```
 
