@@ -1206,18 +1206,24 @@ def _should_skip_vision(
     return True
 
 
+# Shared CJK character class for the two OCR-garble triage checks below. Covers
+# Han + Hiragana + Katakana + Hangul, matching the languages the language-script
+# check (parsing.vision.triage.language_script_check) already supports (ja/zh/
+# ko). Defined once so both checks stay in sync \u2014 adding a script here updates
+# both. (English is Latin and never produces CJK-truncation garble, so it needs
+# no entry.)
+_CJK_CLASS = r"\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af"
+
 # Pre-compiled: a CJK char immediately followed by the &lt; HTML entity \u2014 the
 # signature of OCR garble that truncated a CJK char into an entity (\u78ba\u8a8d \u2192 \u78ba&lt;).
-# Deliberately NOT matching a closing &gt; or a leading entity: Japanese headings
-# legitimately read `## &lt;\u2026&gt;` (entity precedes the CJK), so those must skip.
-_CJK_ENTITY_GARBLE_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]&lt;")
+# Deliberately NOT matching a closing &gt; or a leading entity: CJK headings
+# legitimately read `## &lt;\u2026&gt;` (entity precedes the CJK, closing &gt; follows a
+# CJK char), so matching those directions would misfire on valid titles.
+_CJK_ENTITY_GARBLE_RE = re.compile(rf"[{_CJK_CLASS}]&lt;")
 
-# Pre-compiled pattern for mixed-script detection (module-level, compiled once)
-_MIXED_SCRIPT_RE = re.compile(
-    r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]"   # CJK / Hiragana / Katakana
-    r"[A-Za-z]{1,3}"                                 # short ASCII fragment
-    r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]"     # CJK / Hiragana / Katakana
-)
+# Pre-compiled pattern for mixed-script detection (module-level, compiled once):
+# a short ASCII fragment sandwiched between two CJK chars (OCR mismap garble).
+_MIXED_SCRIPT_RE = re.compile(rf"[{_CJK_CLASS}][A-Za-z]{{1,3}}[{_CJK_CLASS}]")
 
 
 def _has_mixed_script_anomaly(text: str, triage_cfg: dict[str, Any]) -> bool:
