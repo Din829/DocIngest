@@ -622,6 +622,21 @@ function pagesForFile(name) {
   return row && row.pages != null ? row.pages : null;
 }
 
+// Video files take a single long Gemini call (upload + whole-video analysis,
+// tens of seconds, no mid-call progress), so their "active" row would sit on
+// "処理中…" silently and read as frozen. We surface an honest "this takes a
+// while" note instead — the standard UX for an indeterminate 10s+ wait.
+// Prefer the inspect format; fall back to the filename extension when the user
+// skipped the pre-flight check (inspectRows empty).
+const VIDEO_EXTS = ["mp4", "mov", "mkv", "webm", "avi", "wmv", "flv", "ts", "m4v"];
+function isVideoFile(name) {
+  const row = state.inspectRows.find((r) => r.name === name);
+  const fmt = row && row.format
+    ? String(row.format).toLowerCase()
+    : (name.split(".").pop() || "").toLowerCase();
+  return VIDEO_EXTS.includes(fmt);
+}
+
 function procRowInfo(stateName, ev, fileName) {
   switch (stateName) {
     case "done": {
@@ -630,9 +645,20 @@ function procRowInfo(stateName, ev, fileName) {
       return `${pages}${ev ? ev.chunks || 0 : 0} chunks`;
     }
     case "cached": return "キャッシュ再利用";
-    case "failed": return "解析に失敗";
+    case "failed":
+      // Distinguish a password-protected file from a generic parse failure so
+      // the user knows to unlock it rather than wondering why it "broke".
+      // error_type comes through on the file_done event (see __onIngestProgress).
+      return ev && ev.error_type === "encrypted"
+        ? "🔒 パスワード保護（解除が必要）"
+        : "解析に失敗";
     case "skipped": return "スキップ";
-    case "active": return "処理中…";
+    case "active":
+      // Video: one long indeterminate Gemini call — tell the user it's slow
+      // so the unmoving row doesn't read as a freeze.
+      return isVideoFile(fileName)
+        ? "AI が動画を解析中…（数十秒かかる場合があります）"
+        : "処理中…";
     default: return "待機中";
   }
 }

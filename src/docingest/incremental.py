@@ -165,10 +165,8 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.doc.auto_convert_to_docx",    # same for legacy .doc → .docx
     "parsing.ppt.auto_convert_to_pptx",    # same for legacy .ppt → .pptx
     "output.markdown.include_metadata_header",
-    "output.dedup.enabled",                # Vision/Docling dedup toggle —
-                                           # disabling it keeps both versions in sources/*.md
-    "output.dedup.vision_ratio_threshold", # dedup threshold — alters sources/*.md content
-    "output.dedup.vision_min_chars",       # absolute Vision floor — affects when dedup fires
+    "output.vision_keep",                  # which Docling/Vision half to keep —
+                                           # changing it rewrites sources/*.md content
     "sanitize.enabled",                    # PII sanitize hook master toggle —
                                            # flipping it rewrites markdown before write
     "sanitize.rules",                      # custom PII rule set — changes

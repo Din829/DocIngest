@@ -48,6 +48,17 @@ import logging
 _pipeline_logger = logging.getLogger(__name__)
 
 
+def _detect_encrypted_reason(file_path) -> str | None:
+    """Thin wrapper around utils.encryption.detect_encrypted — lazy-imported so
+    the util loads only when a parse has failed, and fully isolated so a buggy
+    detector can never escalate one failed file into a crashed run."""
+    try:
+        from .utils.encryption import detect_encrypted
+        return detect_encrypted(file_path)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Pipeline result types
 # ---------------------------------------------------------------------------
@@ -68,6 +79,9 @@ class FileResult:
     #   "timeout"        wall-clock cap exceeded (parse / vision)
     #   "parse_error"    parser raised or returned success=False
     #   "io_error"       FileNotFoundError / PermissionError / OSError
+    #   "encrypted"      parse failed AND the file is password-protected
+    #                    (PDF: definite; OOXML: encrypted-or-corrupt). The
+    #                    `error` message is a human-readable, actionable hint.
     # Reserved for future use (consumers may match defensively, but the
     # pipeline does not emit these today):
     #   "chunk_error"    reserved — chunker failures currently surface as parse_error
@@ -1716,85 +1730,86 @@ def _enrich_with_vision(
 # Docling + Vision deduplication
 # ---------------------------------------------------------------------------
 
-def _dedup_vision(markdown: str, config: dict[str, Any]) -> str:
+# Matches every vision-enriched marker variant: plain `<!-- vision-enriched -->`,
+# `... page=N`, `... page=N (overflow)`, and `... batched batch=X/Y pages=A-B`.
+_VISION_MARK_RE = re.compile(r"<!-- vision-enriched[^>]*-->")
+
+
+def _apply_vision_keep(markdown: str, config: dict[str, Any], doc_format: str | None) -> str:
     """
-    Remove Docling-Vision content overlap in a markdown string.
+    De-duplicate Docling↔Vision overlap by KEEPING ONE HALF — chosen by config,
+    split on the `<!-- vision-enriched ... -->` marker (never by length-ratio
+    guessing, which silently overwrote the wrong side in the old dedup).
 
-    DEFAULT OFF — keep both Docling and Vision views (no content loss).
-    The "Vision is a superset of Docling" assumption only holds reliably
-    for single-page-per-section formats (text PDF, PPTX); for xlsx / docx
-    a length-ratio check cannot tell whether the two views describe the
-    same content, and the wrong side may silently overwrite the right side.
+    output.vision_keep:
+      both    → return markdown unchanged (DEFAULT, zero content loss)
+      vision  → drop the Docling half (before the marker), keep the marker + Vision
+      docling → drop the marker + Vision half, keep the Docling half
 
-    When enabled (`output.dedup.enabled: true`) and a pagebreak section
-    contains both a Docling block and a <!-- vision-enriched --> block:
-      - Vision len >= threshold × Docling len AND Vision len >= min_chars
-        → drop Docling, keep only Vision
-      - Otherwise → keep BOTH (safe path)
+    SAFETY — page-aligned, full-mode formats only:
+      - Supplement-mode formats (xlsx): Vision only supplements visuals; the
+        table body lives in the Docling/openpyxl half. Dropping Docling would
+        delete the table body → we force `both` for these formats.
+      - Mode B flow formats (docx / doc / html / md / txt): rendered via
+        LibreOffice with no native pagination, so Vision is appended at the
+        document end and does NOT align with the Docling text — the two halves
+        are different content, not a superset pair → force `both`. Note we key
+        this off the FORMAT, not "markdown has no pagebreak marker": a single-
+        page PDF also has no pagebreak yet IS a clean Docling/Vision superset
+        pair, so it must still be de-duped.
 
-    Sections WITHOUT vision-enriched stay untouched regardless of setting.
-    Knobs: output.dedup.enabled / vision_ratio_threshold / vision_min_chars.
+    Frontmatter (a leading `---\\n...\\n---` block) is always preserved.
+    Sections without a vision marker are returned untouched.
     """
-    if not get_nested(config, "output.dedup.enabled", False):
+    keep = str(get_nested(config, "output.vision_keep", "both")).lower()
+    if keep == "both" or keep not in ("vision", "docling"):
         return markdown
 
-    threshold = float(get_nested(
-        config, "output.dedup.vision_ratio_threshold", 0.7
-    ))
-    min_chars = int(get_nested(
-        config, "output.dedup.vision_min_chars", 200
-    ))
-
     pagebreak = PAGEBREAK_MARKER
-    sections = markdown.split(pagebreak)
 
-    deduped_sections = []
-    for section in sections:
-        if "<!-- vision-enriched -->" in section:
-            parts = section.split("<!-- vision-enriched -->", 1)
-            pre_vision = parts[0].strip()
-            vision_content = parts[1].strip()
+    # Guard 1: supplement-mode formats — Vision is additive, Docling holds the
+    # body. Dropping Docling there is data loss, so leave both halves intact.
+    from .parsers.vision import resolve_supplement_only
+    if resolve_supplement_only(config, doc_format):
+        return markdown
 
-            # Strip frontmatter from length calculation
-            docling_text = pre_vision
-            if pre_vision.startswith("---\n") and "\n---" in pre_vision[4:]:
-                frontmatter_end = pre_vision.index("\n---", 4) + 4
-                frontmatter = pre_vision[:frontmatter_end]
-                docling_text = pre_vision[frontmatter_end:].strip()
-            else:
-                frontmatter = None
+    # Guard 2: Mode B flow formats — Vision appended at the end, not aligned to
+    # Docling text. Keyed off format (not pagebreak presence): a single-page PDF
+    # also lacks a pagebreak but IS a page-aligned superset pair, so de-dup it.
+    _MODE_B_FORMATS = {"docx", "doc", "html", "htm", "md", "markdown", "txt"}
+    if (doc_format or "").lower() in _MODE_B_FORMATS:
+        return markdown
 
-            # Safety check: only dedup if Vision captured enough content.
-            # Two independent gates — both must pass to drop Docling:
-            #   1. ratio: Vision is ≥ threshold × Docling length
-            #   2. absolute floor: Vision is ≥ min_chars
-            # Gate 2 catches the failure mode where a sparse page yields a
-            # tiny Vision blob that proportionally matches a denoised Docling
-            # block, silently wiping real content. Empty Docling sections
-            # remain safe to replace (they have nothing to lose).
-            docling_len = len(docling_text)
-            vision_len = len(vision_content)
-            vision_sufficient = (
-                docling_len == 0
-                or (
-                    vision_len >= docling_len * threshold
-                    and vision_len >= min_chars
-                )
-            )
+    out: list[str] = []
+    for section in markdown.split(pagebreak):
+        m = _VISION_MARK_RE.search(section)
+        if not m:
+            out.append(section)
+            continue
 
-            if vision_sufficient:
-                # Vision is complete — keep only Vision version
-                if frontmatter:
-                    deduped_sections.append(frontmatter + "\n\n" + vision_content)
-                else:
-                    deduped_sections.append(vision_content)
-            else:
-                # Vision missed content — keep both to avoid info loss
-                deduped_sections.append(section)
-        else:
-            deduped_sections.append(section)
+        # Preserve a leading frontmatter block (only possible in the first
+        # section) regardless of which half we drop.
+        frontmatter = ""
+        body = section
+        if section.startswith("---\n") and "\n---" in section[4:]:
+            fm_end = section.index("\n---", 4) + 4
+            frontmatter = section[:fm_end]
+            body = section[fm_end:]
+            m = _VISION_MARK_RE.search(body)
+            if not m:
+                out.append(section)
+                continue
 
-    return pagebreak.join(deduped_sections)
+        if keep == "vision":
+            # Keep the marker + everything after it (Vision); drop Docling before.
+            kept = body[m.start():]
+            out.append(frontmatter + "\n\n" + kept if frontmatter else kept)
+        else:  # keep == "docling"
+            # Keep everything before the marker (Docling); drop marker + Vision.
+            kept = body[:m.start()].rstrip()
+            out.append(frontmatter + kept if frontmatter else kept)
+
+    return pagebreak.join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -2059,23 +2074,31 @@ def process_single_file(
         return result, []
     except Exception as e:
         result.success = False
-        result.error = f"Parse failed: {e}"
-        result.error_type = "parse_error"
+        # A parse can fail because the file is password-protected; surface that
+        # as a clear, actionable reason instead of the raw parser error. Checked
+        # only here on the failure path, so successful files pay nothing.
+        enc_reason = _detect_encrypted_reason(file_path)
+        if enc_reason:
+            result.error = enc_reason
+            result.error_type = "encrypted"
+        else:
+            result.error = f"Parse failed: {e}"
+            result.error_type = "parse_error"
         return result, []
     result.parse_time_ms = int((time.monotonic() - t0) * 1000)
 
     if not parse_result.success:
-        # Check error handling config
-        on_failure = get_nested(config, "error_handling.on_parse_failure", "skip")
-        if on_failure == "fail":
-            result.success = False
+        # Check error handling config. Either way the file is marked failed;
+        # the only difference is whether we stop the run (fail) or keep going
+        # (skip). The error message/type are resolved the same way for both.
+        result.success = False
+        enc_reason = _detect_encrypted_reason(file_path)
+        if enc_reason:
+            result.error = enc_reason
+            result.error_type = "encrypted"
+        else:
             result.error = parse_result.error
             result.error_type = "parse_error"
-            return result, []
-        # "skip" — mark as failed but continue pipeline for other files
-        result.success = False
-        result.error = parse_result.error
-        result.error_type = "parse_error"
         return result, []
 
     result.format = parse_result.metadata.get("format", "unknown")
@@ -2176,11 +2199,14 @@ def process_single_file(
     # Vision results are already settled before frontmatter is built.
     run_post_parse_hooks(file_path, parse_result, config, phase="pre_write")
 
-    # --- Phase 1.7: Docling + Vision dedup ---
-    # When Vision enrichment produced a version of each page, deduplicate
-    # so sources/*.md and chunks.jsonl both get clean, non-redundant content.
-    # Controlled by output.dedup.enabled (default: true).
-    parse_result.markdown = _dedup_vision(parse_result.markdown, config)
+    # --- Phase 1.7: Docling + Vision dedup (keep one half) ---
+    # When Vision enrichment produced a whole-page view alongside Docling's,
+    # output.vision_keep selects which half to keep (default: both = no-op).
+    # Splits on the vision-enriched marker; auto-skips supplement-mode (xlsx)
+    # and Mode B (docx) where the two halves are not a superset pair.
+    parse_result.markdown = _apply_vision_keep(
+        parse_result.markdown, config, parse_result.metadata.get("format")
+    )
 
     # --- Phase 2: Write Markdown + assets ---
     # original_file determines the sources/*.md filename — must be the

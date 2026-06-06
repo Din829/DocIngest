@@ -325,6 +325,16 @@
 .p-row.is-failed  .pr-icon { color: var(--danger); }
 .p-row.is-waiting .pr-icon,
 .p-row.is-skipped .pr-icon { color: var(--ink-3); }
+/* Active row's loader icon spins so a long, progress-less step (notably native
+   video: one tens-of-seconds Gemini call with no mid-call events) reads as
+   "working", not "frozen". Pure transform rotation — no reflow, 60fps-safe. */
+@keyframes pr-spin { to { transform: rotate(360deg); } }
+.p-row.is-active  .pr-icon { animation: pr-spin 1s linear infinite; }
+/* Honor reduced-motion: drop the spin, keep the accent color so the active
+   row stays visually distinct. */
+@media (prefers-reduced-motion: reduce) {
+  .p-row.is-active .pr-icon { animation: none; }
+}
 .p-row.is-done    .pr-info { color: var(--ink-3); }
 .p-row.is-cached  .pr-info { color: var(--ink-3); }
 .p-row.is-active  .pr-info { color: var(--accent); }

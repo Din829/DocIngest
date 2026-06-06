@@ -209,6 +209,14 @@ class DoclingParser(BaseParser):
             self.config, "parsing.pdf.table_extraction", True
         )
 
+        # Cell-matching strategy (default True = Docling's default). Set False
+        # to read cell text from the model-predicted grid by coordinates, which
+        # recovers vertically-merged columns the default drops — at the risk of
+        # smearing densely horizontally-merged tables. See config comment.
+        pipeline_options.table_structure_options.do_cell_matching = get_nested(
+            self.config, "parsing.pdf.table_cell_matching", True
+        )
+
         # Image extraction (generate images for Vision processing later)
         pipeline_options.generate_picture_images = get_nested(
             self.config, "parsing.pdf.image_extraction", True

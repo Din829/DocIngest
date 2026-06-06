@@ -288,6 +288,18 @@ parsing:
   # PDF-specific
   pdf:
     table_extraction: true
+    # How Docling assigns text to recognised table cells.
+    #   true  (default): map structure back to the PDF's own text cells —
+    #                    best for clean, regular tables.
+    #   false:           read text from the model-predicted cell grid by
+    #                    coordinates. Recovers VERTICALLY-merged columns that
+    #                    `true` silently drops (e.g. a category column whose
+    #                    value spans many rows), BUT can duplicate/smear text on
+    #                    densely HORIZONTALLY-merged tables. Not a blanket
+    #                    accuracy win — flip per project only when the default
+    #                    drops a column. Measured: rescues vertical-merge specs
+    #                    / nutrition tables; degrades nested invoice tables.
+    table_cell_matching: true
     image_extraction: true
     max_pages: null           # null = no limit
     hidden_text_detection:
@@ -635,37 +647,35 @@ output:
   index_file: "index.json"
   include_bounding_boxes: true  # Extract per-element coordinates from Docling
 
-  # Docling+Vision dedup — DEFAULT OFF.
+  # Docling+Vision dedup — choose which view to keep when a page has both.
   #
-  # When Vision enrichment runs on a page, the pipeline produces two views of
-  # that page: Docling's text/table extraction AND Vision's image-based
-  # description. Old default behaviour was "if Vision looks long enough, keep
-  # only Vision and drop Docling" — that assumes Vision is a faithful superset
-  # of Docling. In practice that assumption only holds reliably for single-
-  # page-per-section formats (text PDF, PPTX). For xlsx / docx / mixed
-  # workloads the two views describe different things (e.g. Docling sees
-  # sheet body text, Vision sees the rendered page area) and a length-ratio
-  # check cannot tell whether real content overlaps. The wrong side then
-  # silently overwrites the right side and there is no warning.
+  # When Vision enrichment runs on a page in FULL mode (PDF / PPT), the pipeline
+  # produces two views of that page in the markdown: Docling's text/table
+  # extraction, then a `<!-- vision-enriched ... -->` marker, then Vision's
+  # whole-page transcription. For clean text/contract pages Vision is the better,
+  # more complete view (it recovers handwritten signatures, filled-in blanks,
+  # structured fields Docling misses) — so the Docling half is redundant.
   #
-  # Default keeps BOTH views — markdown is slightly larger but no content is
-  # ever lost. Downstream consumers (RAG / Agentic Search / grep) match on
-  # whichever channel happens to have the answer, raising recall without
-  # changing the API shape. Re-enable only when you have evidence that on
-  # YOUR corpus Vision is a faithful superset of Docling (e.g. clean text
-  # PDFs) and you want to shrink the markdown.
-  dedup:
-    enabled: false              # false = keep both (default, safe)
-                                # true  = drop Docling when Vision passes the
-                                #         ratio + absolute-floor gates below
-    vision_ratio_threshold: 0.7 # Only consulted when enabled=true.
-                                # Vision len >= this × Docling len → may drop Docling.
-    vision_min_chars: 200       # Only consulted when enabled=true.
-                                # Absolute floor: Vision must also be >= this many
-                                # chars before dropping Docling. Guards the failure
-                                # mode where a tiny Vision blob proportionally
-                                # matches a denoised Docling block and wipes real
-                                # content. Set to 0 to rely on ratio alone.
+  # vision_keep selects which half to keep, by SPLITTING ON THE MARKER (never by
+  # length-ratio guessing — the old approach silently overwrote the wrong side):
+  #   both    = keep both halves (DEFAULT, zero content loss, = legacy behaviour)
+  #   vision  = drop the Docling half, keep Vision (de-dups full-mode pages;
+  #             Vision is usually the superset for text PDF/PPT)
+  #   docling = drop the Vision half, keep Docling
+  #
+  # SAFETY — only applied to FULL-mode, pagebreak-aligned sections:
+  #   - xlsx (supplement mode): Vision only ADDS visuals; the table body lives in
+  #     the Docling/openpyxl half. Dropping Docling there would delete the table
+  #     body. → vision_keep is IGNORED for supplement-mode formats (stays both).
+  #   - docx (Mode B, no pagebreaks): Vision is appended at the document end and
+  #     does NOT align page-by-page with the Docling text — the two halves are
+  #     different content, not a superset pair. → IGNORED (stays both).
+  # So `vision: vision` safely de-dups PDF/PPT while auto-protecting xlsx/docx.
+  vision_keep: vision           # both | vision | docling
+                                # DEFAULT = vision: on a full-mode page (PDF/PPT)
+                                # keep only the Vision half (the superset view);
+                                # drop the redundant Docling half. xlsx/docx are
+                                # auto-protected (kept as both) by the guards above.
 
   markdown:
     include_metadata_header: true  # YAML frontmatter in each file

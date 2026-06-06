@@ -69,6 +69,13 @@ dependencies = [
                               # `pymupdf embed-extract` CLI). We use the library
                               # API only so impact is nil — but pin must not
                               # allow vulnerable versions.
+    "olefile>=0.47",          # Detect password-encrypted MS Office files (any
+                              # era) via the OLE EncryptedPackage stream, so a
+                              # parse failure on a locked file reports a clear
+                              # "password-protected" reason instead of a cryptic
+                              # error. Tiny (pure-Python, no transitive deps).
+                              # Often already present transitively, but declared
+                              # here so the detection works on every install.
     "requests>=2.33",         # URL resolution (yt-dlp info download).
                               # >=2.33 closes CVE-2026-25645 (predictable temp
                               # path in extract_zipped_paths).
