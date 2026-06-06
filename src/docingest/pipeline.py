@@ -1122,13 +1122,14 @@ def _should_skip_vision(
 
     Checks (all must pass to skip):
       1. No image markers in Docling output (no charts/diagrams to describe)
-      2. No structured data injection (no chart hook data needing visual context)
-      3. Sufficient text extracted (not a scanned/image-only page)
-      4. No garbled text (Docling didn't fail on this page)
-      5. Low replacement character ratio (no CID font issues)
-      6. No complex tables (simple tables are fine, complex ones need Vision)
-      7. No mixed-script anomaly (CJK mismap garbling from OCR)
-      8. Text scripts match the document's declared language (catches CMap
+      2. No picture elements (Docling figures / fitz-detected embedded images)
+      3. No structured data injection (no chart hook data needing visual context)
+      4. Sufficient text extracted (not a scanned/image-only page)
+      5. No garbled text (glyph< CID failure, or CJK-adjacent &lt; entity garble)
+      6. Low replacement character ratio (no CID font issues)
+      7. No complex tables (simple tables are fine, complex ones need Vision)
+      8. No mixed-script anomaly (CJK mismap garbling from OCR)
+      9. Text scripts match the document's declared language (catches CMap
          failures that produce "clean" but wrong Unicode — e.g. Bengali /
          Thai / Tibetan characters in a document declared as Japanese).
     """
@@ -1158,12 +1159,18 @@ def _should_skip_vision(
 
     # Garbled text → Docling failed, Vision can re-OCR
     # glyph< = CID font mapping failure
-    # &lt; / &gt; in running text = HTML entity artifacts from OCR garbling
-    #   (e.g. 確&lt; from a garbled 確認). Legitimate HTML entities appear
-    #   inside code blocks or tags, not in running Japanese/Chinese text.
     if "glyph<" in text or "glyph&lt;" in text:
         return False
-    if "&lt;" in stripped or "&gt;" in stripped:
+    # CJK-adjacent &lt; entity = OCR garble where a CJK char was truncated into
+    # an HTML entity (e.g. 確認 → 確&lt;). We match ONLY a CJK char immediately
+    # followed by &lt; — NOT a bare &lt;/&gt; anywhere — because legitimate
+    # Japanese headings wrap titles in <…> which Docling escapes to
+    # `## &lt;入居中の各種連絡先&gt;` (entity BEFORE the CJK, plus a closing
+    # &gt;), and English/code prose uses &lt; legitimately (`vector&lt;int&gt;`).
+    # Measured on real corpus: 8/8 garble pages caught, 2/2 heading pages
+    # skipped, code/HTML prose not flagged. Toggle via
+    # parsing.vision.triage.entity_garble_check.
+    if triage_cfg.get("entity_garble_check", True) and _CJK_ENTITY_GARBLE_RE.search(stripped):
         return False
 
     # High U+FFFD ratio → CID font extraction failure
@@ -1198,6 +1205,12 @@ def _should_skip_vision(
     # All checks passed → pure text page, safe to skip
     return True
 
+
+# Pre-compiled: a CJK char immediately followed by the &lt; HTML entity \u2014 the
+# signature of OCR garble that truncated a CJK char into an entity (\u78ba\u8a8d \u2192 \u78ba&lt;).
+# Deliberately NOT matching a closing &gt; or a leading entity: Japanese headings
+# legitimately read `## &lt;\u2026&gt;` (entity precedes the CJK), so those must skip.
+_CJK_ENTITY_GARBLE_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]&lt;")
 
 # Pre-compiled pattern for mixed-script detection (module-level, compiled once)
 _MIXED_SCRIPT_RE = re.compile(

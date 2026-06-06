@@ -203,6 +203,13 @@ parsing:
                                 # false = all pages sent to Vision (maximum quality, higher cost)
       min_text_length: 50       # Pages with less text than this → always send to Vision
       max_replacement_ratio: 0.05  # U+FFFD ratio above this → always send to Vision
+      entity_garble_check: true # Detect OCR garble where a CJK char was truncated
+                                # into an HTML entity (確認 → 確&lt;). Matches ONLY
+                                # a CJK char directly followed by &lt; — so it does
+                                # NOT misfire on Japanese headings wrapped in <…>
+                                # (`## &lt;入居中…&gt;`, entity precedes the CJK) or
+                                # on code/HTML prose (`vector&lt;int&gt;`). Set false
+                                # to disable this single check.
       table_line_threshold: 30  # Markdown table rows above this → send to Vision.
                                 # Raised from the earlier 10 after real-world
                                 # 仕様書 / API spec / Q&A 表 testing: nearly
