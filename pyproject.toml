@@ -27,6 +27,13 @@ dependencies = [
                               # proxy server) so the SQLi surface is unreachable,
                               # but the pin must not allow the vulnerable
                               # 1.81.16–1.83.6 range. 1.86.1 = current latest.
+    "google-genai>=2.0",      # Native video understanding (parsing.audio.native_video,
+                              # ON by default). The Files API path (videos >20MB:
+                              # upload → poll ACTIVE → reference) is first-class here,
+                              # unlike litellm's thinner video handling. Core (not an
+                              # extra) because native_video defaults ON and the default
+                              # vision provider is Gemini — a missing SDK would silently
+                              # degrade the default path to frame sampling.
 
     # Core: CLI & config
     "typer>=0.15",            # CLI framework.
@@ -144,12 +151,15 @@ graph-local = [
     # for inference; 3.x's training-API rewrite doesn't affect that path.
 ]
 graph-gemini = [
-    # Optional: Gemini embeddings via the official google-genai SDK.
-    # Replaces the legacy google-generativeai package (EOL 2025-11-30, now
-    # marked Development Status :: 7 - Inactive on PyPI). See migration
-    # guide: https://ai.google.dev/gemini-api/docs/migrate
-    # Most users on the [graph] path use OpenAI embeddings; opt in here
-    # only if you want Gemini's gemini-embedding-001 (768/1536/3072 dim).
+    # Gemini embeddings via the official google-genai SDK
+    # (gemini-embedding-001, 768/1536/3072 dim). Most users on the [graph]
+    # path use OpenAI embeddings; this extra documents the Gemini-embedding
+    # opt-in.
+    #
+    # NOTE: google-genai is now a CORE dependency (it backs the default-ON
+    # native_video path), so this extra is effectively a no-op — kept for
+    # backwards compatibility (`pip install .[graph-gemini]` still resolves)
+    # and as a self-documenting marker of the Gemini-embedding feature.
     "google-genai>=2.0",
 ]
 langchain = [

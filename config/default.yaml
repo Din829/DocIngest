@@ -473,6 +473,50 @@ parsing:
                                            # global parsing.vision.max_pages cap, so a
                                            # video costs no more Vision than a same-length
                                            # text document of equivalent page count.
+      skip_solid_frames: true              # drop near-uniform solid-colour frames
+                                           # (black/blank slates) before Vision — they
+                                           # carry no info and waste an API call. Judged
+                                           # by grayscale stddev, robust to JPEG noise.
+
+    # Native video understanding — send the WHOLE video to a video-capable
+    # model in ONE call instead of sampling frames + per-frame Vision. The
+    # model watches frames AND listens to the audio in a single pass, so the
+    # transcript and the on-screen description come back already aligned on one
+    # timeline (no ASR + frame-sampling + timestamp-stitching needed). Measured
+    # vs. the frame-sampling path on a 100s screen-recording: 1 API call vs 10,
+    # ~12K tokens vs ~50K, and far fewer [unreadable] markers (the model sees
+    # the real video stream, not shrunk-down single frames).
+    #
+    # Provider support: ONLY "google"/Gemini today. With any other provider
+    # configured, this path logs a warning and DEGRADES to frame sampling —
+    # so leaving it ON never breaks a non-Gemini deployment, it just no-ops
+    # back to the frame-sampling path. Subtitles still win when present
+    # (cheapest + exact); native video only applies to video with NO subtitle.
+    #
+    # Cost guard: native video cost scales with DURATION (~300 tok/s for
+    # Gemini). The pre-flight safety budget check already bounds this via
+    # safety.per_file.max_duration_sec (default 30 min) — a long video trips
+    # warn/strict and waits for --yes, exactly like a huge PDF. No separate
+    # cap here (a post-hoc cap would be silent info loss, not defence).
+    native_video:
+      enabled: true                        # ON by default — for video without a
+                                           # subtitle, use native video understanding
+                                           # (one call, frames+audio together). The
+                                           # default vision provider is Gemini, so
+                                           # this works out of the box. Non-Gemini
+                                           # providers / missing SDK auto-degrade to
+                                           # the frame-sampling path. Set false to
+                                           # force frame sampling for all video.
+      fps: 1                               # frames/sec the model samples at.
+                                           # Aligns with Gemini's own default (1).
+                                           # Static screencasts/lectures: try <1
+                                           # to save tokens; fast-cut footage: >1.
+      files_api_threshold_mb: 20           # videos < this go inline (base64);
+                                           # >= this upload via the Files API
+                                           # (Gemini's 20MB inline-request limit).
+      # model: inherits models.video_understanding if set, else models.vision
+      #        (which inherits models.defaults). To pin a video-specific model,
+      #        add a models.video_understanding.primary block.
 
   # URL resolution (yt-dlp)
   # When users pass an http/https URL as input, DocIngest downloads the

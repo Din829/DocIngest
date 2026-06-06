@@ -601,6 +601,60 @@ content (or the exact `(no additional visual content)` line). Do not repeat \
 the table text; mark uncertainty; never invent."""
 
 
+# ---------------------------------------------------------------------------
+# Native video understanding prompt (whole video → one call)
+# ---------------------------------------------------------------------------
+# Used by describe_video (provider.py) when parsing.audio.native_video is on.
+# The model watches frames AND listens to audio in one pass, so unlike the
+# frame-sampling path (transcript from ASR + per-frame Vision, stitched by
+# timestamp) it produces an inherently aligned result. Reuses the SAME
+# uncertainty markers ([?] / [unreadable]) as the page prompts so the
+# downstream quality_report scan and chunkers treat video output identically.
+# Output is plain timestamped Markdown → the `timestamp` chunker slices it with
+# no special-casing, exactly like an ASR transcript.
+_VIDEO_PROMPT = """\
+You are a video preprocessing specialist. Produce an accurate Markdown \
+representation of this video that INTERLEAVES, in chronological order:
+  1. The SPOKEN content — transcribe the audio track verbatim.
+  2. The ON-SCREEN visual content — UI text, slide text, chart labels, \
+     captions, button/menu labels, URLs, and what the user is doing.
+
+## Output format
+
+Segment the video by meaningful change (a new topic, screen, or action — \
+NOT a fixed time grid). For each segment emit a line `[MM:SS]` (use \
+`[H:MM:SS]` past one hour) followed by:
+
+- **说**: the speech in this window, verbatim. Omit this line if silence.
+- **画面**: what is visibly on screen. Capture readable text VERBATIM — \
+  URLs, field/button labels, prompts typed by the user, headings, code. \
+  Describe the action ("clicks X", "uploads an image", "types '…'").
+
+Timestamps must increase. Do not invent a regular interval — segment by \
+content.
+
+## Uncertainty markers (USE ONLY THESE — machine-scanned downstream)
+
+- `[?]` — partially readable: `¥1,234,5[?]`, `motio[?].ai`
+- `[unreadable]` — fully illegible; optional reason from the CLOSED set \
+  `blur` / `obscured` / `cut-off` / `low-res` / `handwritten`: \
+  `[unreadable: low-res]`
+
+FORBIDDEN: `[illegible]`, `[unclear]`, `???`, ellipses `...`, HTML comments, \
+"(low confidence)". Pick the single closest reason word; never free-form.
+
+## Rules
+
+- Preserve the original language exactly (中文 stays 中文, 日本語 stays 日本語).
+- Transcribe text you can read; never invent content you cannot see.
+- Capture on-screen text that matters for search (URLs, exact prompts, \
+  product/menu names) — these are the highest-value tokens for downstream RAG.
+- Do NOT summarize or paraphrase the speech. Do NOT list every decorative \
+  icon — focus on text and meaningful actions.
+- Start directly with the first `[MM:SS]`. No preamble, no closing remarks, \
+  no code-block wrapper around the whole output."""
+
+
 def describe_pages_batched(
     image_paths: "Sequence[Path | str]",
     page_texts: list[str],

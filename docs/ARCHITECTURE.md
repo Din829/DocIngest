@@ -133,7 +133,8 @@ DocIngest/
 │  │  ├─ base.py                     BaseParser + ParseResult + PageData + PAGEBREAK_MARKER
 │  │  ├─ __init__.py                 create_parser + _DoclingWithFallback 路由
 │  │  ├─ docling_parser.py
-│  │  ├─ media_parser.py             音视频：subtitle-first + ASR fallback
+│  │  ├─ media_parser.py             音视频：subtitle-first + ASR fallback；视频默认走
+│  │  │                              native_video（整段一次调用，Gemini 原生），不支持则降级抽帧画面理解
 │  │  ├─ text_parser.py              兜底 + 多编码尝试
 │  │  └─ vision.py                   per-page Vision + resolve_vision_config + prompt
 │  ├─ chunkers/
@@ -361,7 +362,7 @@ if file_path.suffix.lower() in {".cad", ".dwg"}:
     return self._cad_parser.parse(file_path)
 ```
 
-`Media parser` ([parsers/media_parser.py](src/docingest/parsers/media_parser.py)) 是个好参考：`accepts()` 方法 / subtitle-first 策略 / ASR fallback / 长音频自动分段 + 并发。
+`Media parser` ([parsers/media_parser.py](src/docingest/parsers/media_parser.py)) 是个好参考：`accepts()` 方法 / subtitle-first 策略 / ASR fallback / 长音频自动分段 + 并发 / 视频两条可切换路径（默认 `native_video` 整段一次调用；不支持时降级抽帧 + per-page Vision，见 §5.11）。
 
 ### 4.3 Chunkers（加新切分策略）
 
@@ -800,6 +801,33 @@ cache hit 的文件：
 - 生成入口：`pipeline.py::_build_chunk_lineage`，在 Phase 3.1（`inject_paths` 之后）为每个 chunk 独立生成一份（copy-on-attach，chunks 之间互不污染）
 - 填充点：Phase 1 / 1.0 / 1.4 / 1.5 / 1.6 在**成功**时往 `parse_result.transformations` append。失败的变换**不记**——这是一条**正面变换轨迹**，不是调试日志
 - 顶层平级字段**一个都不删**：现有 RAG 代码读 `metadata.source` / `metadata.original_file` 继续工作。lineage 只是**归集 + 扩展**
+
+### 5.11 视频两条路径：抽帧 vs 原生（native_video）
+
+视频有**两条可切换**的处理路径，都在 `media_parser.py`，由 `parsing.audio.native_video.enabled` 选择：
+
+| | **native_video（默认）** | **抽帧路径（降级 fallback）** |
+|---|---|---|
+| 怎么做 | 整段视频一次性丢给视频模型，模型同时看帧+听音轨，**一次调用**返回时间轴对齐的「转录+画面」Markdown | ffmpeg 抽音轨→ASR 转录；ffmpeg 每 N 秒抽一帧→当 PageData→pipeline Phase 1.5 逐帧 Vision；时间戳拼接对齐 |
+| 调用次数 | **1 次** | N 帧 = N 次 Vision + ASR |
+| provider | **仅 Gemini**（`google` provider）；其它降级到右列 | 任意（ASR + 任意 Vision） |
+| 入口 | `_parse_via_native_video` → `provider.py::describe_video` | `_parse_from_asr` + `_attach_video_frames` |
+
+**为什么并存不二选一**：原生路径成本/质量/对齐全面更优（实测 100s 录屏：1 调用 vs 10、~11K token vs ~50K、`[unreadable]` 大幅减少，因为模型看真实视频流而非缩小的单帧），但它**只有 Gemini 支持**，且 multi-provider 是项目根基——删掉抽帧 = 砍掉非 Gemini 用户的视频能力。所以加新路径、配置切换，不替换。
+
+**融合点（关键）**：`_parse_via_native_video` 返回的 `ParseResult.pages=[]`。pipeline Phase 1.5 `_enrich_with_vision` 开头 `if not parse_result.pages: return` → **自动跳过逐帧 Vision**。产出已是带 `[MM:SS]` 的成品 Markdown，后续 Phase 2/3（写 md、`timestamp` chunker 切片）和普通文档完全一样——**主 pipeline.py 一行不动**。
+
+**优先级**：字幕 > native_video > 抽帧。有字幕仍用字幕（免费、最准）；native 只在「视频 + 无字幕 + enabled」时走。
+
+**传输分流**（`describe_video` 内，走 google-genai SDK）：`< files_api_threshold_mb`（默认 20）走 base64 内联；`>=` 走 Files API（上传→**轮询 ACTIVE**→引用→用完删）。轮询是真实外部异步状态，必须等（大文件上传后是 PROCESSING，不等就引用失败）。
+
+**三条降级**（都 log warn、不 raise、回退抽帧）：① 非 Gemini provider（`NativeVideoUnsupported`）；② google-genai SDK 没装；③ API 调用失败 / 返回空。
+
+**成本防爆**：native 成本按时长走（Gemini ~300 tok/s），由现有 Phase 0 safety 体检的 `safety.per_file.max_duration_sec`（默认 30 分钟）兜住——长视频触发 warn/strict 等 `--yes`，和大 PDF 一个待遇。没在 native 这里加单独的 cap（事后截断 = 信息丢失伪装成防御）。
+
+**已知特性**：「说」（音轨转录）稳定可靠且能音画互校（实测把 ASR 听错的 "Max" 校正成画面里的 "MUX"）；「画面」（视觉 OCR）在小字/水印区有非确定性抖动（`[?]`/`[unreadable]` 标记数会跨次浮动）——这是模型诚实标注边界，不是幻觉，不影响转录完整性。
+
+模型配置：`models.video_understanding` 若设则用，否则继承 `models.vision`（再继承 `models.defaults`）——和 vision/chunking_assist 同一套 one-model-to-rule 继承。
 
 ---
 

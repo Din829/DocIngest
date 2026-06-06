@@ -126,6 +126,23 @@ class MediaParser(BaseParser):
             # Step 2: Transcribe the audio track — subtitle-first, ASR fallback.
             prefer_subs = get_nested(self.config, "parsing.audio.prefer_subtitles", True)
             subtitle_path = self._find_subtitle(file_path) if prefer_subs else None
+
+            # Step 2a: Native video understanding (画面+音轨 一次调用). Preferred
+            # for video when enabled AND no subtitle exists (subtitles stay the
+            # cheapest, most accurate source — never overridden). The model
+            # watches frames + listens in one pass and returns a timeline-
+            # aligned transcript+visual Markdown, replacing the ASR + frame-
+            # sampling + per-frame Vision path. Returns a FINISHED ParseResult
+            # with pages=[] so pipeline Phase 1.5 Vision is skipped (nothing to
+            # enrich). Unsupported provider / SDK missing / API failure → log
+            # and FALL THROUGH to the subtitle/ASR + frame-sampling path below.
+            if (is_video and not subtitle_path
+                    and get_nested(self.config, "parsing.audio.native_video.enabled", False)):
+                native = self._parse_via_native_video(file_path)
+                if native is not None and native.success:
+                    return native
+                # native is None (degraded) or failed → continue to legacy path.
+
             if subtitle_path:
                 result = self._parse_from_subtitle(file_path, subtitle_path)
             else:
@@ -594,6 +611,106 @@ class MediaParser(BaseParser):
         return ParseResult(markdown=markdown, metadata=metadata, success=True)
 
     # ------------------------------------------------------------------
+    # Native video understanding (whole video → one call)
+    # ------------------------------------------------------------------
+
+    # Video extension → MIME, for the native video API. Falls back to mp4.
+    _VIDEO_MIME = {
+        "mp4": "video/mp4", "m4v": "video/mp4", "mov": "video/quicktime",
+        "webm": "video/webm", "mkv": "video/x-matroska", "avi": "video/x-msvideo",
+        "wmv": "video/x-ms-wmv", "flv": "video/x-flv", "ts": "video/mp2t",
+    }
+
+    def _parse_via_native_video(self, video_path: Path) -> ParseResult | None:
+        """Whole-video understanding in one model call (Gemini-native).
+
+        Returns a FINISHED ParseResult (markdown ready, pages=[] so pipeline
+        Phase 1.5 Vision is skipped), or None to signal "degrade to the
+        subtitle/ASR + frame-sampling path". None is returned when the provider
+        has no native video support, the SDK is missing, or the call fails —
+        all logged, never raised, so a native-path problem never breaks the run.
+        """
+        from ..models.provider import describe_video, NativeVideoUnsupported
+        from .vision import _VIDEO_PROMPT, resolve_vision_config
+
+        nv_cfg = get_nested(self.config, "parsing.audio.native_video", {}) or {}
+        # Model config: a dedicated models.video_understanding task if present,
+        # else inherit models.vision (which itself inherits models.defaults —
+        # the one-model-to-rule chain). resolve_vision_config gives us the
+        # merged primary/fallback + _defaults so token budgets are inherited.
+        model_config = get_nested(self.config, "models.video_understanding", None)
+        if not model_config:
+            model_config = resolve_vision_config(self.config, None)
+
+        fps = nv_cfg.get("fps", 1)
+        inline_max_mb = nv_cfg.get("files_api_threshold_mb", 20)
+        mime = self._VIDEO_MIME.get(
+            video_path.suffix.lstrip(".").lower(), "video/mp4"
+        )
+
+        try:
+            markdown = describe_video(
+                video_path,
+                _VIDEO_PROMPT,
+                model_config,
+                fps=fps,
+                inline_max_mb=inline_max_mb,
+                mime_type=mime,
+            )
+        except NativeVideoUnsupported as e:
+            logger.warning(
+                f"Native video understanding unavailable for {video_path.name} "
+                f"({e}); falling back to frame-sampling Vision."
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                f"Native video understanding failed for {video_path.name} "
+                f"({type(e).__name__}: {e}); falling back to frame-sampling Vision."
+            )
+            return None
+
+        if not markdown.strip():
+            logger.warning(
+                f"Native video understanding returned empty output for "
+                f"{video_path.name}; falling back to frame-sampling Vision."
+            )
+            return None
+
+        metadata: dict[str, Any] = {
+            "format": video_path.suffix.lstrip(".").lower(),
+            "title": video_path.stem,
+            "transcription_source": "native_video",
+            "transcription_engine": "gemini-native-video",
+        }
+        duration = self._get_duration(video_path)
+        if duration:
+            metadata["duration"] = duration
+        # yt-dlp metadata (title / uploader / description) if present — same
+        # enrichment the ASR path does, so URL-sourced videos keep their header.
+        info = self._load_info_json(video_path)
+        if info:
+            if info.get("title"):
+                metadata["title"] = info["title"]
+            if info.get("uploader"):
+                metadata["uploader"] = info["uploader"]
+            header_parts = []
+            if info.get("title"):
+                header_parts.append(f"# {info['title']}")
+            if info.get("uploader"):
+                header_parts.append(f"**Uploader:** {info['uploader']}")
+            if info.get("description"):
+                metadata["description"] = info["description"][:500]
+                header_parts.append(f"\n> {info['description'][:500]}")
+            if header_parts:
+                markdown = "\n\n".join(header_parts) + "\n\n" + markdown
+
+        # pages=[] is the key contract: pipeline Phase 1.5 (_enrich_with_vision)
+        # early-returns on empty pages, so no per-frame Vision runs. The output
+        # is already a finished, timeline-aligned transcript.
+        return ParseResult(markdown=markdown, metadata=metadata, success=True)
+
+    # ------------------------------------------------------------------
     # Video frame understanding (画面理解)
     # ------------------------------------------------------------------
 
@@ -638,6 +755,7 @@ class MediaParser(BaseParser):
         if max_frames is None:
             max_frames = get_nested(self.config, "parsing.vision.max_pages", 50)
         max_frames = int(max_frames) if max_frames is not None else None
+        skip_solid = cfg.get("skip_solid_frames", True)
 
         total_sec = self._duration_seconds(video_path)
         if not total_sec:
@@ -664,28 +782,62 @@ class MediaParser(BaseParser):
             timestamps = [round(step * (i + 0.5), 2) for i in range(max_frames)]
 
         frames: list[tuple[Path, float]] = []
+        solid_skipped = 0
         for idx, ts in enumerate(timestamps):
             out_path = video_path.with_name(f"{video_path.stem}_frame{idx:04d}.jpg")
-            if out_path.exists() and out_path.stat().st_size > 0:
-                frames.append((out_path, ts))
+            # Extract unless a prior run already wrote this frame (reused as-is).
+            if not (out_path.exists() and out_path.stat().st_size > 0):
+                try:
+                    subprocess.run(
+                        [ffmpeg, "-y", "-ss", str(ts), "-i", str(video_path),
+                         "-frames:v", "1", "-q:v", "3", str(out_path)],
+                        capture_output=True, timeout=60,
+                    )
+                except Exception as e:
+                    logger.debug(f"Frame extraction at {ts}s failed: {e}")
+                    continue
+            if not (out_path.exists() and out_path.stat().st_size > 0):
                 continue
-            try:
-                subprocess.run(
-                    [ffmpeg, "-y", "-ss", str(ts), "-i", str(video_path),
-                     "-frames:v", "1", "-q:v", "3", str(out_path)],
-                    capture_output=True, timeout=60,
-                )
-                if out_path.exists() and out_path.stat().st_size > 0:
-                    frames.append((out_path, ts))
-            except Exception as e:
-                logger.debug(f"Frame extraction at {ts}s failed: {e}")
+            # Drop near-uniform solid-colour frames (black/blank slates) — no
+            # visual info, a wasted Vision call. Reused frames are checked too.
+            if skip_solid and self._is_solid_frame(out_path):
+                try:
+                    out_path.unlink()
+                except OSError:
+                    pass
+                solid_skipped += 1
+                continue
+            frames.append((out_path, ts))
 
         if frames:
             logger.info(
                 f"Sampled {len(frames)} frame(s) from {video_path.name} "
-                f"(every {interval}s, {total_sec:.0f}s total)"
+                f"(every {interval}s, {total_sec:.0f}s total"
+                + (f"; {solid_skipped} solid-colour skipped)" if solid_skipped else ")")
+            )
+        elif solid_skipped:
+            logger.info(
+                f"All {solid_skipped} sampled frame(s) of {video_path.name} were "
+                f"solid-colour (blank/black); no frames to describe."
             )
         return frames
+
+    @staticmethod
+    def _is_solid_frame(image_path: Path, std_threshold: float = 3.0) -> bool:
+        """True if the frame is a near-uniform solid colour (black/blank/white
+        slate) with no visual content worth a Vision call. Judged by grayscale
+        standard deviation (< std_threshold): a solid frame is ~0, any text or
+        UI is tens — measured 0 for black vs 69+ for content, so 3.0 leaves a
+        wide margin. Stddev (not mean brightness) is used so a dark-but-detailed
+        UI isn't misjudged. Fails open (False) — an unreadable file is kept,
+        never silently dropped."""
+        try:
+            from PIL import Image, ImageStat
+            with Image.open(image_path) as img:
+                stddev = ImageStat.Stat(img.convert("L")).stddev[0]
+            return stddev < std_threshold
+        except Exception:
+            return False
 
     @staticmethod
     def _splice_frame_pagebreaks(markdown: str, frame_times: list[float]) -> str:

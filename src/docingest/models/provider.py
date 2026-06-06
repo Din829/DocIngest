@@ -446,6 +446,218 @@ def describe_images_batched(
 
 
 # ---------------------------------------------------------------------------
+# Native video understanding (whole video → one call, Gemini-native)
+# ---------------------------------------------------------------------------
+# Unlike describe_image (which sends one rendered frame per call), this sends
+# the WHOLE video file to a model that natively samples + understands it. The
+# model listens to the audio AND watches the frames in one pass, producing a
+# timeline-aligned transcript + on-screen description. This replaces the
+# frame-sampling + per-frame Vision path entirely for supported providers.
+#
+# Routed through the google-genai SDK rather than litellm: the Files API
+# (required for videos over the inline-request size limit) is a first-class,
+# reliable path there, whereas litellm's video/Files handling is thinner. Only
+# the "google" provider supports this today — other providers raise
+# NativeVideoUnsupported so the caller (media_parser) can degrade to the
+# frame-sampling path instead.
+
+
+class NativeVideoUnsupported(RuntimeError):
+    """Raised when the configured provider has no native video-understanding
+    path. The caller catches this and degrades to frame-sampling Vision."""
+
+
+# Gemini's inline-data request ceiling is 20 MB for the WHOLE request. Videos
+# at or above this must go through the Files API (upload → poll ACTIVE →
+# reference by uri). Below it, base64 inline is simpler and avoids the upload
+# round-trip. Exposed as a module constant so the threshold is visible in one
+# place; the caller may override via config.
+_GEMINI_INLINE_MAX_MB = 20
+
+
+def describe_video(
+    video_path: Path | str,
+    prompt: str,
+    model_config: dict[str, Any] | None = None,
+    *,
+    fps: float | None = None,
+    max_tokens: int | None = None,
+    inline_max_mb: float = _GEMINI_INLINE_MAX_MB,
+    mime_type: str = "video/mp4",
+    poll_timeout_sec: int = 300,
+) -> str:
+    """
+    Send a WHOLE video to a native video-understanding model in one call.
+
+    Auto-selects transport by file size: base64 inline below ``inline_max_mb``,
+    Files API (upload + poll ACTIVE + reference) at or above it.
+
+    Args:
+        video_path: Local video file.
+        prompt: Instruction (caller supplies the timeline-aligned prompt).
+        model_config: Same shape as describe_image's — primary (+ fallback)
+            with provider/model/api_key(_env). Only "google" provider is
+            supported natively; others raise NativeVideoUnsupported.
+        fps: Frames-per-second the model samples at (Gemini default 1.0).
+            None → let the model use its own default.
+        max_tokens: Output cap. None → resolve_max_tokens(model_config).
+        inline_max_mb: Size boundary between base64 and Files API.
+        mime_type: Video MIME (caller maps from extension).
+        poll_timeout_sec: Max wait for Files API processing to reach ACTIVE.
+
+    Returns:
+        Model's text response (timeline-aligned transcript + visual content).
+
+    Raises:
+        NativeVideoUnsupported: provider has no native video path → caller
+            degrades to frame sampling.
+        FileNotFoundError: video missing.
+        RuntimeError: provider call failed after the model chain was tried.
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    chain = _build_model_chain(model_config)
+    effective_max_tokens = resolve_max_tokens(model_config, max_tokens)
+
+    last_error: Exception | None = None
+    saw_supported = False
+    for entry in chain:
+        provider = str(entry.get("provider", "")).lower()
+        if provider not in ("google", "gemini", "vertex"):
+            # This provider can't do native video — skip to the next chain
+            # entry (e.g. fallback). If NONE are supported, we raise
+            # NativeVideoUnsupported below so the caller can degrade.
+            continue
+        saw_supported = True
+        # Mirror the key to the env var litellm/genai read (reuses the same
+        # credential-resolution path as every other LLM call here).
+        _set_api_key(entry)
+        try:
+            return _describe_video_gemini(
+                video_path=video_path,
+                prompt=prompt,
+                model=entry["model"],
+                fps=fps,
+                max_tokens=effective_max_tokens,
+                inline_max_mb=inline_max_mb,
+                mime_type=mime_type,
+                poll_timeout_sec=poll_timeout_sec,
+            )
+        except NativeVideoUnsupported:
+            raise
+        except Exception as e:  # network / API / processing failure
+            last_error = e
+            continue
+
+    if not saw_supported:
+        raise NativeVideoUnsupported(
+            "No configured provider supports native video understanding "
+            "(only 'google'/Gemini does today). Configure "
+            "models.video_understanding.primary with a Gemini model, or "
+            "disable parsing.audio.native_video to use frame sampling."
+        )
+    raise RuntimeError(
+        f"Native video understanding failed for {video_path.name}. "
+        f"Last error: {last_error}"
+    )
+
+
+def _describe_video_gemini(
+    video_path: Path,
+    prompt: str,
+    model: str,
+    fps: float | None,
+    max_tokens: int,
+    inline_max_mb: float,
+    mime_type: str,
+    poll_timeout_sec: int,
+) -> str:
+    """Gemini-native video call via google-genai. base64 inline for small
+    files, Files API (upload → poll → reference → delete) for large ones."""
+    import time
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as e:
+        # SDK genuinely absent — this is the "unsupported" signal, not a
+        # transient failure, so the caller degrades rather than retries.
+        raise NativeVideoUnsupported(
+            f"google-genai SDK not installed ({e}); cannot do native video. "
+            f"pip install google-genai, or disable parsing.audio.native_video."
+        ) from e
+
+    # genai.Client() reads GEMINI_API_KEY from the env (already set by
+    # _set_api_key above). No explicit key plumbing needed.
+    client = genai.Client()
+    model_name = model if model.startswith("models/") else model
+    video_metadata = types.VideoMetadata(fps=fps) if fps is not None else None
+
+    size_mb = video_path.stat().st_size / (1024 * 1024)
+    uploaded_name: str | None = None
+    try:
+        if size_mb < inline_max_mb:
+            part = types.Part(
+                inline_data=types.Blob(
+                    data=video_path.read_bytes(), mime_type=mime_type
+                ),
+                video_metadata=video_metadata,
+            )
+        else:
+            myfile = client.files.upload(file=str(video_path))
+            uploaded_name = myfile.name
+            # Large uploads land in PROCESSING and must reach ACTIVE before
+            # they can be referenced — this is a real external-system
+            # boundary, so we poll (not over-defensive: skipping it makes the
+            # generate call fail on every large video).
+            waited = 0
+            while str(myfile.state) in ("FileState.PROCESSING", "PROCESSING"):
+                if waited >= poll_timeout_sec:
+                    raise RuntimeError(
+                        f"Files API still PROCESSING after {poll_timeout_sec}s"
+                    )
+                time.sleep(3)
+                waited += 3
+                myfile = client.files.get(name=myfile.name)
+            if str(myfile.state) not in ("FileState.ACTIVE", "ACTIVE"):
+                raise RuntimeError(f"Files API state not ACTIVE: {myfile.state}")
+            part = types.Part(
+                file_data=types.FileData(
+                    file_uri=myfile.uri, mime_type=mime_type
+                ),
+                video_metadata=video_metadata,
+            )
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=types.Content(parts=[part, types.Part(text=prompt)]),
+            config=types.GenerateContentConfig(max_output_tokens=max_tokens),
+        )
+
+        # Record usage so the run's token report includes native-video cost.
+        um = getattr(response, "usage_metadata", None)
+        if um is not None:
+            token_tracker.record(
+                model=f"gemini/{model}",
+                prompt=getattr(um, "prompt_token_count", 0) or 0,
+                completion=getattr(um, "candidates_token_count", 0) or 0,
+            )
+
+        text = response.text or ""
+        return text.strip()
+    finally:
+        # Best-effort cleanup of the uploaded file (it also auto-expires in
+        # 48h). Never let a delete failure mask the real result/error.
+        if uploaded_name:
+            try:
+                client.files.delete(name=uploaded_name)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Text completion (for chunking assist, contextual summary, etc.)
 # ---------------------------------------------------------------------------
 
