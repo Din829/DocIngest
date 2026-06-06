@@ -59,19 +59,29 @@ _DEFAULT_FALLBACK_PRICE = 0.005  # USD per Vision call; ultimate fallback
 
 def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> float:
     """
-    Estimate Vision API cost for a single file.
+    Estimate Vision / video API cost for a single file.
 
-    cost ≈ min(pages, vision.max_pages) × price_per_call
+    Two cost models, by file shape:
+      * page-based docs (pdf/pptx/docx/...): cost ≈ min(pages, vision.max_pages)
+        × per-call price.
+      * video (no pages, has duration_sec): cost ≈ duration × per-second token
+        rate × per-token price — see _estimate_video_cost_usd. Without this a
+        video estimated 0.0 (pages=None), which silently defeated the cost
+        pre-flight for the highest-cost input type.
 
-    Returns 0.0 when Vision is disabled or the file has no pages (audio /
-    text / unknown formats). Safe on missing fields — treats absent pages
-    as zero.
+    Returns 0.0 when Vision is disabled or the file has neither pages nor a
+    video duration (audio-only / text / unknown formats). Safe on missing
+    fields.
     """
     if not get_nested(config, "parsing.vision.enabled", True):
         return 0.0
 
     pages = info.get("pages") or 0
     if not pages:
+        # No pages — but a video carries a real (often large) cost via its
+        # duration. Estimate that instead of falling through to 0.0.
+        if info.get("duration_sec") and _is_video(info):
+            return _estimate_video_cost_usd(info, config)
         return 0.0
 
     cap_raw = get_nested(config, "parsing.vision.max_pages", 50)
@@ -80,6 +90,59 @@ def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> floa
 
     price = _lookup_vision_price(config)
     return vision_calls * price
+
+
+# Video formats that go through Vision (native video understanding or frame
+# sampling). Audio-only formats are excluded — they cost ASR, not Vision, and
+# ASR cost is small + harder to price per-second here. Mirrors the video set in
+# config parsing.audio.video_formats; kept as a literal so safety has no import
+# dependency on the parser.
+_VIDEO_EXTS = {"mp4", "avi", "mkv", "webm", "mov", "wmv", "flv", "ts", "m4v"}
+
+
+def _is_video(info: dict[str, Any]) -> bool:
+    return str(info.get("format", "")).lower() in _VIDEO_EXTS
+
+
+def _estimate_video_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> float:
+    """
+    Estimate the Vision cost of a video from its duration.
+
+    Native video understanding (default) sends the whole clip to a video model
+    that bills per token. Gemini tokenizes at ~258 tokens per sampled frame +
+    ~32 tokens/s of audio; at the configured fps the per-second token rate is
+    ``258 × fps + 32``. cost = duration_sec × tok_per_sec × price_per_token.
+
+    Frame-sampling fallback (native_video off) bills per Vision *call* instead:
+    one call per sampled frame, frame count = duration / interval, capped by
+    max_frames (or the global vision.max_pages). cost = frames × per-call price.
+
+    Both rates/prices are config-driven; 258 is Gemini's documented per-frame
+    token count (a fixed protocol fact, not a tunable) so it stays inline.
+    """
+    duration = float(info.get("duration_sec") or 0)
+    if duration <= 0:
+        return 0.0
+
+    native_on = get_nested(config, "parsing.audio.native_video.enabled", True)
+
+    if native_on:
+        fps = float(get_nested(config, "parsing.audio.native_video.fps", 1) or 1)
+        tok_per_sec = 258.0 * fps + 32.0          # frames + audio, per second
+        price_per_million = float(
+            get_nested(config, "safety.video_token_price_per_million", 0.50)
+        )
+        return duration * tok_per_sec * price_per_million / 1_000_000.0
+
+    # Frame-sampling path: one Vision call per sampled frame.
+    interval = float(get_nested(config, "parsing.audio.video_frames.interval_sec", 10) or 10)
+    frames = duration / interval if interval > 0 else 0
+    cap_raw = get_nested(config, "parsing.audio.video_frames.max_frames", None)
+    if cap_raw is None:
+        cap_raw = get_nested(config, "parsing.vision.max_pages", 50)
+    if cap_raw is not None:
+        frames = min(frames, float(cap_raw))
+    return frames * _lookup_vision_price(config)
 
 
 def _lookup_vision_price(config: dict[str, Any]) -> float:

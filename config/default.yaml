@@ -1085,6 +1085,13 @@ safety:
     claude-sonnet: 0.006
     _default: 0.005
 
+  # Per-token price (USD per 1M input tokens) for NATIVE video understanding,
+  # which bills per token (not per call). est_cost_usd for a video =
+  # duration_sec × (258×fps + 32) tok/s × this / 1e6. Default = Gemini 3 Flash
+  # input price ($0.50/1M, video billed same as text). Update on price change.
+  # Frame-sampling fallback (native_video off) uses vision_price_per_call above.
+  video_token_price_per_million: 0.50
+
 # =============================================================================
 # Incremental processing (content-addressed pipeline output cache)
 # =============================================================================
