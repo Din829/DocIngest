@@ -132,6 +132,9 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.pptx.extract_chart_data",     # hook #1: PPTX chart direct-read
     "parsing.pdf.table_extraction",
     "parsing.pdf.image_extraction",
+    "parsing.pdf.oom_batch_fallback",      # TEMP (Windows bad_alloc): toggling enabled /
+                                           # batch_size changes output for PDFs that would
+                                           # otherwise drop pages. Remove with the workaround.
     "parsing.pptx.include_notes",
     "parsing.xlsx.denoising",
     "parsing.xlsx.extract_connector_data",  # hook: xlsx connector → Vision ground truth

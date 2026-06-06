@@ -254,6 +254,7 @@ class DoclingParser(BaseParser):
         file_path: Path,
         *,
         override_stream: BytesIO | None = None,
+        _page_range: tuple[int, int] | None = None,
     ) -> ParseResult:
         """
         Parse a document using Docling.
@@ -265,6 +266,12 @@ class DoclingParser(BaseParser):
                 of reading file_path. Used by pre-parse hooks (e.g. DOCX OMML
                 preprocessing) to transform file content before Docling sees
                 it without touching the original file on disk.
+            _page_range: INTERNAL — explicit 1-based inclusive (start, end)
+                page window. Used ONLY by the OOM batch fallback
+                (_parse_pdf_batched) to parse one batch of pages at a time.
+                When None (the default, all normal callers), behaviour is
+                unchanged: page_range derives from parsing.max_pages as before.
+                Not a public argument — leading underscore marks it internal.
         """
         from .base import PageData
 
@@ -292,19 +299,92 @@ class DoclingParser(BaseParser):
 
         try:
             converter = self._get_converter()
-            if override_stream is not None:
-                # Route through DocumentStream so Docling reads the
-                # transformed bytes while still seeing the original filename
-                # (which it uses for format detection).
-                from docling_core.types.io import DocumentStream
-                override_stream.seek(0)
-                doc_stream = DocumentStream(
-                    name=file_path.name,
-                    stream=override_stream,
-                )
-                result = converter.convert(doc_stream)
+            # Optional page cap: parse only the first N pages (PDF/PPT/DOCX —
+            # any paged format Docling handles). None = no cap (parse all,
+            # backward-compatible default). Docling's page_range is 1-based and
+            # inclusive: (1, N) yields exactly the first N pages (verified on
+            # docling 2.96.1 — no off-by-one / dropped-last-page issue). Pages
+            # past N are never rendered, so this genuinely saves layout-model
+            # and Vision work, not just trims output.
+            convert_kwargs: dict[str, Any] = {}
+            if _page_range is not None:
+                # OOM batch fallback supplies an explicit window — it wins over
+                # max_pages (the batcher already accounts for max_pages when
+                # computing the total page count it splits into batches).
+                convert_kwargs["page_range"] = _page_range
             else:
-                result = converter.convert(str(file_path))
+                max_pages = get_nested(self.config, "parsing.max_pages", None)
+                if max_pages is not None and int(max_pages) > 0:
+                    convert_kwargs["page_range"] = (1, int(max_pages))
+
+            def _do_convert():
+                if override_stream is not None:
+                    # Route through DocumentStream so Docling reads the
+                    # transformed bytes while still seeing the original filename
+                    # (which it uses for format detection). Seek to 0 each call
+                    # so a retry re-reads the stream from the start.
+                    from docling_core.types.io import DocumentStream
+                    override_stream.seek(0)
+                    doc_stream = DocumentStream(
+                        name=file_path.name,
+                        stream=override_stream,
+                    )
+                    return converter.convert(doc_stream, **convert_kwargs)
+                return converter.convert(str(file_path), **convert_kwargs)
+
+            # Docling silently degrades when a page's layout pass dies (notably
+            # std::bad_alloc from the native layout model — intermittent, NOT
+            # an out-of-system-memory condition; observed at ~2.7GB RSS with
+            # 30GB free). It catches the per-page exception, logs "Stage ...
+            # failed", drops that page's content, and returns the document with
+            # status == PARTIAL_SUCCESS. The page slots still exist (empty), so
+            # page COUNT looks correct — only the status reveals the loss.
+            # A knowledge base silently missing pages is worse than a clean
+            # failure (downstream RAG can't tell content is gone), so we treat
+            # PARTIAL_SUCCESS / FAILURE as a hard failure. The OOM is
+            # intermittent, so retry the whole convert once before giving up.
+            from docling.datamodel.base_models import ConversionStatus
+
+            result = _do_convert()
+            if result.status not in (ConversionStatus.SUCCESS,):
+                logger.warning(
+                    f"Docling returned {result.status} for {file_path.name} "
+                    f"(pages dropped by failed layout passes) — retrying once."
+                )
+                result = _do_convert()
+                if result.status not in (ConversionStatus.SUCCESS,):
+                    # --- TEMPORARY WORKAROUND: docling-parse Windows bad_alloc ---
+                    # (issue #227 / PR #274 — Windows-only, formula/queue memory).
+                    # Whole-document parse dropped pages even after one retry.
+                    # Re-parse in small page batches, rebuilding the converter
+                    # between batches so the native C++ allocator is released
+                    # (verified: 48 dropped pages → 0; internal page_batch_size
+                    # does NOT help because it reuses one converter). This is a
+                    # fallback ONLY — normal SUCCESS parses never reach here, and
+                    # when docling-parse fixes Windows this whole block can be
+                    # deleted. _page_range is None here means we're NOT already
+                    # inside a batch (guards against infinite recursion).
+                    if (
+                        _page_range is None
+                        and file_path.suffix.lower() == ".pdf"
+                        and get_nested(self.config, "parsing.pdf.oom_batch_fallback.enabled", True)
+                    ):
+                        batched = self._parse_pdf_batched(file_path, override_stream)
+                        if batched is not None and batched.success:
+                            return batched
+                    # --- END WORKAROUND ---
+                    return ParseResult(
+                        success=False,
+                        markdown="",
+                        error=(
+                            f"Docling parse incomplete: status={result.status.value} "
+                            f"after one retry. Pages were dropped (commonly "
+                            f"std::bad_alloc from the native layout model on large "
+                            f"PDFs). Refusing to emit a silently-incomplete knowledge "
+                            f"base. Try a smaller parsing.max_pages, or split the file."
+                        ),
+                        metadata={"error_type": "parse_incomplete", "format": file_path.suffix.lstrip(".").lower()},
+                    )
             doc = result.document
 
             # Export full Markdown (with page break markers)
@@ -354,6 +434,130 @@ class DoclingParser(BaseParser):
                 success=False,
                 error=f"Docling parse failed: {e}",
             )
+
+    def _parse_pdf_batched(
+        self,
+        file_path: Path,
+        override_stream: BytesIO | None,
+    ) -> ParseResult | None:
+        """
+        TEMPORARY WORKAROUND for docling-parse's Windows std::bad_alloc
+        (issue #227 / PR #274). Called ONLY when a whole-document parse came
+        back PARTIAL_SUCCESS/FAILURE (pages silently dropped). Re-parses the
+        PDF in small page batches, rebuilding the DocumentConverter between
+        batches so the native C++ allocator is released each time — verified
+        on a 75-page PDF: 48 dropped pages → 0. (docling's internal
+        page_batch_size does NOT help: it reuses one converter, so the C++
+        backend never releases. Only a fresh converter + gc per batch works.)
+
+        Implementation reuses parse() itself per batch via the internal
+        _page_range argument, so every batch goes through the exact same
+        post-processing (section injection, bboxes, metadata) as a normal
+        parse. Results are then concatenated. docling returns global page
+        numbers for a page_range window (verified: page_range=(21,25) →
+        doc.pages keys 21..25), so PageData.page_no and the per-page bbox/
+        size maps need no offset — they merge directly.
+
+        Returns:
+          * ParseResult(success=True) with all pages stitched together, or
+          * None when batching can't help (can't read page count, or a batch
+            STILL dropped pages — in which case the caller fails loud rather
+            than emit a silently-incomplete knowledge base).
+
+        Delete this method (and its call site + the config block) once
+        docling-parse fixes the Windows allocator bug.
+        """
+        import gc
+
+        # Total page count to split. Respect parsing.max_pages so the batched
+        # path covers exactly the same pages the whole-doc path would have.
+        try:
+            import pymupdf
+            with pymupdf.open(str(file_path)) as _d:
+                total = len(_d)
+        except Exception as e:
+            logger.warning(f"OOM fallback: cannot read page count for {file_path.name}: {e}")
+            return None
+
+        max_pages = get_nested(self.config, "parsing.max_pages", None)
+        if max_pages is not None and int(max_pages) > 0:
+            total = min(total, int(max_pages))
+        if total <= 0:
+            return None
+
+        batch_size = int(get_nested(self.config, "parsing.pdf.oom_batch_fallback.batch_size", 10))
+        if batch_size <= 0:
+            batch_size = 10
+
+        logger.warning(
+            f"OOM fallback engaged for {file_path.name}: re-parsing {total} pages "
+            f"in batches of {batch_size} (rebuilding converter per batch)."
+        )
+
+        merged_md_parts: list[str] = []
+        merged_pages: list = []
+        merged_meta: dict[str, Any] = {}
+        merged_boxes: dict = {}
+        merged_sizes: dict = {}
+        has_tables = False
+        has_images = False
+
+        start = 1
+        while start <= total:
+            end = min(start + batch_size - 1, total)
+            # Fresh converter per batch — the whole point. Drop the cached one
+            # so _get_converter() rebuilds, then drop it again after the batch.
+            self._converter = None
+            br = self.parse(
+                file_path,
+                override_stream=override_stream,
+                _page_range=(start, end),
+            )
+            if not br.success:
+                logger.warning(
+                    f"OOM fallback: batch {start}-{end} still failed "
+                    f"({br.error}); giving up on batched parse."
+                )
+                self._converter = None
+                gc.collect()
+                return None
+
+            if merged_md_parts:
+                merged_md_parts.append(PAGEBREAK_MARKER)
+            merged_md_parts.append(br.markdown)
+            merged_pages.extend(br.pages)
+            # First batch seeds the base metadata (format/title/docling_origin…);
+            # later batches only contribute additive page-level data.
+            if not merged_meta:
+                merged_meta = dict(br.metadata)
+            has_tables = has_tables or bool(br.metadata.get("has_tables"))
+            has_images = has_images or bool(br.metadata.get("has_images"))
+            # Per-page maps are keyed by global page_no → merge directly.
+            merged_boxes.update(br.metadata.get("element_boxes", {}) or {})
+            merged_sizes.update(br.metadata.get("page_sizes", {}) or {})
+
+            # Release native memory before the next batch.
+            self._converter = None
+            del br
+            gc.collect()
+            start = end + 1
+
+        # Finalize merged metadata.
+        merged_meta["pages"] = len(merged_pages)
+        merged_meta["has_tables"] = has_tables
+        merged_meta["has_images"] = has_images
+        if merged_boxes:
+            merged_meta["element_boxes"] = merged_boxes
+        if merged_sizes:
+            merged_meta["page_sizes"] = merged_sizes
+        merged_meta["oom_batch_fallback_used"] = True
+
+        return ParseResult(
+            markdown="".join(merged_md_parts),
+            metadata=merged_meta,
+            pages=merged_pages,
+            success=True,
+        )
 
     def export_with_images(
         self,

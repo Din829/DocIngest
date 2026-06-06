@@ -126,6 +126,12 @@ select {
 .screen.is-active {
   display: flex;
   flex-direction: column;
+  /* Soft fade-in on screen swap — opacity only (no reflow), kept very short so
+     it reads as "smooth", not animated. Honored-reduced-motion below. */
+  animation: screen-fade 0.14s ease both;
+}
+@keyframes screen-fade {
+  from { opacity: 0; }
 }
 
 /* Dialog overlay screens (pen 09 / 10): dim backdrop + centered card.

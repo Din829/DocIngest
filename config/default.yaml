@@ -95,6 +95,15 @@ models:
 parsing:
   engine: "docling"           # docling | docling_with_fallback
 
+  # Global page cap — parse only the FIRST N pages of each paged document
+  # (PDF / PPTX / DOCX — anything Docling counts in pages). null = no cap
+  # (parse everything, the default). Pages past N are never rendered, so this
+  # genuinely saves layout-model + Vision work on big files (e.g. a 300-page
+  # report you only need the first 30 of), and the cost preview reflects N.
+  # Per-run override (no code change): ingest(..., config_overrides={"parsing.max_pages": 30}).
+  # Does NOT affect non-paged inputs (plain text, audio/video) — they have no pages.
+  max_pages: null
+
   # Wall-clock cap for a single file's parse step. null = no timeout.
   # A hung Docling call (rare but possible on malformed PDFs) is caught
   # here so the rest of the pipeline keeps moving. The file is recorded
@@ -308,9 +317,32 @@ parsing:
     #                    / nutrition tables; degrades nested invoice tables.
     table_cell_matching: true
     image_extraction: true
-    max_pages: null           # null = no limit
+    # (page cap lives at the global parsing.max_pages — applies to all paged
+    #  formats, not just PDF; the old per-PDF knob here was never wired up.)
     hidden_text_detection:
       enabled: true           # Detect hidden/invisible elements via Docling ContentLayer
+
+    # === TEMPORARY WORKAROUND — docling-parse Windows std::bad_alloc ===
+    # docling-parse (the C++ PDF backend) intermittently throws std::bad_alloc
+    # on Windows for multi-page PDFs, silently dropping pages (status becomes
+    # PARTIAL_SUCCESS). Known upstream bug, NOT out-of-memory: tracked at
+    # docling-parse issue #227 / PR #274; still unfixed on Windows as of
+    # docling 2.96.1. See docs/docling_parse_OOM_Windows_长期监控.md.
+    #
+    # When a whole-document parse drops pages even after one retry, we re-parse
+    # the PDF in small page batches, rebuilding the converter between batches so
+    # the native allocator is released (measured: 75-page PDF, 48 dropped → 0).
+    # This is a FALLBACK ONLY — it triggers solely on a detected partial parse,
+    # so non-Windows / small / clean PDFs pay nothing. DELETE this whole block
+    # (and _parse_pdf_batched + its call site in docling_parser.py) once the
+    # upstream bug is fixed.
+    oom_batch_fallback:
+      enabled: true           # set false to disable and fail loud on partial parse instead
+      batch_size: 10          # pages per batch. Measured on a 75-page PDF: batches of
+                              # 8/10/12 all parsed 0-error; 15 still dropped pages. 10
+                              # keeps a safety margin below the ~15 crash threshold while
+                              # minimising converter rebuilds (slower path: ~7x a clean
+                              # whole-doc parse, but it ONLY runs when the doc already failed).
 
     # Optional per-format Vision override. Any field listed here overrides the
     # global models.vision.* / parsing.vision.* setting for THIS format only.

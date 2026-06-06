@@ -5,15 +5,11 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>DocIngest</title>
 
-  <!-- Fonts + icons. Loaded from CDN in dev; for the packaged exe (data must
-       not leave the machine) both get vendored locally and these links swapped
-       for local files — handled at packaging time. -->
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Newsreader:wght@400;500&family=Noto+Sans+JP:wght@400;500;600&family=Noto+Serif+JP:wght@500&display=swap"
-    rel="stylesheet"
-  />
+  <!-- Fonts — vendored locally (no CDN). DocIngest ships as an offline exe;
+       loading fonts from Google at runtime would fail offline and break the
+       Japanese type system. The four families live in vendor/fonts/ as full
+       woff2; see vendor/fonts/fonts.css for @font-face rules + provenance. -->
+  <link rel="stylesheet" href="vendor/fonts/fonts.css" />
 
   <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/base.css" />
@@ -526,14 +522,18 @@
 
   </div>
 
-  <!-- lucide icon font/SVG replacer (CDN in dev; vendored at packaging) -->
-  <script src="https://unpkg.com/lucide@latest"></script>
-  <!-- Markdown preview rendering. marked parses MD → HTML; DOMPurify sanitizes
-       it (marked doesn't sanitize — the MD comes from parsed documents, an
-       external-data boundary, so we clean it). CDN in dev; vendored at
-       packaging (data must not leave the machine). -->
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+  <!-- Third-party JS — vendored locally (no CDN), so the offline exe runs with
+       no network. Versions pinned at vendor time (2026-06-06):
+         lucide 1.17.0 (ISC)  — icon <i data-lucide> → <svg> replacer
+         marked 18.0.5 (MIT)  — Markdown → HTML for the product preview
+         DOMPurify 3.4.8 (Apache-2.0 OR MPL-2.0) — sanitizes that HTML
+                                (preview source = parsed docs, an external boundary)
+       LICENSE texts + provenance: vendor/NOTICE.md.
+       app.js calls window.lucide.createIcons() / window.marked.parse /
+       window.DOMPurify.sanitize — these globals are what the UMD builds expose. -->
+  <script src="vendor/lucide.min.js"></script>
+  <script src="vendor/marked.umd.js"></script>
+  <script src="vendor/purify.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -173,6 +173,22 @@
   width: 100%;
   padding: var(--sp-3) 0;
   border-bottom: 1px solid var(--line);
+  /* Staggered entrance — rows ease in one after another (opacity + tiny rise,
+     transform/opacity only = 60fps). Rows are JS-generated, so the per-row
+     delay is done with nth-child (no JS change). Beyond the 8th row everything
+     shares the last delay — fine, selections are rarely longer. */
+  animation: file-row-in 0.26s ease both;
+}
+.file-row:nth-child(1) { animation-delay: 0.00s; }
+.file-row:nth-child(2) { animation-delay: 0.03s; }
+.file-row:nth-child(3) { animation-delay: 0.06s; }
+.file-row:nth-child(4) { animation-delay: 0.09s; }
+.file-row:nth-child(5) { animation-delay: 0.12s; }
+.file-row:nth-child(6) { animation-delay: 0.15s; }
+.file-row:nth-child(7) { animation-delay: 0.18s; }
+.file-row:nth-child(n+8) { animation-delay: 0.21s; }
+@keyframes file-row-in {
+  from { opacity: 0; transform: translateY(4px); }
 }
 .file-row:last-child { border-bottom: none; }
 .fr-icon { font-size: 15px; color: var(--ink-3); }
@@ -330,10 +346,12 @@
    "working", not "frozen". Pure transform rotation — no reflow, 60fps-safe. */
 @keyframes pr-spin { to { transform: rotate(360deg); } }
 .p-row.is-active  .pr-icon { animation: pr-spin 1s linear infinite; }
-/* Honor reduced-motion: drop the spin, keep the accent color so the active
-   row stays visually distinct. */
+/* Honor reduced-motion: drop the spin (keep accent color so the active row
+   stays distinct), and drop the screen-fade + file-row stagger entrances. */
 @media (prefers-reduced-motion: reduce) {
   .p-row.is-active .pr-icon { animation: none; }
+  .screen.is-active { animation: none; }
+  .file-row { animation: none; }
 }
 .p-row.is-done    .pr-info { color: var(--ink-3); }
 .p-row.is-cached  .pr-info { color: var(--ink-3); }

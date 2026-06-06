@@ -390,6 +390,23 @@ def inspect_single(file_path: Path, config: dict[str, Any] | None = None) -> dic
     else:
         info["pages"] = None
 
+    # Page cap (parsing.max_pages): when set, only the first N pages are
+    # parsed at run time, so the cost preview must reflect N, not the full
+    # count. Cap the effective `pages` here — before cost estimation — and
+    # keep the original under `total_pages` so the UI can show "30 / 300".
+    # Only applies to paged formats that reported a real count.
+    max_pages = get_nested(config, "parsing.max_pages", None)
+    full_pages = info.get("pages")
+    if (
+        max_pages is not None
+        and int(max_pages) > 0
+        and isinstance(full_pages, int)
+        and full_pages > int(max_pages)
+    ):
+        info["total_pages"] = full_pages
+        info["pages"] = int(max_pages)
+        info["pages_capped"] = True
+
     # Cost estimation: cheap lookup based on page count + Vision model price.
     # Lazy import so inspect.py stays self-contained for callers that only
     # want size/pages without paying the safety import.
