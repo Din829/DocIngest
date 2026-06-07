@@ -48,6 +48,19 @@ import logging
 _pipeline_logger = logging.getLogger(__name__)
 
 
+class VisionSystemicFailure(Exception):
+    """Raised by _enrich_with_vision when EVERY Vision page call failed AND the
+    failed pages were ones whose content depended on Vision (scanned/garbled).
+
+    This is the fail-loud half of the single-page-vs-systemic distinction: a
+    single page failing keeps its Docling fallback silently (ordinary, handled
+    inside the per-page except); a TOTAL failure on content-critical pages must
+    not be swallowed, or the run produces a "successful" but empty knowledge
+    base. Caught at the Phase-1.5 call site in process_single_file, which turns
+    it into a per-file failure (success=False, error_type="vision_systemic_failure")
+    so one bad file is reported without crashing the rest of the run."""
+
+
 def _detect_encrypted_reason(file_path) -> str | None:
     """Thin wrapper around utils.encryption.detect_encrypted — lazy-imported so
     the util loads only when a parse has failed, and fully isolated so a buggy
@@ -82,6 +95,10 @@ class FileResult:
     #   "encrypted"      parse failed AND the file is password-protected
     #                    (PDF: definite; OOXML: encrypted-or-corrupt). The
     #                    `error` message is a human-readable, actionable hint.
+    #   "vision_systemic_failure"  every Vision page call failed AND the failed
+    #                    pages depended on Vision for content (scanned/garbled),
+    #                    so the output would be empty/garbled. Controlled by
+    #                    parsing.vision.on_systemic_failure (error/warn/ignore).
     # Reserved for future use (consumers may match defensively, but the
     # pipeline does not emit these today):
     #   "chunk_error"    reserved — chunker failures currently surface as parse_error
@@ -1462,6 +1479,67 @@ def _has_latin_cipher_garble(text: str, triage_cfg: dict[str, Any]) -> bool:
     return vowels < max_vowel_ratio * letters
 
 
+def _is_vision_critical_page(
+    page_text: str,
+    triage_cfg: dict[str, Any],
+    sysf_cfg: dict[str, Any],
+) -> bool:
+    """Is this a page whose CONTENT depends on Vision succeeding?
+
+    Used only by the systemic-failure check at the end of _enrich_with_vision:
+    when EVERY Vision page failed, we look at the failed pages' Docling text to
+    decide whether the failure actually cost us content (fail loud) or merely
+    cost a visual supplement on top of usable Docling text (stay silent).
+
+    A failed page is "critical" iff its Docling text is either:
+      (a) Empty of meaning — once the structural placeholders Docling emits for
+          image-only pages ("<!-- image -->", "<!-- pagebreak -->") and all
+          whitespace are stripped, fewer than `min_meaningful_chars` real
+          characters remain. This is the scanned-document case: Docling
+          extracted nothing, Vision was the ONLY content source, and it failed.
+          (NB: a true scanned page's text is "<!-- image -->", NOT "" — judging
+          by len()==0 alone would miss it, which is why we strip placeholders.)
+      (b) Garbled — the Docling text tripped one of the existing garble signals
+          (CID-mapping "glyph<" failure, a high U+FFFD ratio, a mixed-script
+          CJK mismap, or a Latin substitution-cipher CMap break). Vision was
+          enriching specifically to REPAIR this broken text; losing it means the
+          page is left as unreadable garble.
+
+    A page whose Docling text is clean and non-trivial is NOT critical: Vision
+    there was only adding a visual supplement, so even a total Vision failure
+    leaves the page's real content intact (handled as ordinary fallback).
+
+    Thresholds: min_meaningful_chars from sysf_cfg (parsing.vision.systemic_failure);
+    the garble ratio/helpers from triage_cfg — the SAME ones triage already uses,
+    so "what counts as garble" stays defined in exactly one place.
+    """
+    text = page_text or ""
+
+    # (a) Meaningless-after-placeholder-strip → empty content page (scanned).
+    min_meaningful = int(sysf_cfg.get("min_meaningful_chars", 10))
+    stripped = (
+        text.replace("<!-- image -->", "")
+        .replace("<!-- pagebreak -->", "")
+        .strip()
+    )
+    if len(stripped) < min_meaningful:
+        return True
+
+    # (b) Garble — reuse the exact signals triage uses, so the definition of
+    # "broken text Vision was meant to repair" lives in one place.
+    if "glyph<" in text or "glyph&lt;" in text:
+        return True
+    max_fffd = float(triage_cfg.get("max_replacement_ratio", 0.05))
+    if len(stripped) > 0 and stripped.count("�") / len(stripped) > max_fffd:
+        return True
+    if _has_mixed_script_anomaly(stripped, triage_cfg):
+        return True
+    if _has_latin_cipher_garble(stripped, triage_cfg):
+        return True
+
+    return False
+
+
 def _is_empty_supplement(text: str) -> bool:
     """In supplement mode, Vision returns "(no additional visual content)" when
     Docling already captured the page. Detect that sentinel (tolerant of minor
@@ -1485,6 +1563,22 @@ def _enrich_with_vision(
     Optional triage (parsing.vision.triage.enabled) skips pages that are
     purely text with no visual elements — saving API cost without losing info.
     Modifies parse_result.markdown in-place.
+
+    Single-page failures stay silent (step 3): the page keeps its Docling text,
+    which is the right call when Docling already had the content. But a SYSTEMIC
+    failure — EVERY sent page failed AND the failed pages were content-critical
+    (scanned-empty or garbled, see _is_vision_critical_page) — would otherwise
+    produce a "successful" but empty/garbled knowledge base. After the per-page
+    loop, a systemic-failure check (config parsing.vision.on_systemic_failure)
+    decides what to do:
+      - error (default): raise VisionSystemicFailure (caught at the Phase-1.5
+        call site → the file is marked failed, the rest of the run continues).
+      - warn: log at ERROR level, do not fail the file.
+      - ignore: legacy behaviour (stay silent).
+    The described/failed/critical_failed tally is written into
+    parse_result.metadata["vision_triage"] so run_log / quality_report can read
+    it. None of this alters the per-page fallback — failed pages still keep
+    their Docling text regardless of the systemic decision.
     """
     import logging
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1595,6 +1689,16 @@ def _enrich_with_vision(
     results: dict[int, str] = {}  # page_index → vision result text
     described = 0
     failed = 0
+    # Docling text of pages that FAILED Vision — kept so the systemic-failure
+    # check at the end can ask _is_vision_critical_page whether the failure
+    # actually cost content (scanned/garbled pages) or just a visual supplement.
+    # Only populated on the failure path; success path never touches it.
+    failed_page_texts: list[str] = []
+    # First real error string seen on any failed page — surfaced in the
+    # systemic-failure message so the user sees "API key invalid" etc. rather
+    # than just a count. A 1-element list so the nested _call_vision closure can
+    # write to it without a `nonlocal` declaration.
+    _vision_last_error: list[str] = []
 
     # ------------------------------------------------------------------
     # Batched multi-image branch — for xlsx whose single sheet renders to
@@ -1807,10 +1911,19 @@ def _enrich_with_vision(
                 )
             except TimeoutError as e:
                 logger.warning(f"Vision timed out for page {page_data.page_no}: {e}")
+                if not _vision_last_error:
+                    _vision_last_error.append(f"timeout: {e}")
                 return idx, None
             except Exception as e:
                 logger.warning(f"Vision failed for page {page_data.page_no}: {e}")
+                if not _vision_last_error:
+                    _vision_last_error.append(f"{type(e).__name__}: {e}")
                 return idx, None
+
+        # idx → that page's Docling text, so a failed page can be judged
+        # critical-or-not by the systemic-failure check below. Built from
+        # vision_tasks (the same (idx, page_data) pairs submitted as futures).
+        _idx_to_text = {idx: pd.text for idx, pd in vision_tasks}
 
         with ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = {
@@ -1829,6 +1942,10 @@ def _enrich_with_vision(
                     described += 1
                 else:
                     failed += 1
+                    # Record this page's Docling text for the systemic-failure
+                    # check. Does NOT alter the fallback — the page still keeps
+                    # its Docling text as before; we only remember it failed.
+                    failed_page_texts.append(_idx_to_text.get(idx, ""))
 
     # Inject results into markdown sections.
     # Two modes depending on whether the source has pagebreak markers:
@@ -1926,6 +2043,65 @@ def _enrich_with_vision(
             "model": vision_model,
             "pages_enriched": pages_enriched,
         })
+
+    # ------------------------------------------------------------------
+    # Systemic-failure check — distinguish "all Vision failed and it cost us
+    # real content" (fail loud) from "a page failed but Docling already had the
+    # text" (ordinary fallback, already handled per-page above). This NEVER
+    # touches the per-page fallback: every failed page still kept its Docling
+    # text. It only decides whether to ALSO surface the total failure.
+    #
+    # Two signals must BOTH hold to act:
+    #   A (scale):     described == 0 and failed > 0  — every sent page failed.
+    #   B (criticality): >= min_critical_pages of those failed pages were
+    #                    content-critical (scanned-empty or garbled — see
+    #                    _is_vision_critical_page). Pages whose Docling text was
+    #                    clean (Vision was only supplementing visuals) do NOT
+    #                    count, so a clean text PDF whose Vision happens to fail
+    #                    stays successful.
+    # ------------------------------------------------------------------
+    sysf_cfg = get_nested(config, "parsing.vision.systemic_failure", {}) or {}
+    if not isinstance(sysf_cfg, dict):
+        sysf_cfg = {}
+    critical_failed = sum(
+        1 for t in failed_page_texts
+        if _is_vision_critical_page(t, triage_cfg, sysf_cfg)
+    )
+    # Persist the failure tally alongside the triage tally so run_log /
+    # quality_report can read it (FileResult.vision_triage keeps only int
+    # values, so these three ints carry through). Previously described/failed
+    # were log-only and never reached disk.
+    parse_result.metadata.setdefault("vision_triage", {}).update({
+        "described": described,
+        "failed": failed,
+        "critical_failed": critical_failed,
+    })
+
+    on_systemic = str(
+        get_nested(config, "parsing.vision.on_systemic_failure", "error")
+    ).lower()
+    min_critical = int(sysf_cfg.get("min_critical_pages", 1))
+
+    systemic = (
+        described == 0
+        and failed > 0
+        and critical_failed >= min_critical
+        and on_systemic != "ignore"
+    )
+    if systemic:
+        first_err = _vision_last_error[0] if _vision_last_error else "unknown"
+        msg = (
+            f"Systemic Vision failure: {failed} page(s) sent, 0 described, "
+            f"{critical_failed} content-critical page(s) have NO usable "
+            f"Docling text and depended on Vision (scanned / garbled). The "
+            f"knowledge base for this file would be empty/garbled. "
+            f"First error: {first_err}"
+        )
+        if on_systemic == "warn":
+            # Do not fail the file; just make the failure impossible to miss.
+            logger.error("%s — continuing (on_systemic_failure=warn)", msg)
+        else:  # "error" (default) and any unrecognised value → fail loud
+            raise VisionSystemicFailure(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -2435,7 +2611,26 @@ def process_single_file(
 
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):
-        _enrich_with_vision(parse_result, config)
+        try:
+            _enrich_with_vision(parse_result, config)
+        except VisionSystemicFailure as e:
+            # Every Vision page failed AND those pages depended on Vision for
+            # their content (scanned / garbled). Fail THIS file — don't write a
+            # silently-empty knowledge base — but return cleanly so the rest of
+            # the run keeps processing other files (the run loop has no
+            # try/except around process_single_file, so re-raising would crash
+            # the whole run). Mirrors the parse-failure early-return above.
+            result.success = False
+            result.error = str(e)
+            result.error_type = "vision_systemic_failure"
+            # Carry out the triage/failure tally even on this failure path so
+            # run_log still shows what happened.
+            vt = parse_result.metadata.get("vision_triage")
+            if isinstance(vt, dict):
+                result.vision_triage = {
+                    k: int(v) for k, v in vt.items() if isinstance(v, int)
+                }
+            return result, []
 
     # --- Phase 1.6: Pre-write hooks (post-Vision, pre-frontmatter) ---
     # Hooks that enrich metadata without touching Vision (e.g. exiftool

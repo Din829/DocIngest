@@ -225,6 +225,35 @@ parsing:
                               # 200+ = diminishing returns, risks 4MP cap downscale
                               # Gemini charges per-image regardless of DPI,
                               # OpenAI/Claude charge by tile/pixel count.
+    # Systemic-failure handling: what to do when EVERY Vision page call for a
+    # file fails AND the failed pages are "content-critical" — i.e. pages that
+    # depend on Vision for their content (scanned docs whose Docling text is
+    # empty, or garbled pages Vision was meant to repair). This is deliberately
+    # NARROWER than single-page failure: an isolated page failing always keeps
+    # its Docling text as fallback and is NEVER controlled by this knob.
+    # Background: when an API key expires / quota is exhausted / all models are
+    # down, the old behaviour silently reported success and produced an empty
+    # knowledge base (measured: scanned PDF + total Vision failure → md left as
+    # just "<!-- image -->", quality_score 1.0, exit code 0). This makes that
+    # case fail loud instead.
+    on_systemic_failure: error  # error  = raise + mark THIS file failed (default,
+                                #          fail loud); the run keeps processing
+                                #          other files.
+                                # warn   = do not fail the file, but log at ERROR
+                                #          level so the failure is impossible to miss.
+                                # ignore = legacy behaviour (stay silent) — a
+                                #          backward-compat escape hatch.
+    systemic_failure:
+      min_critical_pages: 1     # Trigger only when at least this many FAILED
+                                # pages were content-critical (default 1: a
+                                # single page left with no content is enough).
+      min_meaningful_chars: 10  # A failed page counts as "empty content" when,
+                                # after stripping "<!-- image -->" /
+                                # "<!-- pagebreak -->" placeholders and
+                                # whitespace from its Docling text, fewer than
+                                # this many real characters remain. (A scanned
+                                # page's Docling text is "<!-- image -->", not
+                                # "", so a bare len()==0 test would miss it.)
     triage:
       enabled: true             # true = skip pages that are purely text (saves API cost)
                                 # false = all pages sent to Vision (maximum quality, higher cost)
