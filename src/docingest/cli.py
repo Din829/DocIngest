@@ -156,11 +156,10 @@ def main(
         None,
         "--outputs",
         help=(
-            "Comma-separated whitelist of artefacts to KEEP on disk, e.g. "
-            "'markdown,chunks,index'. Valid: markdown, chunks, index, "
-            "assets, knowledge_map, quality_report, run_log. Excluded "
-            "artefacts are not produced (or produced-then-deleted for "
-            "runtime deps). Wins over --purpose if both given."
+            "Comma-separated whitelist of artefacts to keep, e.g. "
+            "'markdown,chunks,index'. One or more of: markdown, chunks, "
+            "index, assets, knowledge_map, quality_report, run_log. "
+            "Anything omitted is not written. Overrides --purpose."
         ),
     ),
     strategy: Optional[str] = typer.Option(
@@ -168,10 +167,24 @@ def main(
         "--strategy",
         help="Override chunking strategy: auto, heading, recursive, slide, sheet.",
     ),
+    max_pages: Optional[int] = typer.Option(
+        None,
+        "--max-pages",
+        help=(
+            "Parse only the first N pages of paged inputs (PDF / PPTX / DOCX). "
+            "Saves layout + Vision work on big files, and the cost preview "
+            "reflects N. Omit (default) to parse every page. NOTE: this caps "
+            "PARSING; --max-pages differs from the Vision-only page cap "
+            "(parsing.vision.max_pages)."
+        ),
+    ),
     parallel: Optional[int] = typer.Option(
         None,
         "--parallel",
-        help="Number of files to process in parallel.",
+        help=(
+            "Worker count for Vision API calls and ASR segmentation "
+            "(per-file concurrency; file-level parallelism is not implemented)."
+        ),
     ),
     force: bool = typer.Option(
         False,
@@ -192,10 +205,8 @@ def main(
         False,
         "--json",
         help=(
-            "Emit the run summary as JSON to stdout (for agent / subprocess "
-            "consumption). Banner, errors and progress info still go to "
-            "stderr. Exit code is unchanged: 0 success, 1 failures, 2 "
-            "safety abort."
+            "Emit the run summary as JSON to stdout; banner / errors / "
+            "progress stay on stderr. Exit code: 0 ok, 1 failures, 2 safety abort."
         ),
     ),
     verbose: bool = typer.Option(
@@ -203,14 +214,10 @@ def main(
         "--verbose",
         "-v",
         help=(
-            "Stream INFO-level docingest pipeline progress to stderr (Vision "
-            "batched calls, per-batch describe, page-image generation, etc.). "
-            "litellm / httpx / urllib3 stay at WARNING regardless — those "
-            "tools' INFO logs are pure noise (one 'Wrapper: Completed Call' "
-            "per LLM call). Independent of --json: stdout JSON output stays "
-            "clean. A full INFO-level run.log file is written to <output>/ "
-            "every run regardless of -v, so post-mortem analysis works "
-            "without re-running with -v."
+            "Stream INFO-level pipeline progress to stderr (Vision calls, "
+            "page-image generation, etc.); without it the console stays quiet. "
+            "A full INFO-level run.log is always written to <output>/ "
+            "regardless, so this only controls live console output."
         ),
     ),
 ) -> None:
@@ -302,6 +309,9 @@ def main(
 
     if strategy:
         cli_overrides.setdefault("chunking", {})["strategy"] = strategy
+
+    if max_pages is not None:
+        cli_overrides.setdefault("parsing", {})["max_pages"] = max_pages
 
     if parallel:
         cli_overrides.setdefault("performance", {})["parallel_files"] = parallel

@@ -33,6 +33,14 @@ DocIngest 用 docling 解析**多页 PDF**时，docling 底层的 `docling-parse
 不是机器内存不够（**实测 RSS 才 2.7GB 就崩，机器有 31GB 空闲**），是 docling-parse
 某版本的**回归 bug**。
 
+> **两种症状是同一个 bug（2026-06-06 实测定性）**：页数少时报 `std::bad_alloc`（C++ 层局部崩）；
+> 页数多时（实测 100 页）升级成 Python `MemoryError`（进程内存被 docling-parse 累积占满，
+> 连 4MB 都分配不出）。**铁证**：同样 100 页、关 vision/ocr、同机器，**换 PyPdfium2 backend
+> 单次跑 RSS 峰值才 2.3GB、0 报错全成**——证明内存爆 100% 是 docling-parse 不释放内存，
+> 不是模型/页图累积、更不是机器内存不够。**含义：IBM 修好 docling-parse 内存管理后，
+> bad_alloc 和 MemoryError 会一起消失，回单次处理自然好——MemoryError 不用单独处理。**
+> （分批兜底对两种症状都有效，因为根治手段都是"重建 converter 释放内存"。出问题再细查。）
+
 本问题有**两层**，**两层都已处理**（绕过，非根治）：
 - **第一层：假绿灯（已修 ✅）** —— OOM 丢页后 docling 报 `PARTIAL_SUCCESS`，但 DocIngest
   以前没检查，当成功处理 → 产出"悄悄少了几十页"的知识库。**已修复**（status 检测 + fail loud）。
@@ -312,6 +320,12 @@ C++ 内存。** 这是仅有的"治 OOM + 保精度 + 不改库"方案。
 - **关 vision 时分批会误触发 LibreOffice 全量转换（~226s/批）**——真实场景 vision 开（默认）
   不会，但 vision-off 的库用户（如 Mplat）走分批会很慢。只在"vision关+PDF崩+走分批"三重边界发生。
 - 跨页表格分批可能切断（WEO 表单页完整不受影响，社区已知局限）。
+- **vision 结果 overflow → 边界页 title_path 错标**：分批拼接让 section 数和 vision 页索引
+  差 1，触发 `pipeline.py:1668` 的 overflow 分支（warning 文本是为 xlsx 写的，PDF 分批也命中）。
+  实测 100 页 IEA：**仅 1/183 chunk 受影响（0.5%）**——第 98 页内容被追加到上一段，继承了上一段
+  的 title_path（实标 `Figure 2.8`、实际是 `Figure 2.9 / 2.2.3`）。**内容不丢（Figure 2.9、
+  2.2.3 节都在、vision 转写经页图核对准确），只是这一段 title_path 标签错**，且带 `(overflow)`
+  标记可被下游过滤。单次处理不会有此 overflow——又一条"回单次后自然消失"的临时代价。
 
 ---
 

@@ -161,6 +161,10 @@ Options:
 -c, --config PATH    Project config YAML
 --strategy TEXT      Override chunking strategy: auto | heading | recursive | slide | sheet
                      (auto picks heading/recursive/slide/sheet/timestamp/whole by file format)
+--max-pages INTEGER  Parse only the first N pages of paged inputs (PDF/PPTX/DOCX).
+                     Caps the whole parse (layout + Vision + chunking), and the
+                     cost preview reflects N. Distinct from parsing.vision.max_pages,
+                     which parses every page but only Vision-enriches the first N.
 --no-chunks          Only output Markdown, skip chunks.jsonl
 --parallel INTEGER   Worker count for Vision API calls and ASR segmentation
                      (file-level parallelism is not yet implemented)
