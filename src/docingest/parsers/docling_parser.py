@@ -1056,6 +1056,21 @@ class DoclingParser(BaseParser):
             except Exception as e:
                 logger.debug(f"fitz per-page image count failed: {e}")
 
+        # Optional: detect cross-page "furniture" pictures (repeating small
+        # logos / headers / footers) so triage can skip a page whose ONLY
+        # visuals are furniture. Default OFF (opt-in) — when off this returns
+        # an empty map and furniture_pic_count stays 0, so behaviour is
+        # unchanged. PDF only (the helper short-circuits other formats).
+        furniture_per_page: dict[int, int] = {}
+        furn_cfg = get_nested(self.config, "parsing.vision.triage.furniture_exempt", {}) or {}
+        if furn_cfg.get("enabled", False):
+            furniture_per_page = _detect_furniture_pictures(
+                file_path,
+                repeat_ratio=float(furn_cfg.get("repeat_page_ratio", 0.6)),
+                max_area_ratio=float(furn_cfg.get("max_area_ratio_pct", 50.0)),
+                min_doc_pages=int(furn_cfg.get("min_doc_pages", 3)),
+            )
+
         for page_no, page in doc.pages.items():
             # Extract per-page text via Docling
             page_text = ""
@@ -1087,6 +1102,7 @@ class DoclingParser(BaseParser):
                 text=page_text,
                 image_path=image_path,
                 num_pictures=pic_per_page.get(page_no, 0),
+                furniture_pic_count=furniture_per_page.get(page_no, 0),
             ))
 
         # Extract embedded images from xlsx zip (xl/media/)
@@ -1904,3 +1920,110 @@ def _render_xlsx_sheet_to_markdown(
             lines.append(f"- <!-- image: {fname} -->")
 
     return lines
+
+
+def _detect_furniture_pictures(
+    file_path: Path,
+    *,
+    repeat_ratio: float,
+    max_area_ratio: float,
+    min_doc_pages: int,
+) -> dict[int, int]:
+    """
+    PDF only: count, per page, how many embedded images are cross-page
+    "furniture" — repeating small logos / headers / footers / watermarks
+    that carry no per-page information.
+
+    An image is furniture iff ALL hold (deliberately strict — false
+    furniture = lost content, far worse than an extra Vision call):
+      * it appears on >= ``repeat_ratio`` of the document's pages, matched
+        by IMAGE CONTENT HASH (NOT xref — the same logo is often re-embedded
+        under a fresh xref on every page, so xref-based matching misses it;
+        verified on a real 10-page deck where one logo had 10 distinct xrefs).
+      * its area is < ``max_area_ratio`` of the page (a full-page repeating
+        image is a SCANNED PAGE, not furniture — must still go to Vision).
+      * the document has >= ``min_doc_pages`` pages (on a 2-page file a logo
+        trivially "repeats on 100% of pages"; too little signal to risk it).
+
+    Returns ``{page_no: furniture_count}`` (1-based pages). Empty dict for
+    non-PDF, too-short docs, or any failure (fail safe → no exemption →
+    everything still goes to Vision). Pure function: opens its own fitz
+    handle, mutates nothing.
+    """
+    if file_path.suffix.lower() != ".pdf":
+        return {}
+
+    try:
+        import fitz
+        import hashlib
+        from collections import defaultdict
+    except Exception as e:
+        logger.debug(f"furniture detection deps unavailable: {e}")
+        return {}
+
+    try:
+        doc = fitz.open(file_path)
+    except Exception as e:
+        logger.debug(f"furniture detection: cannot open {file_path.name}: {e}")
+        return {}
+
+    try:
+        total_pages = len(doc)
+        if total_pages < int(min_doc_pages):
+            return {}
+
+        # Pass 1: for each image (by content hash) record which pages it is on
+        # and its largest area ratio seen. Also remember, per page, the hash of
+        # every image so pass 2 can count furniture per page.
+        hash_pages: dict[str, set[int]] = defaultdict(set)
+        hash_max_area: dict[str, float] = {}
+        page_hashes: dict[int, list[str]] = defaultdict(list)
+
+        for page_index in range(total_pages):
+            page = doc.load_page(page_index)
+            page_w = page.rect.width
+            page_h = page.rect.height
+            page_area = page_w * page_h
+            for img in page.get_images():
+                xref = img[0]
+                try:
+                    data = doc.extract_image(xref)
+                    digest = hashlib.md5(data["image"]).hexdigest()
+                except Exception:
+                    continue
+                # An image can be placed multiple times on a page; take the
+                # largest placement's area for the "is it small" test.
+                area_ratio = 0.0
+                try:
+                    for rect in page.get_image_rects(xref):
+                        if page_area:
+                            area_ratio = max(
+                                area_ratio,
+                                (rect.width * rect.height) / page_area * 100.0,
+                            )
+                except Exception:
+                    pass
+                page_no = page_index + 1
+                hash_pages[digest].add(page_no)
+                hash_max_area[digest] = max(hash_max_area.get(digest, 0.0), area_ratio)
+                page_hashes[page_no].append(digest)
+
+        # Decide which hashes are furniture.
+        furniture: set[str] = set()
+        for digest, pages in hash_pages.items():
+            occ_ratio = len(pages) / total_pages
+            if occ_ratio >= float(repeat_ratio) and hash_max_area[digest] < float(max_area_ratio):
+                furniture.add(digest)
+
+        # Pass 2: per page, how many of its images are furniture.
+        result: dict[int, int] = {}
+        for page_no, hashes in page_hashes.items():
+            count = sum(1 for h in hashes if h in furniture)
+            if count:
+                result[page_no] = count
+        return result
+    except Exception as e:
+        logger.debug(f"furniture detection failed for {file_path.name}: {e}")
+        return {}
+    finally:
+        doc.close()

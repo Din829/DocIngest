@@ -264,6 +264,32 @@ parsing:
           en: [Latin]
           ko: [Latin, Hangul, Han]
 
+      # Furniture-picture exemption (PDF only, default OFF / opt-in).
+      # A text page whose ONLY images are cross-page "furniture" — a logo /
+      # header / footer / watermark that repeats on most pages — carries no
+      # per-page visual information. Without this, a single repeating logo
+      # forces EVERY page of a "logo + body text" document (common in
+      # corporate reports / contracts) to Vision. Turn this on to skip those
+      # pages. STRICT by design — any of these keeps a page on the Vision path:
+      # a non-furniture picture (chart / stamp), ANY table markup, low text,
+      # garble. A single-page image is never furniture (cross-page repetition
+      # is required), so body text disguised as an image is still sent.
+      # Off by default because it is a cost optimisation, not a correctness
+      # fix — enable it only after confirming your corpus has repeating
+      # decorative furniture worth skipping.
+      furniture_exempt:
+        enabled: false            # true = skip text pages whose only images are furniture
+        repeat_page_ratio: 0.6    # an image must appear on >= this fraction of pages to
+                                  # count as furniture (0.6 = 60%). Higher = stricter.
+                                  # Uses image CONTENT HASH, not xref (same logo is often
+                                  # re-embedded under a new xref per page).
+        max_area_ratio_pct: 50.0  # images larger than this % of the page are NEVER
+                                  # furniture even if they repeat — a full-page repeating
+                                  # image is a SCANNED PAGE, which must go to Vision.
+        min_doc_pages: 3          # documents shorter than this don't use the exemption
+                                  # (on a 2-page file a logo trivially "repeats on 100%
+                                  # of pages" — too little signal to risk skipping).
+
     # Batched multi-image Vision call — for xlsx whose single sheet renders
     # to multiple PDF pages (long 方眼紙 / cross-page tables). Independent
     # experiments (see notes in pipeline._enrich_with_vision) showed that

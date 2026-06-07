@@ -32,6 +32,14 @@ class PageData:
                            # image page is never skipped for Vision just because
                            # Docling's OCR is off (no garble to trip the
                            # garble-detection layers). Default 0.
+    furniture_pic_count: int = 0  # How many of this page's pictures are
+                           # cross-page "furniture" (repeating small logos /
+                           # headers / footers / watermarks). Computed for PDF
+                           # only, when parsing.vision.triage.furniture_exempt
+                           # is on; 0 otherwise. Used by triage to optionally
+                           # exempt a page whose ONLY visuals are furniture —
+                           # never exceeds num_pictures (a furniture pic is a
+                           # picture). Default 0 (no furniture detected / off).
 
 
 @dataclass

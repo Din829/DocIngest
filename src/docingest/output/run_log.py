@@ -144,6 +144,11 @@ def _build_section(
     llm_phrase = _format_llm_summary(pipeline_result.token_usage)
     if llm_phrase:
         tail_bits.append(llm_phrase)
+    vision_phrase = _format_vision_triage(
+        getattr(pipeline_result, "vision_triage", {}) or {}
+    )
+    if vision_phrase:
+        tail_bits.append(vision_phrase)
     tail = " | ".join(tail_bits)
 
     lines = [
@@ -317,3 +322,26 @@ def _format_llm_summary(token_usage: dict) -> str:
     total = token_usage.get("total_tokens", 0)
     call_word = "call" if calls == 1 else "calls"
     return f"LLM: {calls} {call_word} / {total:,} tok"
+
+
+def _format_vision_triage(vt: dict) -> str:
+    """
+    Render the Vision triage tail, e.g.
+    'Vision: 12/50 pages sent, 38 skipped (7 furniture)'.
+
+    Shows at a glance how Vision cost broke down: of the pages that carried
+    pictures, how many actually went to Vision vs. were skipped by triage, and
+    how many of those skips were furniture (logo/header — the savings from
+    parsing.vision.triage.furniture_exempt). Returns '' when no paged file ran
+    Vision triage (nothing to report). The furniture clause is omitted when 0.
+    """
+    if not vt:
+        return ""
+    sent = vt.get("sent_to_vision", 0)
+    skipped = vt.get("triage_skipped", 0)
+    pages = vt.get("pages_with_pictures", 0)
+    if not (sent or skipped or pages):
+        return ""
+    furn = vt.get("furniture_skipped", 0)
+    furn_clause = f" ({furn} furniture)" if furn else ""
+    return f"Vision: {sent}/{pages} pages sent, {skipped} skipped{furn_clause}"

@@ -114,6 +114,11 @@ class FileResult:
     # completeness compromise (page cap hit, OCR engine downgraded, ...).
     # run_pipeline aggregates these into PipelineResult.warnings.
     warnings: list[str] = field(default_factory=list)
+    # Per-file Vision triage tally — collected from
+    # parse_result.metadata["vision_triage"] (set by _enrich_with_vision).
+    # run_pipeline sums these into PipelineResult.vision_triage. Empty for
+    # cached / non-paged / Vision-disabled files. Keys mirror that dict.
+    vision_triage: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -141,6 +146,15 @@ class PipelineResult:
     # Keys: total_prompt_tokens, total_completion_tokens, total_tokens,
     #       total_calls, total_cache_hits, by_model.
     token_usage: dict[str, Any] = field(default_factory=dict)
+    # Corpus-wide Vision triage tally (summed across all processed files), so a
+    # run report shows at a glance how Vision cost broke down: how many pages
+    # carried pictures, how many actually went to Vision, how many were skipped
+    # by triage, and how many of those skips were furniture (logo/header) — the
+    # last is also the savings figure for parsing.vision.triage.furniture_exempt.
+    # Keys: pages_with_pictures, sent_to_vision, triage_skipped,
+    #       furniture_skipped, cap_skipped, no_image_pages. Empty when Vision
+    # is disabled or no paged files were processed.
+    vision_triage: dict[str, int] = field(default_factory=dict)
     # Phase 0 safety check result (populated when safety.enabled and mode
     # != "off"). Keys: mode, violations (list of {file, reasons}), summary
     # ({total_files, total_pages, total_est_cost_usd}), acknowledged (bool),
@@ -1136,6 +1150,39 @@ def _should_skip_vision(
     text = page_data.text
     stripped = text.strip()
 
+    # Furniture exemption (opt-in, PDF only, default OFF). A page whose ONLY
+    # pictures are cross-page furniture (repeating small logos / headers /
+    # footers, detected in docling_parser._detect_furniture_pictures) carries
+    # no per-page visual information — sending it to Vision just to describe a
+    # logo is wasted cost. We exempt such a page from the two "has a picture →
+    # Vision" gates below, BUT ONLY when it is otherwise a clean text page:
+    #   * EVERY picture on the page is furniture (num_pictures == furniture
+    #     count) — a single non-furniture picture (a chart, a stamp, even a
+    #     small one) keeps the page on the Vision path.
+    #   * NO table markup at all — not even one `|` row. We do NOT use the
+    #     table_line_threshold here: a small table (below threshold) would
+    #     normally rely on Docling's own text, but once we stop sending the
+    #     page to Vision we must be stricter. Any table hint → keep on Vision.
+    #   * The remaining triage layers (text length, garble, replacement ratio,
+    #     script consistency) still run below and can independently veto the
+    #     skip. Furniture exemption only neutralises the picture signal; it
+    #     never forces a skip on its own.
+    # Single-page images are never furniture (the detector requires cross-page
+    # repetition), so a page that disguises body text as an image is safe —
+    # that image is single-page → not furniture → page still goes to Vision.
+    num_pics = getattr(page_data, "num_pictures", 0)
+    furn_pics = getattr(page_data, "furniture_pic_count", 0)
+    has_any_table_markup = any(
+        "|" in line and line.strip().startswith("|")
+        for line in stripped.split("\n")
+    )
+    furniture_only_page = (
+        num_pics > 0
+        and furn_pics >= num_pics
+        and not has_any_table_markup
+        and "<!-- image -->" not in text  # an explicit non-furniture image marker
+    )
+
     # Has image/chart markers → Vision needs to describe visual elements
     if "<!-- image -->" in text:
         return False
@@ -1145,7 +1192,8 @@ def _should_skip_vision(
     # OCR-INDEPENDENT image signal: without it, "invisible image pages" — a
     # figure Docling did not render as <!-- image --> and whose ONLY previous
     # trigger was OCR garble — get wrongly skipped once Docling OCR is off.
-    if getattr(page_data, "num_pictures", 0) > 0:
+    # Furniture-only pages are the deliberate exception (see above).
+    if getattr(page_data, "num_pictures", 0) > 0 and not furniture_only_page:
         return False
 
     # Has structured data (e.g. PPTX chart) → Vision describes surrounding visuals
@@ -1373,26 +1421,49 @@ def _enrich_with_vision(
     vision_tasks = []
     no_image = 0
     triage_skipped = 0
+    furniture_skipped = 0   # subset of triage_skipped: pages skipped because
+                            # their ONLY pictures were cross-page furniture
+                            # (logo / header / footer). Counted separately so a
+                            # run report can show how much the furniture
+                            # exemption saved — and so an over-aggressive skip
+                            # is traceable after the fact.
     cap_skipped = 0
+    pages_with_pictures = 0  # pages that carry any picture signal (would have
+                             # triggered Vision pre-triage) — the "trigger" count.
     for i, page_data in enumerate(parse_result.pages):
         if not page_data.image_path:
             no_image += 1
             continue
+        if getattr(page_data, "num_pictures", 0) > 0:
+            pages_with_pictures += 1
         if triage_enabled and _should_skip_vision(
             page_data, structured_per_page, triage_cfg, doc_language
         ):
             triage_skipped += 1
+            # A page is a furniture skip iff it has pictures AND every picture
+            # is furniture (matches _should_skip_vision's furniture_only_page
+            # precondition). Cheap to recompute from PageData fields here — no
+            # change to _should_skip_vision's signature / callers.
+            _npic = getattr(page_data, "num_pictures", 0)
+            _furn = getattr(page_data, "furniture_pic_count", 0)
+            if _npic > 0 and _furn >= _npic:
+                furniture_skipped += 1
             continue
         if max_vision_pages is not None and len(vision_tasks) >= max_vision_pages:
             cap_skipped += 1
             continue
         vision_tasks.append((i, page_data))
 
-    if triage_skipped:
-        logger.info(
-            f"Vision triage: {triage_skipped} page(s) skipped (text-only), "
-            f"{len(vision_tasks)} page(s) sent to Vision"
-        )
+    # One-line, machine-greppable Vision triage summary — always emitted (even
+    # when nothing was skipped) so a run log / -v output shows the full picture
+    # at a glance: how many pages carried visuals, how many actually went to
+    # Vision, how many were skipped, and how many of those skips were furniture.
+    logger.info(
+        f"Vision triage summary: trigger(pages w/ pictures)={pages_with_pictures}, "
+        f"sent_to_vision={len(vision_tasks)}, triage_skipped={triage_skipped} "
+        f"(of which furniture={furniture_skipped}), cap_skipped={cap_skipped}, "
+        f"no_image_pages={no_image}"
+    )
     if cap_skipped:
         logger.warning(
             f"Vision cap: {cap_skipped} page(s) skipped — "
@@ -1400,11 +1471,19 @@ def _enrich_with_vision(
             f"Increase parsing.vision.max_pages or set to null to remove limit."
         )
 
+    # Stash the triage tally on parse_result so downstream (quality report /
+    # run stats) can persist it to disk — a run log line scrolls away, a JSON
+    # field is there when you need to trace "why did page N skip Vision?".
+    parse_result.metadata.setdefault("vision_triage", {}).update({
+        "pages_with_pictures": pages_with_pictures,
+        "sent_to_vision": len(vision_tasks),
+        "triage_skipped": triage_skipped,
+        "furniture_skipped": furniture_skipped,
+        "cap_skipped": cap_skipped,
+        "no_image_pages": no_image,
+    })
+
     if not vision_tasks:
-        logger.info(
-            f"Vision enrichment: 0 pages to process "
-            f"(no_image={no_image}, triage_skipped={triage_skipped})"
-        )
         return
 
     doc_format = parse_result.metadata.get("format")
@@ -2447,6 +2526,11 @@ def process_single_file(
     if isinstance(md_warnings, list):
         result.warnings = [str(w) for w in md_warnings if w]
 
+    # Carry the per-file Vision triage tally out for run_pipeline to sum.
+    vt = parse_result.metadata.get("vision_triage")
+    if isinstance(vt, dict):
+        result.vision_triage = {k: int(v) for k, v in vt.items() if isinstance(v, int)}
+
     return result, chunks
 
 
@@ -3055,6 +3139,15 @@ def run_pipeline(
                     "file": file_path.name,
                     "message": w,
                 })
+
+            # Sum the per-file Vision triage tally into the corpus-wide total.
+            # Cached files carry an empty dict (they didn't re-run Vision), so
+            # this reflects work actually done THIS run — not a stale all-time
+            # total. Same key set across files; missing keys default to 0.
+            for k, v in (file_result.vision_triage or {}).items():
+                pipeline_result.vision_triage[k] = (
+                    pipeline_result.vision_triage.get(k, 0) + int(v)
+                )
 
             if file_result.success:
                 pipeline_result.successful += 1
