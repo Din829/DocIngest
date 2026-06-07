@@ -345,6 +345,39 @@ class DoclingParser(BaseParser):
             # intermittent, so retry the whole convert once before giving up.
             from docling.datamodel.base_models import ConversionStatus
 
+            # PROACTIVE batching: a big PDF would only fail the whole-doc parse
+            # below and fall into the reactive fallback anyway, after wasting two
+            # doomed attempts (~300s + memory spike). So when the page count is
+            # over the configured threshold, go straight to batched parsing.
+            # Guarded by _page_range is None (don't recurse when already inside a
+            # batch) and pdf-only. Produces the same seamless single-file result
+            # as a whole-doc parse — invisible downstream.
+            proactive_cfg = get_nested(
+                self.config, "parsing.pdf.oom_batch_fallback.proactive", {}
+            ) or {}
+            if (
+                _page_range is None
+                and file_path.suffix.lower() == ".pdf"
+                and proactive_cfg.get("enabled", False)
+            ):
+                above = int(proactive_cfg.get("above_pages", 50))
+                pages = self._probe_pdf_pages(file_path)
+                if pages is not None and pages > above:
+                    logger.info(
+                        f"Proactive batching for {file_path.name}: {pages} pages "
+                        f"> {above} — splitting up front (skips doomed whole-doc parse)."
+                    )
+                    p_batch = proactive_cfg.get("batch_size")
+                    batched = self._parse_pdf_batched(
+                        file_path,
+                        override_stream,
+                        batch_size=int(p_batch) if p_batch else None,
+                    )
+                    if batched is not None and batched.success:
+                        return batched
+                    # Fall through to the normal whole-doc path if batching
+                    # couldn't help (e.g. page count unreadable mid-run).
+
             result = _do_convert()
             if result.status not in (ConversionStatus.SUCCESS,):
                 logger.warning(
@@ -435,10 +468,23 @@ class DoclingParser(BaseParser):
                 error=f"Docling parse failed: {e}",
             )
 
+    @staticmethod
+    def _probe_pdf_pages(file_path: Path) -> int | None:
+        """Cheap PDF page count via PyMuPDF xref (O(1)). None on any failure —
+        callers fall back to the whole-doc path, so a failed probe never blocks
+        a parse. Shared by proactive-batch sizing and _parse_pdf_batched."""
+        try:
+            import pymupdf
+            with pymupdf.open(str(file_path)) as _d:
+                return len(_d)
+        except Exception:
+            return None
+
     def _parse_pdf_batched(
         self,
         file_path: Path,
         override_stream: BytesIO | None,
+        batch_size: int | None = None,
     ) -> ParseResult | None:
         """
         TEMPORARY WORKAROUND for docling-parse's Windows std::bad_alloc
@@ -485,7 +531,10 @@ class DoclingParser(BaseParser):
         if total <= 0:
             return None
 
-        batch_size = int(get_nested(self.config, "parsing.pdf.oom_batch_fallback.batch_size", 10))
+        # Explicit batch_size (proactive path) wins; otherwise read the
+        # reactive-fallback default from config.
+        if batch_size is None:
+            batch_size = int(get_nested(self.config, "parsing.pdf.oom_batch_fallback.batch_size", 10))
         if batch_size <= 0:
             batch_size = 10
 

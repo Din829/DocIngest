@@ -315,6 +315,15 @@ docingest.ingest("./docs/", output="./kb/", on_progress=on_event)
 
 **Signal handling** — by default DocIngest does NOT install a SIGINT handler when used as a library, so embedding it in a long-running host (web server, daemon) leaves your own Ctrl+C handling intact. The CLI opts in to graceful Ctrl+C (`install_signal_handler=True`); library callers can do the same explicitly when running stand-alone.
 
+**Failure handling** — `ingest()` returns rather than raises, so the caller owns error handling via `result.stats["errors"]` (each entry has `file` / `error` / `error_type`). To avoid the "succeeded, 0 files" trap, failures are **always logged at warning level** even on the library path. Pass `raise_on_failure=True` to instead get a `RuntimeError` whenever any file fails (parse error, timeout, …):
+
+```python
+# Hard-fail on any error instead of inspecting stats yourself
+docingest.ingest("./docs/", output="./kb/", raise_on_failure=True)
+```
+
+**Parse timeout scales with size** — a single flat per-file timeout is wrong at both ends, so the parse budget is sized by page count: `clamp(base_sec + per_page_sec * pages, base_sec, max_sec)` (defaults 120 / 3 / 1800 → a 519-page PDF gets ~1677 s, a 10-page memo ~150 s). Page count is probed cheaply for PDFs; non-PDFs or probe failures fall back to the fixed `parsing.timeout_sec`. Tune or disable under `parsing.dynamic_timeout` in `config/default.yaml`.
+
 **Return value** — `IngestResult` carries the produced artefacts so callers don't have to re-read the output directory:
 
 | Field | Populated when | Shape |

@@ -102,6 +102,8 @@ def generate_report(
             stamps/watermarks, shrunk-down screenshots, handwriting) that
             even a human couldn't recover, and Vision honestly flagged it
             rather than guessing.
+          - score_note: a string copy of the disclaimer above, written into
+            the JSON so downstream readers see it without reading this source.
     """
     if not sources_dir.exists():
         return {
@@ -146,6 +148,23 @@ def generate_report(
         "total_questions": total_questions,
         "total_unreadable": total_unreadable,
         "quality_score": round(score, 3),
+        # Inline disclaimer so anyone reading this JSON later (a human or an
+        # agent) gets the same context the CLI prints at run time, without
+        # having to read the source. The score is a heuristic marker count,
+        # NOT a parse-failure signal — and it deflates on a single large
+        # document (all markers divided by one file), so a low number here
+        # routinely means "the source had illegible bits Vision honestly
+        # flagged", not "the parse went wrong".
+        "score_note": (
+            "Informational only — a heuristic count of Vision uncertainty "
+            "markers ([?] partial, [unreadable] gaps), NOT a parse-failure "
+            "signal. A low score is often the source itself being unreadable "
+            "(watermarks, low-res scans, vertical margin text) that Vision "
+            "honestly flagged rather than guessing; it can also deflate on a "
+            "single large document where every marker is averaged over one "
+            "file. Judge extraction quality by inspecting sources/*.md and "
+            "the 'files'/'samples' below, not by this number alone."
+        ),
         "files": files_with_issues,  # only files with issues; clean files omitted
     }
 

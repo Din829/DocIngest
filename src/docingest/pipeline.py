@@ -97,6 +97,13 @@ class FileResult:
     # index_builder without going through the sources/*.md frontmatter
     # (which only holds small scalars). None when Docling didn't emit any.
     element_boxes: dict[str, Any] | None = None
+    # Per-page PDF dimensions (points) — page_no -> [width, height]. The
+    # sibling of element_boxes (both set together under
+    # include_bounding_boxes). Piped through FileResult the same way so it
+    # reaches index.json, where the visualizer reads it to scale bboxes onto
+    # rendered page images by true page size instead of an assumed DPI.
+    # None when Docling didn't emit any.
+    page_sizes: dict[str, Any] | None = None
     # Lifecycle status for this run — consumed by run_log to render a
     # human-readable timeline. One of: "added" (new file, first time seen),
     # "updated" (cache existed but invalidated), "cached" (hit, reused),
@@ -2108,6 +2115,45 @@ def _postprocess_chunks(
 # Single file processing
 # ---------------------------------------------------------------------------
 
+def _probe_page_count(file_path: Path) -> int | None:
+    """Cheap page-count probe for sizing the parse timeout (PDF only).
+
+    PyMuPDF reads the count from the xref in O(1) (~ms even on 1000-page
+    files). Returns None for non-PDFs or any failure — the caller then falls
+    back to the fixed timeout. Never raises: a failed probe must not block
+    the parse it's only trying to budget.
+    """
+    if file_path.suffix.lower() != ".pdf":
+        return None
+    try:
+        import pymupdf
+        with pymupdf.open(str(file_path)) as doc:
+            return len(doc)
+    except Exception:
+        return None
+
+
+def _resolve_parse_timeout(file_path: Path, config: dict[str, Any]) -> float | None:
+    """Resolve the wall-clock parse timeout for one file.
+
+    With parsing.dynamic_timeout.enabled (default), paged inputs get a budget
+    scaled to their page count: clamp(base + per_page * pages, base, max).
+    Falls back to the fixed parsing.timeout_sec when dynamic sizing is off or
+    the page count can't be probed (non-PDF / probe failure). Returns None
+    (= no timeout) only when the fixed value itself is null.
+    """
+    fixed = get_nested(config, "parsing.timeout_sec", 300)
+    if not get_nested(config, "parsing.dynamic_timeout.enabled", True):
+        return fixed
+    pages = _probe_page_count(file_path)
+    if not pages or pages <= 0:
+        return fixed
+    base = float(get_nested(config, "parsing.dynamic_timeout.base_sec", 120))
+    per_page = float(get_nested(config, "parsing.dynamic_timeout.per_page_sec", 3))
+    ceiling = float(get_nested(config, "parsing.dynamic_timeout.max_sec", 1800))
+    return max(base, min(ceiling, base + per_page * pages))
+
+
 def process_single_file(
     file_path: Path,
     parser: BaseParser,
@@ -2153,7 +2199,10 @@ def process_single_file(
 
     # --- Phase 1: Parse ---
     t0 = time.monotonic()
-    parse_timeout = get_nested(config, "parsing.timeout_sec", 300)
+    # Size-aware timeout: a 500-page book gets a budget scaled to its page
+    # count instead of the same flat cap a 10-page memo gets (see
+    # _resolve_parse_timeout / parsing.dynamic_timeout).
+    parse_timeout = _resolve_parse_timeout(file_path, config)
     try:
         from .utils.timeout import run_with_timeout
         parse_result = run_with_timeout(
@@ -2369,6 +2418,24 @@ def process_single_file(
             # Pre-existing exclusion: 186 KB bbox dict, lives in
             # index.json (see _build_index_entry).
             "element_boxes",
+            # Per-page PDF dimensions (points) — the sibling of element_boxes
+            # (both are set together under output.include_bounding_boxes). It
+            # is inherently per-file geometry, keyed by page number, with no
+            # chunk-level consumer: the only readers are index_builder /
+            # visualizer / cli, all of which look it up from index.json, never
+            # from the chunk. On a 100-page doc it was ~40% of chunks.jsonl.
+            "page_sizes",
+            # Internal diagnostic flag set only when the OOM batch-fallback
+            # parse path ran (docling_parser). It records HOW the parse was
+            # done, not anything about this chunk — run history already lives
+            # in log.md. Pure noise on chunks.
+            "oom_batch_fallback_used",
+            # Per-file Vision triage tally (sent_to_vision / triage_skipped /
+            # ...) set once by _enrich_with_vision. It is whole-document run
+            # stats, identical across every chunk of a file. Its real
+            # consumers read it from FileResult.vision_triage -> run_log,
+            # never from the chunk. Pure per-chunk duplication.
+            "vision_triage",
             # File-level identity / Docling origin — promoted to top-level
             # frontmatter keys by the file_metadata hook; chunk gets the
             # same info via `lineage.original_input.{filename,mimetype,
@@ -2517,6 +2584,10 @@ def process_single_file(
     eb = parse_result.metadata.get("element_boxes")
     if eb:
         result.element_boxes = eb
+    # Same path for the per-page dimensions that pair with element_boxes.
+    ps = parse_result.metadata.get("page_sizes")
+    if ps:
+        result.page_sizes = ps
 
     # Collect non-fatal warnings produced during this file's processing
     # (page caps, OCR fallbacks, etc.) for run_pipeline to aggregate.
@@ -2728,6 +2799,10 @@ def _make_index_parse_result(
     # picks it up and writes a per-file entry into index.json.
     if file_result.element_boxes:
         metadata["element_boxes"] = file_result.element_boxes
+    # Same for page_sizes — index_builder writes it per-file alongside
+    # element_boxes so the visualizer can scale by true page size.
+    if file_result.page_sizes:
+        metadata["page_sizes"] = file_result.page_sizes
 
     return ParseResult(
         markdown=markdown,

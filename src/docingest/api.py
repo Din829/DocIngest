@@ -311,6 +311,7 @@ def ingest(
     acknowledge_large: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     install_signal_handler: bool = False,
+    raise_on_failure: bool = False,
 ) -> IngestResult:
     """
     Process documents into a knowledge base (library entry point).
@@ -360,6 +361,12 @@ def ingest(
             Default False so library callers (web servers, long-running
             hosts) keep their own signal handling intact. The CLI passes
             True to give users the expected Ctrl+C-stops-cleanly behaviour.
+        raise_on_failure: When True, raise ``RuntimeError`` if any file
+            failed (parse error, timeout, …) instead of returning a result
+            whose ``stats["failed"] > 0``. Default False keeps the
+            return-don't-raise contract (caller owns error handling via
+            ``stats["errors"]``). Regardless of this flag, failures are
+            always logged at warning level so they're never fully silent.
 
     Returns:
         :class:`IngestResult` — statistics + actual artefact contents
@@ -423,6 +430,14 @@ def ingest(
         output_dir=str(output_dir_path),
         stats=_pipeline_stats(pipeline_result),
     )
+
+    # Surface failures even on the library path. ingest() deliberately returns
+    # (rather than raising) so callers own error handling — but a silent return
+    # means an unaware caller treats an all-failed run as success. So: always
+    # log a warning when files failed (a log line the caller can't miss as
+    # easily as a buried stats field), and optionally hard-fail when the caller
+    # opts in via raise_on_failure.
+    _surface_failures(result, raise_on_failure)
 
     if pipeline_result.safety.get("aborted"):
         return result
@@ -789,6 +804,28 @@ def _pipeline_stats(pipeline_result: Any) -> dict[str, Any]:
         "safety": dict(pipeline_result.safety),
         "interrupted": bool(getattr(pipeline_result, "interrupted", False)),
     }
+
+
+def _surface_failures(result: IngestResult, raise_on_failure: bool) -> None:
+    """Make per-file failures visible on the library path.
+
+    The CLI already prints failures in red; the library path historically
+    only put them in result.stats["errors"], which an unaware caller can miss
+    entirely (the documented "succeeded, 0 files" trap). So always emit a
+    warning log, and optionally raise when the caller asked for hard-fail.
+    No-op on a clean run.
+    """
+    errors = result.stats.get("errors") or []
+    if not errors:
+        return
+    import logging
+    detail = "; ".join(
+        f"{e.get('file', '?')}: {e.get('error', 'unknown error')}" for e in errors
+    )
+    msg = f"DocIngest: {len(errors)} file(s) failed — {detail}"
+    logging.getLogger(__name__).warning(msg)
+    if raise_on_failure:
+        raise RuntimeError(msg)
 
 
 def _populate_artefacts(

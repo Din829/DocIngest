@@ -108,7 +108,25 @@ parsing:
   # A hung Docling call (rare but possible on malformed PDFs) is caught
   # here so the rest of the pipeline keeps moving. The file is recorded
   # as failed with error_type="timeout".
+  #
+  # This is the FIXED fallback value — used when dynamic_timeout is off, or
+  # when the page count can't be probed. With dynamic_timeout on (default),
+  # paged inputs get a budget scaled to their size instead (see below), so a
+  # 500-page book isn't killed by the same 300 s that fits a 10-page memo.
   timeout_sec: 300
+
+  # Size-aware parse timeout. A single flat cap is wrong at both ends: too
+  # short for a big book (519-page WEO needs ~1100 s just to parse), too long
+  # for a tiny file that's actually hung. So scale the budget by page count:
+  #   timeout = clamp(base_sec + per_page_sec * pages, base_sec, max_sec)
+  # Page count is probed cheaply (PyMuPDF xref, O(1)) for PDFs; if it can't be
+  # determined (non-PDF, probe failure), we fall back to the fixed timeout_sec
+  # above — never blocking the parse on a failed probe.
+  dynamic_timeout:
+    enabled: true
+    base_sec: 120        # floor — also covers fixed per-file overhead
+    per_page_sec: 3      # added per page (519 pages → ~1677 s)
+    max_sec: 1800        # ceiling — a genuinely hung file still dies eventually
 
   # Generic Markdown post-processing — applied to all non-xlsx formats
   # (PDF / DOCX / PPTX / HTML / plain Markdown). The xlsx path has its own
@@ -369,6 +387,27 @@ parsing:
                               # keeps a safety margin below the ~15 crash threshold while
                               # minimising converter rebuilds (slower path: ~7x a clean
                               # whole-doc parse, but it ONLY runs when the doc already failed).
+
+      # PROACTIVE batching — split big PDFs up front instead of waiting to hit
+      # the wall. The same batched-parse machinery as the fallback above, but
+      # triggered by page count rather than a detected failure. Two wins:
+      # (1) skips the two doomed whole-doc attempts a big PDF would fail anyway
+      # (~300s + an 8GB memory spike, measured on 519p); (2) caps memory — even
+      # AFTER the upstream bug is fixed, a 1000-page whole-doc parse grows memory
+      # unbounded (architectural, not the crash bug), so capping per-batch stays
+      # useful. Produces the SAME seamless single-file output as a whole-doc
+      # parse (chunks stay attributed to the original file — verified), so it's
+      # invisible to downstream RAG / Agentic Search.
+      #
+      # above_pages is currently 50 to match the MEASURED wall (this bug-era
+      # machine drops pages past ~50 on a whole-doc parse). AFTER docling-parse
+      # fixes the Windows allocator, raise it to ~150 so mid-size PDFs go back
+      # to the faster whole-doc path and only genuinely huge files get split.
+      proactive:
+        enabled: true         # default on; false → only the reactive fallback above runs
+        above_pages: 50       # PDFs with more pages than this are batched up front
+        batch_size: 50        # bigger than the reactive 10 — proactive isn't post-crash,
+                              # so it can use batches near the wall for fewer rebuilds / speed
 
     # Optional per-format Vision override. Any field listed here overrides the
     # global models.vision.* / parsing.vision.* setting for THIS format only.
