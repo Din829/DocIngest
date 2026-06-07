@@ -74,7 +74,7 @@ run_pipeline (src/docingest/pipeline.py)
 |---|---|---|
 | **0.5 Legacy format convert** | 旧版二进制 Office `.xls`/`.doc`/`.ppt` → 对应 OOXML `.xlsx`/`.docx`/`.pptx`（LibreOffice），失败降级；产物落 `.cache/_legacy_convert/<sha256>.<目标后缀>`，后续 Phase 全部对转换后的现代格式操作。映射表 `_LEGACY_OFFICE_CONVERSIONS` 驱动，每格式一个开关 `parsing.<xls|doc|ppt>.auto_convert_to_*` | `_maybe_convert_legacy_office()` |
 | **1.0 pre_parse hook** | 改写原文件内容（如 DOCX OMML → LaTeX） | `run_pre_parse_hooks()` |
-| **1 Parse** | Docling / Media / Text 解析为 markdown + pages | `parser.parse()` |
+| **1 Parse** | Docling / Media / Text 解析为 markdown + pages。受**动态超时**（按页数缩放，`parsing.dynamic_timeout`，见 §5.12）+ **大文件主动分批**（PDF 超 `parsing.pdf.oom_batch_fallback.proactive.above_pages` 直接分批，避撞 docling-parse Windows OOM bug，见 §5.13 / `docs/docling_parse_OOM_Windows_长期监控.md`）保护 | `parser.parse()` |
 | **1.1 Garbled fallback** | 检测 `glyph<` 乱码 → pymupdf 重抽文本 | `_detect_garbled` + `_pymupdf_fallback` |
 | **1.2 Excel denoise** | xlsx/xls/csv 行内去重 + 空格剥离 | `_clean_excel_markdown` |
 | **1.2.5 通用表格去噪** | 非 Excel 格式的合并单元格去重 | `_denoise_markdown_table_rows` |
@@ -213,6 +213,9 @@ DocIngest/
 | AI 结果缓存 | `models/cache.py` |
 | Vision 主逻辑 | `parsers/vision.py` + `pipeline.py::_enrich_with_vision` |
 | Vision 8 层 triage | `pipeline.py::_should_skip_vision` |
+| 解析超时（按页数动态） | `pipeline.py::_resolve_parse_timeout` + `_probe_page_count`（§5.12） |
+| 大文件主动分批 / OOM 兜底 | `docling_parser.py::_parse_pdf_batched` + `parse()` 前置判断 + `_probe_pdf_pages`（§5.13） |
+| Chunk metadata 黑名单（文件级字段不进 chunk） | `pipeline.py::_CHUNK_METADATA_BLACKLIST`（§5.14） |
 | Refine（独立命令） | `refine.py` + `skills/*.SKILL.md` |
 | 知识图生成 | `output/knowledge_map.py` |
 | 质量报告 | `output/quality_report.py` |
@@ -832,6 +835,39 @@ cache hit 的文件：
 **已知特性**：「说」（音轨转录）稳定可靠且能音画互校（实测把 ASR 听错的 "Max" 校正成画面里的 "MUX"）；「画面」（视觉 OCR）在小字/水印区有非确定性抖动（`[?]`/`[unreadable]` 标记数会跨次浮动）——这是模型诚实标注边界，不是幻觉，不影响转录完整性。
 
 模型配置：`models.video_understanding` 若设则用，否则继承 `models.vision`（再继承 `models.defaults`）——和 vision/chunking_assist 同一套 one-model-to-rule 继承。
+
+### 5.12 解析超时：按文件大小动态缩放
+
+单文件解析有 wall-clock 超时保护（防一个卡死的文件拖垮整批）。**默认按页数动态算**，不是一刀切：
+
+```
+timeout = clamp(base_sec + per_page_sec × 页数, base_sec, max_sec)
+```
+
+- 配置 `parsing.dynamic_timeout`（`enabled` / `base_sec=120` / `per_page_sec=3` / `max_sec=1800`）。519 页 PDF → ~1677s，10 页 memo → ~150s。
+- 页数靠 `pipeline.py::_probe_page_count`（PyMuPDF xref，O(1)）探，**仅 PDF**；非 PDF 或探测失败 → 回退固定 `parsing.timeout_sec`（默认 300）。探测失败绝不阻塞解析。
+- 入口：`pipeline.py::_resolve_parse_timeout`，在 Phase 1 解析前算出该文件的超时值。
+- **为什么**：一刀切 300s 在两端都错——大书被冤杀、卡死的小文件等太久。超时是这套机制里**长期保留**的（与 docling bug 无关）。
+
+### 5.13 大文件主动分批（避 docling-parse Windows OOM）
+
+docling-parse 在 Windows 上有个内存 bug，多页 PDF 整本解析会间歇崩/丢页（详见 [docling_parse_OOM_Windows_长期监控.md](docling_parse_OOM_Windows_长期监控.md)）。两层应对：
+
+- **被动兜底**（一直有）：整本解析失败（PARTIAL_SUCCESS）→ 自动按小批重解析、每批重建 converter 释放 C++ 内存（`docling_parser.py::_parse_pdf_batched`，默认 `batch_size=10`）。
+- **主动分批**（2026-06-07 新增）：PDF 页数超 `parsing.pdf.oom_batch_fallback.proactive.above_pages`（默认 50）→ **不等撞墙，整本解析前就直接分批**（`batch_size=50`，比被动大），跳过两遍注定失败的整本尝试（省 ~300s + 内存冲高）。
+
+**产物无缝**：分批在 `parse()` 内部完成、拼接成一个 `ParseResult`，下游看到的还是单文件——chunk 的 `original_file`/`source` 是原 PDF、页码连续（实测验证）。对 RAG / Agentic Search 完全透明。
+
+**三层防护**（见 OOM 文档待办 6）：① 整本正路（小文件）② 主动分批（大文件，控内存，**IBM 修好后仍需要**——内存随页数线性增长是架构问题，与崩溃 bug 无关，届时只上调阈值）③ 被动兜底（解析失败的最后防线，**长期保留**）。
+
+### 5.14 Chunk metadata 黑名单：文件级字段不进每个 chunk
+
+`pipeline.py::_CHUNK_METADATA_BLACKLIST` 是一个硬编码 frozenset，**把文件级 / 内部诊断字段从每个 chunk 的 metadata 里剔除**，避免它们在 `chunks.jsonl` 里按 chunk 数重复（一份 100 页文档曾因此让 metadata 占 jsonl 74% 体积）。
+
+- 剔除的典型：`element_boxes` / `page_sizes`（几何数据，**改存 index.json**，visualizer 从那读）、`docling_origin` / `binary_hash`（血缘走 `lineage.original_input`）、`xlsx_sheet_page_map`、`vision_triage` / `oom_batch_fallback_used`（运行级诊断，进 run_log 不进 chunk）等。
+- chunk 上保留的是**真正 chunk 级**的：`source` / `original_file`（下游 join key）/ `title_path` / `chunk_index` / `tokens` / `has_table` / `has_image_ref` / `lineage`。
+- **为什么硬编码**：哪个字段属哪个 scope 是**事实**不是用户偏好，YAML 开关只会徒增复杂度。注释里逐条写了"剔除理由 + 信息从哪还能拿到"。
+- 配套：`page_sizes` 被剔出 chunk 的同时，经 `FileResult.page_sizes` → `_make_index_parse_result` 接进 index.json，让 `docingest visualize` 能按真实页尺寸缩放 bbox（而非假设 DPI）。
 
 ---
 

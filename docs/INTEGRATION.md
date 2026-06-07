@@ -74,6 +74,11 @@ async def ingest(paths: list[str]):
 
 **Key knobs**: `on_progress` fires once per file (cached / added / updated / failed / skipped). Event schema is documented in the `run_pipeline` docstring; treat it as a forward-compatible dict (don't `KeyError` on missing fields). Run the sync pipeline in a thread pool — `ingest()` is not async.
 
+**Failure handling — don't fall into the "succeeded, 0 files" trap**: `ingest()` returns rather than raising, so a run where every file failed still comes back as a normal `IngestResult` with `stats["failed"] > 0`. An unaware caller that only checks "did it return" treats that as success and ships an empty knowledge base. Two safeguards:
+- Failures are **always logged at warning level** (`DocIngest: N file(s) failed — ...`), even on the library path — so they surface in your logs without you inspecting `stats`.
+- Pass **`raise_on_failure=True`** to turn any file failure (parse error, timeout, …) into a `RuntimeError` instead of a silent return — the fail-loud option for pipelines that must not proceed on partial results.
+- Either way, the per-file detail lives in `result.stats["errors"]` (each entry: `file` / `error` / `error_type`, where `error_type` ∈ `timeout` / `parse_error` / `io_error` / `encrypted` / …).
+
 ### 3. Long-running daemon embedding
 
 DocIngest is one capability inside a larger always-on service (worker queue, scheduler, multi-tenant API).
