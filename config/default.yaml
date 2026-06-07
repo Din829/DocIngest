@@ -282,6 +282,35 @@ parsing:
           en: [Latin]
           ko: [Latin, Hangul, Han]
 
+      # Latin-script cipher-garble check — the sibling of language_script_check
+      # for the case where a broken font CMap maps each glyph to a DIFFERENT
+      # legal Latin letter (e.g. "Nutrition" → "Pgvsdvdfp"). The output is clean
+      # ASCII: no glyph<, no U+FFFD, no CJK, every char is still "Latin" script —
+      # so glyph / replacement-ratio / mixed-script / language-script checks all
+      # pass and the unreadable page would be skipped. The only surviving signal
+      # is statistical: natural Latin prose runs ~30-45% vowels, a letter
+      # permutation collapses that to single digits.
+      #
+      # Validated on real corpus: 164 genuine EN/JA page blocks → 0 false
+      # positives; 222 ciphered pages (two cipher families) → 100% caught. Real
+      # EN pages bottomed out at 29% vowels, ciphered topped out at 19%, so the
+      # 0.20 default sits in a wide safe gap.
+      #
+      # A trigger only sends the page TO Vision (which re-reads the image) — it
+      # can never drop content — so this is a pure safety net. Default ON.
+      latin_cipher_check:
+        enabled: true
+        min_letters: 30           # need at least this many Latin letters to make
+                                  # a statistical call (short labels / number-
+                                  # heavy / non-Latin pages fall below → skipped)
+        max_vowel_ratio: 0.20     # vowels / Latin-letters below this → cipher.
+                                  # Real prose ≥29%, cipher ≤19% on the test
+                                  # corpus; 0.20 is the midpoint of that gap.
+        max_cjk_share: 0.40       # if CJK chars are >40% of (CJK+Latin), the page
+                                  # is CJK-dominant → out of scope (its own garble
+                                  # detectors handle it; inline English must not
+                                  # trip this check).
+
       # Furniture-picture exemption (PDF only, default OFF / opt-in).
       # A text page whose ONLY images are cross-page "furniture" — a logo /
       # header / footer / watermark that repeats on most pages — carries no
