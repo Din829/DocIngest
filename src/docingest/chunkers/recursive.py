@@ -14,10 +14,11 @@ Based on: Vecta 2026.02 benchmark — recursive 512t scored 69% (highest).
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
-from .base import BaseChunker, Chunk
+from .base import BaseChunker, Chunk, _LIST_ITEM_RE
 from .table_splitter import split_markdown_table
 
 logger = logging.getLogger(__name__)
@@ -132,13 +133,22 @@ class RecursiveChunker(BaseChunker):
 
     @staticmethod
     def _extract_tail(text: str, target_tokens: int) -> str:
-        """Extract approximately target_tokens worth of text from the end."""
-        # Work backwards by sentences/paragraphs
+        """Extract approximately target_tokens worth of text from the end.
+
+        Walk backwards by paragraphs first (cleanest semantic boundary). If
+        a single paragraph is already larger than target_tokens (common with
+        CJK text that has no `\\n\\n` breaks — entire chunk is one
+        paragraph), fall back to a token-bounded character cut so the
+        returned overlap never exceeds the budget. Previously this method
+        would prepend a whole oversized paragraph as the "tail", duplicating
+        the full previous chunk into the next one (observed: 178% coverage
+        on Chinese video transcripts).
+        """
+        from .base import BaseChunker
         parts = text.split("\n\n")
         tail_parts: list[str] = []
         tail_tokens = 0
         for part in reversed(parts):
-            from .base import BaseChunker
             part_tokens = BaseChunker.estimate_tokens(part)
             if tail_tokens + part_tokens > target_tokens and tail_parts:
                 break
@@ -146,7 +156,23 @@ class RecursiveChunker(BaseChunker):
             tail_tokens += part_tokens
             if tail_tokens >= target_tokens:
                 break
-        return "\n\n".join(tail_parts) if tail_parts else ""
+        if not tail_parts:
+            return ""
+        # If the assembled tail itself blew past the budget (single huge
+        # paragraph, no break points), trim it character-by-character from
+        # the LEFT so we keep the rightmost target_tokens worth of text.
+        tail_text = "\n\n".join(tail_parts)
+        if BaseChunker.estimate_tokens(tail_text) <= target_tokens * 1.5:
+            return tail_text
+        # Binary-search the largest suffix that fits within target_tokens.
+        lo, hi = 0, len(tail_text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if BaseChunker.estimate_tokens(tail_text[mid:]) <= target_tokens:
+                hi = mid
+            else:
+                lo = mid + 1
+        return tail_text[lo:]
 
     def _split_segments(self, segments: list[dict]) -> list[str]:
         """Split segments into raw chunk texts (no overlap yet).
@@ -217,6 +243,10 @@ class RecursiveChunker(BaseChunker):
                     #   row_split        — for tables: split at data-row
                     #                      boundaries, repeat header in every
                     #                      chunk (2026 industry standard)
+                    #   item_split       — for lists: split at list-item
+                    #                      boundaries, and recursively split a
+                    #                      single oversized item with list
+                    #                      protection disabled.
                     #   warn_and_bypass  — same as bypass + logs a warning so
                     #                      oversized blocks stay discoverable
                     strategy = self._get_overflow_strategy(block_type)
@@ -250,6 +280,11 @@ class RecursiveChunker(BaseChunker):
                         if prefix and table_chunks:
                             table_chunks[0] = prefix + table_chunks[0]
                         chunks.extend(table_chunks)
+                    elif strategy == "item_split" and block_type == "list":
+                        list_chunks = self._split_list_by_items(seg["text"])
+                        if prefix and list_chunks:
+                            list_chunks[0] = prefix + list_chunks[0]
+                        chunks.extend(list_chunks)
                     else:
                         if strategy == "warn_and_bypass":
                             logger.warning(
@@ -314,6 +349,84 @@ class RecursiveChunker(BaseChunker):
             chunks.append("\n\n".join(current_parts))
 
         return chunks
+
+    def _split_list_by_items(self, list_text: str) -> list[str]:
+        """
+        Split an oversized Markdown list at item boundaries.
+
+        The protected-block detector keeps a whole list together while it is
+        within the overflow budget. Once it exceeds that budget, the safest
+        structural cut is item-by-item. If one item alone is still too large,
+        run it through a RecursiveChunker with list protection disabled so the
+        normal paragraph/sentence/character fallback can make progress.
+        """
+        items = self._list_items(list_text)
+        if not items:
+            return [list_text]
+
+        chunks: list[str] = []
+        current: list[str] = []
+        current_tokens = 0
+
+        for item in items:
+            item_tokens = self.estimate_tokens(item)
+
+            if item_tokens > self._max_tokens:
+                if current:
+                    chunks.append("\n".join(current))
+                    current = []
+                    current_tokens = 0
+                chunks.extend(self._split_single_oversized_list_item(item))
+                continue
+
+            if current and current_tokens + item_tokens > self._max_tokens:
+                chunks.append("\n".join(current))
+                current = []
+                current_tokens = 0
+
+            current.append(item)
+            current_tokens += item_tokens
+
+        if current:
+            chunks.append("\n".join(current))
+
+        return chunks
+
+    @staticmethod
+    def _list_items(list_text: str) -> list[str]:
+        """Return list items, keeping indented continuation lines attached."""
+        items: list[list[str]] = []
+        current: list[str] = []
+        base_indent: int | None = None
+        for line in list_text.split("\n"):
+            match = _LIST_ITEM_RE.match(line)
+            indent = len(line) - len(line.lstrip(" "))
+            if match and (base_indent is None or indent <= base_indent):
+                if base_indent is None:
+                    base_indent = indent
+                if current:
+                    items.append(current)
+                current = [line]
+            elif current and (line.startswith("  ") or not line.strip()):
+                current.append(line)
+            elif current:
+                # A non-indented non-item line inside a protected list is
+                # unusual, but preserving it with the previous item is safer
+                # than dropping or fabricating a new item.
+                current.append(line)
+            elif line.strip():
+                current = [line]
+        if current:
+            items.append(current)
+        return ["\n".join(item).strip() for item in items if "\n".join(item).strip()]
+
+    def _split_single_oversized_list_item(self, item: str) -> list[str]:
+        """Split one oversized list item without re-protecting it as a list."""
+        cfg = copy.deepcopy(self.config)
+        protection = cfg.setdefault("chunking", {}).setdefault("protection", {})
+        protection["lists"] = False
+        splitter = RecursiveChunker(cfg)
+        return [chunk.text for chunk in splitter.chunk(item, {})]
 
     def _split_paragraph(self, text: str) -> list[str]:
         """

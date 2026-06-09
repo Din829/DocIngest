@@ -67,6 +67,14 @@ models:
     # Independent of litellm's network-level retry — this bounds the
     # whole call (incl. retries) at the application layer.
     timeout_sec: 180
+    # Wall-clock cap for a batched Vision call (multi-page in one request).
+    # The batched path scales the cap with batch size up to this ceiling, so
+    # a 10-page batch doesn't get only the single-page budget. null = no
+    # ceiling (still bounded by timeout_sec × batch_size). The ceiling is
+    # separate from timeout_sec because batched calls are inherently longer
+    # than single-page ones, and a 600 s industry-typical max would silently
+    # truncate large-batch supplements on dense PDFs.
+    batch_timeout_max_sec: 1800
 
   chunking_assist:
     # primary / fallback INHERITED from models.defaults.
@@ -110,10 +118,12 @@ parsing:
   # as failed with error_type="timeout".
   #
   # This is the FIXED fallback value — used when dynamic_timeout is off, or
-  # when the page count can't be probed. With dynamic_timeout on (default),
-  # paged inputs get a budget scaled to their size instead (see below), so a
-  # 500-page book isn't killed by the same 300 s that fits a 10-page memo.
-  timeout_sec: 300
+  # when the page count can't be probed (non-PDF inputs: video, audio, html,
+  # ...). With dynamic_timeout on (default), paged PDFs get a budget scaled
+  # to their size instead (see below). 600 s covers most long-form video
+  # going through native_video (a 40-min clip's Gemini call takes ~5-7 min);
+  # tune higher for multi-hour content or lower for short-doc-only corpora.
+  timeout_sec: 600
 
   # Size-aware parse timeout. A single flat cap is wrong at both ends: too
   # short for a big book (519-page WEO needs ~1100 s just to parse), too long
@@ -225,6 +235,16 @@ parsing:
                               # 200+ = diminishing returns, risks 4MP cap downscale
                               # Gemini charges per-image regardless of DPI,
                               # OpenAI/Claude charge by tile/pixel count.
+    progress_interval: 1      # How often the on_progress callback fires a
+                              # "file_progress" event during Vision (every N
+                              # pages). 1 = every page (smoothest UI bar).
+                              # Vision is the longest silent stretch inside one
+                              # file, so per-page reporting keeps a GUI / SSE
+                              # progress bar alive instead of frozen. Raise this
+                              # for very long documents if per-page events flood
+                              # the UI. Does NOT affect output — purely a
+                              # reporting cadence, so it is intentionally NOT in
+                              # incremental.py's cache whitelist.
     # Systemic-failure handling: what to do when EVERY Vision page call for a
     # file fails AND the failed pages are "content-critical" — i.e. pages that
     # depend on Vision for their content (scanned docs whose Docling text is
@@ -630,6 +650,10 @@ parsing:
                                            # Qwen3-ASR-Flash has ~3min per-call limit,
                                            # 150s (2.5min) is the safe default
                                            # (same as qwen_asr.py's DEFAULT_SEGMENT_DURATION)
+    ffmpeg_extract_timeout_sec: 600        # max wait for ffmpeg to strip the audio
+                                           # track out of a video. Scales with video
+                                           # length; 600 s covers ~2 h of HD video.
+                                           # Raise for multi-hour content.
 
     # Video frame understanding (画面理解) — the audio track is always
     # transcribed via ASR above; this ADDS visual understanding by sampling
@@ -688,6 +712,22 @@ parsing:
       files_api_threshold_mb: 20           # videos < this go inline (base64);
                                            # >= this upload via the Files API
                                            # (Gemini's 20MB inline-request limit).
+      files_api_upload_timeout_sec: 600    # Max wait for the Files API upload
+                                           # request itself. This protects the
+                                           # network upload / resumable-upload
+                                           # handshake before PROCESSING polling
+                                           # begins. 600 s is intentionally
+                                           # generous for 200+ MB videos on slow
+                                           # links; lower it for short-video-only
+                                           # workloads.
+      files_api_poll_timeout_sec: 900      # Max wait for Files API PROCESSING
+                                           # → ACTIVE after upload. Gemini's
+                                           # server-side processing scales with
+                                           # video duration: a 40-min / 234 MB
+                                           # video can stay PROCESSING for
+                                           # several minutes. 900 s covers
+                                           # typical long-form video; raise for
+                                           # multi-hour content.
       # model: inherits models.video_understanding if set, else models.vision
       #        (which inherits models.defaults). To pin a video-specific model,
       #        add a models.video_understanding.primary block.
@@ -924,7 +964,7 @@ output:
 # =============================================================================
 chunking:
   enabled: true
-  strategy: "auto"            # auto | heading | recursive | slide | sheet | whole | agentic
+  strategy: "auto"            # auto | heading | recursive | slide | sheet | timestamp | whole
 
   max_tokens: 512
   min_tokens: 100
@@ -971,6 +1011,9 @@ chunking:
   auto:
     min_headings: 3
     max_heading_gap_levels: 2
+    min_section_tokens: 100
+    max_section_tokens: 2000
+    section_size_pass_ratio: 0.5  # fraction of sections that should be in range
     prefer_heading_threshold: 2   # structure score >= 2 → heading strategy
 
     # Format-specific strategy mapping (override per format)
@@ -1015,12 +1058,15 @@ chunking:
     #                     see Chonkie TableChunker / Ragie table chunking).
     #                     Fixes Docling's merged-cell expansion producing
     #                     multi-kilo-token tables.
+    #   item_split      — lists only: split at list-item boundaries, and if
+    #                     one item alone is still too large, hand it back to
+    #                     RecursiveChunker with list protection disabled.
     #   warn_and_bypass — same as bypass + logs a warning so oversized blocks
     #                     stay discoverable for tuning.
     on_overflow:
       table: "row_split"
       code_block: "bypass"
-      list: "bypass"
+      list: "item_split"
       quote: "bypass"
       default: "bypass"
 
@@ -1249,8 +1295,10 @@ safety:
   vision_price_per_call:
     gemini-3-flash-preview: 0.0002
     gemini-3-flash: 0.0002
-    gemini-3-pro-preview: 0.002
+    gemini-3.1-pro-preview: 0.002       # current Gemini 3 Pro (3-pro-preview deprecated 2026-03-09)
+    gemini-3-pro-preview: 0.002         # kept for cache hits on older runs
     gemini-3-pro: 0.002
+    gpt-5.5: 0.012                      # estimated per-call ($5/1M in + ~$30/1M out, ~1k image tokens typical)
     gpt-5.4-mini: 0.005
     gpt-4o: 0.008
     gpt-4o-mini: 0.002

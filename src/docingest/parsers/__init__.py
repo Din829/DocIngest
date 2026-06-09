@@ -97,13 +97,10 @@ class _DoclingWithFallback(BaseParser):
             if result.success:
                 return result
             # MediaParser failed (e.g. ASR API down) — don't fall through
-            # to Docling for audio files; Docling can't handle them either.
-            # Fall through to TextParser instead.
-            fallback_result = self._fallback.parse(file_path)
-            if fallback_result.success:
-                fallback_result.metadata["parser_fallback"] = True
-                return fallback_result
-            return result  # return MediaParser's error, not TextParser's
+            # to Docling or TextParser for audio/video files. Text fallback can
+            # decode arbitrary binary bytes (e.g. latin-1) and turn a real media
+            # failure into a bogus success.
+            return result
 
         # Priority 2: Docling (forwards override_stream when a pre-parse
         # hook produced a replacement stream, e.g. DOCX OMML preprocessing).

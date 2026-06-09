@@ -644,6 +644,10 @@ class MediaParser(BaseParser):
 
         fps = nv_cfg.get("fps", 1)
         inline_max_mb = nv_cfg.get("files_api_threshold_mb", 20)
+        upload_timeout = nv_cfg.get("files_api_upload_timeout_sec", 600)
+        # Gemini Files API server-side PROCESSING scales with video duration;
+        # long-form clips can remain PROCESSING well after upload completes.
+        poll_timeout = nv_cfg.get("files_api_poll_timeout_sec", 900)
         mime = self._VIDEO_MIME.get(
             video_path.suffix.lstrip(".").lower(), "video/mp4"
         )
@@ -656,7 +660,15 @@ class MediaParser(BaseParser):
                 fps=fps,
                 inline_max_mb=inline_max_mb,
                 mime_type=mime,
+                upload_timeout_sec=upload_timeout,
+                poll_timeout_sec=poll_timeout,
             )
+        except TimeoutError:
+            # Native video is the whole parse path for large uploads. A timeout
+            # here is not an "unsupported provider" fallback: surface it to
+            # pipeline so the file is recorded as error_type="timeout" instead
+            # of silently switching to the much costlier frame-sampling path.
+            raise
         except NativeVideoUnsupported as e:
             logger.warning(
                 f"Native video understanding unavailable for {video_path.name} "
@@ -895,12 +907,18 @@ class MediaParser(BaseParser):
         if out_path.exists() and out_path.stat().st_size > 0:
             return out_path  # already extracted
 
+        # Scales with video length — a multi-hour clip can exceed the old
+        # hardcoded 300 s. Config-driven so long-form content isn't capped at
+        # a value tuned for short videos.
+        extract_timeout = get_nested(
+            self.config, "parsing.audio.ffmpeg_extract_timeout_sec", 600
+        )
         try:
             subprocess.run(
                 [ffmpeg, "-i", str(video_path),
                  "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
                  "-y", str(out_path)],
-                capture_output=True, timeout=300,
+                capture_output=True, timeout=extract_timeout,
             )
             if out_path.exists() and out_path.stat().st_size > 0:
                 return out_path

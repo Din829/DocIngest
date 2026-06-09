@@ -14,11 +14,47 @@ Design:
 from __future__ import annotations
 
 import datetime
+import re
 from pathlib import Path
 from typing import Any
 
 from ..config import get_nested
 from ..parsers.base import ParseResult
+
+
+# Match a line that begins with `- **label**:` — the historical native_video
+# output shape that downstream chunkers misread as a Markdown list. The label
+# text is intentionally not enumerated: model wording drifts, but the shape
+# stays stable.
+_VIDEO_BOLD_LABEL = r"\*\*[^*\n]{1,40}\*\*:"
+_VIDEO_FAKE_LIST_RE = re.compile(
+    rf"^- ({_VIDEO_BOLD_LABEL})",
+    re.MULTILINE,
+)
+_VIDEO_LABEL_PARAGRAPH_RE = re.compile(
+    rf"(?<!\n)\n({_VIDEO_BOLD_LABEL})",
+)
+
+
+def _normalize_video_markdown(markdown: str) -> str:
+    """Strip the leading `- ` from video `- **label**: ...` lines
+    and ensure each label sits in its own paragraph (blank line before).
+
+    Why this exists: the chunkers' list-protection rule treats any `- ` line
+    as part of a list block and refuses to split it, so a 4000-token
+    speech+visual segment becomes one chunk. Plain paragraphs let the
+    recursive chunker split by `\\n\\n`. Idempotent — running it on
+    already-normalized text is a no-op.
+    """
+    if "- **" not in markdown:
+        return markdown
+    # 1) drop the leading "- " before bold labels
+    fixed = _VIDEO_FAKE_LIST_RE.sub(r"\1", markdown)
+    # 2) guarantee a blank line before each label so it stands alone as a
+    #    paragraph (chunker's paragraph boundary is "\n\n"). The label may
+    #    already have one — we collapse "\n*\n**X**" patterns to one form.
+    fixed = _VIDEO_LABEL_PARAGRAPH_RE.sub(r"\n\n\1", fixed)
+    return fixed
 
 
 def _yaml_escape(value: Any) -> str:
@@ -190,8 +226,18 @@ def write_markdown(
         parts.append(frontmatter)
         parts.append("")  # blank line after frontmatter
 
-    # Main content
-    parts.append(parse_result.markdown)
+    # Main content. For video (native or frame-sampling) the prompt asks for
+    # plain paragraphs, but model output can drift back to `- **说**:` list
+    # form; normalize so the chunker's list-protection rule never glues a
+    # whole multi-thousand-token segment into one chunk. Skipped for non-video:
+    # chart/table descriptions can legitimately use `- **Y-axis**:`-style
+    # lists, and those should stay lists.
+    body = parse_result.markdown
+    if (parse_result.metadata.get("format") or "").lower() in {
+        "mp4", "avi", "mkv", "webm", "mov", "wmv", "flv", "ts", "m4v"
+    }:
+        body = _normalize_video_markdown(body)
+    parts.append(body)
 
     content = "\n".join(parts)
 

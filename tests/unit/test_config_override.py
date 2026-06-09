@@ -10,9 +10,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 from docingest.config import load_config
 from docingest.parsers import create_parser
 from docingest.chunkers import create_chunker
+from docingest.chunkers import WholeChunker
 from docingest.chunkers.recursive import RecursiveChunker
 from docingest.chunkers.heading import HeadingChunker
 from docingest.chunkers import AutoChunker
+from docingest.chunkers.slide import SlideChunker
+from docingest.chunkers.sheet import SheetChunker
+from docingest.chunkers.timestamp import TimestampChunker
 from docingest.pipeline import run_pipeline
 
 
@@ -48,6 +52,21 @@ def test_strategy_override():
     ca = create_chunker(config_a)
     assert isinstance(ca, AutoChunker)
     print(f"  auto:      type={type(ca).__name__}  OK")
+
+    explicit = {
+        "slide": SlideChunker,
+        "sheet": SheetChunker,
+        "timestamp": TimestampChunker,
+        "whole": WholeChunker,
+    }
+    for strategy, expected_type in explicit.items():
+        config_s = load_config(cli_overrides={"chunking": {"strategy": strategy}})
+        cs = create_chunker(config_s)
+        assert isinstance(cs, expected_type), (
+            f"strategy={strategy!r} returned {type(cs).__name__}, "
+            f"expected {expected_type.__name__}"
+        )
+        print(f"  {strategy}: {type(cs).__name__}  OK")
 
     print("Test 7a PASSED\n")
 

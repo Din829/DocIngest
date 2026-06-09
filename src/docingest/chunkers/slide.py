@@ -4,7 +4,7 @@ Slide chunker — 1 slide = 1 chunk (PPT best practice).
 Boundary detection priority (see ARCHITECTURE.md §5.6):
   1. Docling slide separator markers (if present)
   2. Horizontal rule "---" pattern
-  3. "# Slide N" / "## スライド N" heading pattern
+  3. Short numbered H1/H2 markers ("# 1", "## 第2页", "# Slide 3")
   4. All absent → fallback to recursive
 
 Rules:
@@ -27,10 +27,11 @@ from .recursive import RecursiveChunker
 _PAGEBREAK_RE = re.compile(r"^<!-- pagebreak\s*-->", re.IGNORECASE)
 _DOCLING_SLIDE_RE = re.compile(r"^<!-- slide\b", re.IGNORECASE)
 _HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$")
-_SLIDE_HEADING_RE = re.compile(
-    r"^#{1,2}\s+(?:slide|スライド|page|ページ)\s*\d+",
-    re.IGNORECASE,
-)
+_HEADING_RE = re.compile(r"^#{1,2}\s+(.+?)\s*$")
+_HEADING_NUMBER_RE = re.compile(r"\d+")
+_MAX_NUMBERED_HEADING_CHARS = 16
+_MAX_NUMBERED_HEADING_LABEL_CHARS = 6
+_MIN_NUMBERED_HEADING_BOUNDARIES = 2
 
 
 class SlideChunker(BaseChunker):
@@ -111,8 +112,10 @@ class SlideChunker(BaseChunker):
         if boundaries:
             return self._split_at(lines, boundaries)
 
-        # Priority 3: Slide heading pattern
-        boundaries = self._find_boundaries(lines, _SLIDE_HEADING_RE)
+        # Priority 3: short numbered heading markers. This is deliberately
+        # structural: the label can be any language, but the shape must be a
+        # compact marker plus a single increasing number.
+        boundaries = self._find_numbered_heading_boundaries(lines)
         if boundaries:
             return self._split_at(lines, boundaries)
 
@@ -124,6 +127,52 @@ class SlideChunker(BaseChunker):
     ) -> list[int]:
         """Find line indices matching boundary pattern."""
         return [i for i, line in enumerate(lines) if pattern.match(line)]
+
+    def _find_numbered_heading_boundaries(self, lines: list[str]) -> list[int]:
+        """
+        Find slide markers expressed as short numbered H1/H2 headings.
+
+        The old fallback matched hardcoded words like "slide" / "page". This
+        version looks for shape instead: compact heading, exactly one number,
+        and numbers increasing by 1 across the document.
+        """
+        candidates: list[tuple[int, int]] = []
+        for i, line in enumerate(lines):
+            number = self._numbered_heading_value(line)
+            if number is not None:
+                candidates.append((i, number))
+
+        if len(candidates) < _MIN_NUMBERED_HEADING_BOUNDARIES:
+            return []
+
+        numbers = [number for _, number in candidates]
+        for prev, curr in zip(numbers, numbers[1:]):
+            if curr != prev + 1:
+                return []
+
+        return [line_idx for line_idx, _ in candidates]
+
+    @staticmethod
+    def _numbered_heading_value(line: str) -> int | None:
+        match = _HEADING_RE.match(line)
+        if not match:
+            return None
+
+        title = match.group(1).strip()
+        if len(title) > _MAX_NUMBERED_HEADING_CHARS:
+            return None
+
+        numbers = _HEADING_NUMBER_RE.findall(title)
+        if len(numbers) != 1:
+            return None
+
+        label = _HEADING_NUMBER_RE.sub("", title)
+        label = re.sub(r"[\W_]+", "", label)
+        if len(label) > _MAX_NUMBERED_HEADING_LABEL_CHARS:
+            return None
+
+        number = int(numbers[0])
+        return number if number > 0 else None
 
     def _split_at(self, lines: list[str], boundaries: list[int]) -> list[str]:
         """Split lines at boundary indices into slide texts."""

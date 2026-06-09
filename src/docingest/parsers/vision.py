@@ -623,12 +623,27 @@ representation of this video that INTERLEAVES, in chronological order:
 
 Segment the video by meaningful change (a new topic, screen, or action — \
 NOT a fixed time grid). For each segment emit a line `[MM:SS]` (use \
-`[H:MM:SS]` past one hour) followed by:
+`[H:MM:SS]` past one hour) on its own line, then a BLANK LINE, then the \
+two labels below as plain paragraphs separated by blank lines.
 
-- **说**: the speech in this window, verbatim. Omit this line if silence.
-- **画面**: what is visibly on screen. Capture readable text VERBATIM — \
-  URLs, field/button labels, prompts typed by the user, headings, code. \
-  Describe the action ("clicks X", "uploads an image", "types '…'").
+**说**: the speech in this window, verbatim. Omit this paragraph if silence.
+
+**画面**: what is visibly on screen. Capture readable text VERBATIM — \
+URLs, field/button labels, prompts typed by the user, headings, code. \
+Describe the action ("clicks X", "uploads an image", "types '…'").
+
+Each segment looks like (mind the blank lines):
+
+    [MM:SS]
+
+    **说**: ...
+
+    **画面**: ...
+
+DO NOT prefix the labels with `-`, `*`, `+`, or any list marker — these \
+are plain Markdown paragraphs, not list items. Keep the blank lines: \
+every label MUST be its own paragraph so downstream chunkers can split \
+correctly.
 
 Timestamps must increase. Do not invent a regular interval — segment by \
 content.

@@ -484,7 +484,8 @@ def describe_video(
     max_tokens: int | None = None,
     inline_max_mb: float = _GEMINI_INLINE_MAX_MB,
     mime_type: str = "video/mp4",
-    poll_timeout_sec: int = 300,
+    upload_timeout_sec: int = 600,
+    poll_timeout_sec: int = 900,
 ) -> str:
     """
     Send a WHOLE video to a native video-understanding model in one call.
@@ -503,6 +504,7 @@ def describe_video(
         max_tokens: Output cap. None → resolve_max_tokens(model_config).
         inline_max_mb: Size boundary between base64 and Files API.
         mime_type: Video MIME (caller maps from extension).
+        upload_timeout_sec: Max wait for the Files API upload request itself.
         poll_timeout_sec: Max wait for Files API processing to reach ACTIVE.
 
     Returns:
@@ -543,9 +545,12 @@ def describe_video(
                 max_tokens=effective_max_tokens,
                 inline_max_mb=inline_max_mb,
                 mime_type=mime_type,
+                upload_timeout_sec=upload_timeout_sec,
                 poll_timeout_sec=poll_timeout_sec,
             )
         except NativeVideoUnsupported:
+            raise
+        except TimeoutError:
             raise
         except Exception as e:  # network / API / processing failure
             last_error = e
@@ -572,6 +577,7 @@ def _describe_video_gemini(
     max_tokens: int,
     inline_max_mb: float,
     mime_type: str,
+    upload_timeout_sec: int,
     poll_timeout_sec: int,
 ) -> str:
     """Gemini-native video call via google-genai. base64 inline for small
@@ -606,7 +612,12 @@ def _describe_video_gemini(
                 video_metadata=video_metadata,
             )
         else:
-            myfile = client.files.upload(file=str(video_path))
+            myfile = _upload_gemini_file(
+                client=client,
+                types_module=types,
+                video_path=video_path,
+                upload_timeout_sec=upload_timeout_sec,
+            )
             uploaded_name = myfile.name
             # Large uploads land in PROCESSING and must reach ACTIVE before
             # they can be referenced — this is a real external-system
@@ -615,8 +626,15 @@ def _describe_video_gemini(
             waited = 0
             while str(myfile.state) in ("FileState.PROCESSING", "PROCESSING"):
                 if waited >= poll_timeout_sec:
+                    # Tell the caller exactly which knob to raise. Long videos
+                    # (>40 min / >200 MB) routinely stay PROCESSING this long
+                    # on Gemini's side, and the user has no other way to know
+                    # which config controls it.
                     raise RuntimeError(
-                        f"Files API still PROCESSING after {poll_timeout_sec}s"
+                        f"Files API still PROCESSING after {poll_timeout_sec}s. "
+                        f"For long-form video, raise "
+                        f"parsing.audio.native_video.files_api_poll_timeout_sec "
+                        f"(or set env DOCINGEST__parsing__audio__native_video__files_api_poll_timeout_sec)."
                     )
                 time.sleep(3)
                 waited += 3
@@ -655,6 +673,51 @@ def _describe_video_gemini(
                 client.files.delete(name=uploaded_name)
             except Exception:
                 pass
+
+
+def _upload_gemini_file(
+    *,
+    client: Any,
+    types_module: Any,
+    video_path: Path,
+    upload_timeout_sec: int | float | None,
+):
+    """
+    Upload one video through Gemini Files API with a request timeout.
+
+    google-genai's HttpOptions.timeout is milliseconds; DocIngest config uses
+    seconds like the rest of the project. This timeout protects the upload /
+    resumable-upload handshake before Files API PROCESSING polling starts.
+    """
+    upload_config = None
+    if upload_timeout_sec is not None and float(upload_timeout_sec) > 0:
+        upload_timeout_ms = int(float(upload_timeout_sec) * 1000)
+        upload_config = types_module.UploadFileConfig(
+            http_options=types_module.HttpOptions(timeout=upload_timeout_ms)
+        )
+
+    try:
+        return client.files.upload(file=str(video_path), config=upload_config)
+    except Exception as e:
+        if not _looks_like_timeout(e):
+            raise
+        raise TimeoutError(
+            f"Gemini Files API upload timed out after {upload_timeout_sec}s "
+            f"for {video_path.name}. Raise "
+            f"parsing.audio.native_video.files_api_upload_timeout_sec "
+            f"(or set env DOCINGEST__parsing__audio__native_video__files_api_upload_timeout_sec)."
+        ) from e
+
+
+def _looks_like_timeout(exc: Exception) -> bool:
+    """True for built-in / SDK / httpx-style timeout exceptions."""
+    if isinstance(exc, TimeoutError):
+        return True
+    for cls in type(exc).mro():
+        name = cls.__name__.lower()
+        if "timeout" in name or "timedout" in name:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

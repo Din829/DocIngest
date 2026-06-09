@@ -1,21 +1,29 @@
 """
-Timestamp chunker — splits audio/video transcripts by time markers.
-
-Designed for transcripts that contain `[MM:SS]` or `[HH:MM:SS]` markers
-(produced by media_parser from SRT subtitles or ASR output).
+Timestamp chunker — slices audio/video transcripts at `[MM:SS]` markers,
+then delegates the actual splitting to RecursiveChunker.
 
 Strategy:
-  1. Find all [MM:SS] / [HH:MM:SS] markers in the Markdown.
-  2. Group consecutive timestamped lines into chunks that fit within
-     max_tokens.
-  3. Each chunk carries start_time / end_time in metadata (for RAG
-     queries like "what was said at minute 12?").
-  4. Non-timestamped text (headers, metadata) is prepended to the first
-     chunk as context.
-  5. If no timestamps found → fall back to recursive chunker.
+  1. Find every `[MM:SS]` / `[HH:MM:SS]` position in the markdown.
+  2. Carve the body into segments — each segment is the text from one
+     timestamp up to (but not including) the next.
+  3. Merge tiny adjacent segments to avoid fragment chunks (below
+     min_tokens). Two segments fuse only when the merged size still fits
+     within max_tokens × overflow factor.
+  4. Per segment, hand off to RecursiveChunker — it owns paragraph /
+     sentence / character-level splitting, list-protection, min/max
+     enforcement. This chunker is just a time-aware slicer + tagger.
+  5. Stamp every emitted chunk with start_seconds / end_seconds derived
+     from the owning segment.
 
-This mirrors the slide chunker pattern: format-specific semantic
-boundaries (timestamps ↔ slide breaks), with recursive as the fallback.
+Why delegate instead of reimplementing splits:
+  RecursiveChunker already handles oversized segments via paragraph →
+  sentence → character-level fallback, plus protection for tables / code /
+  lists. Reimplementing that here drifted apart in the past (the original
+  TimestampChunker silently dropped any line between `[MM:SS]` and the
+  next timestamp that wasn't on the timestamp line itself). Delegation
+  guarantees one source of truth.
+
+Fallback: no timestamps found → pass the whole markdown to RecursiveChunker.
 """
 
 from __future__ import annotations
@@ -27,23 +35,23 @@ from .base import BaseChunker, Chunk
 from .recursive import RecursiveChunker
 
 
-# Matches [MM:SS] or [HH:MM:SS] at line start
-_TIMESTAMP_RE = re.compile(r"^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]\s*(.+)", re.MULTILINE)
+# Find each timestamp's POSITION. We intentionally do NOT capture the text
+# after the marker — the slice between two TS positions is the segment body,
+# regardless of how the upstream prompt formatted it.
+_TS_POS_RE = re.compile(
+    r"^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]",
+    re.MULTILINE,
+)
 
 
-def _parse_seconds(match: re.Match) -> int:
-    """Convert a timestamp regex match to total seconds."""
-    groups = match.groups()
-    if groups[2] is not None:
-        # HH:MM:SS
-        return int(groups[0]) * 3600 + int(groups[1]) * 60 + int(groups[2])
-    else:
-        # MM:SS
-        return int(groups[0]) * 60 + int(groups[1])
+def _ts_to_seconds(match: re.Match) -> int:
+    a, b, c = match.group(1), match.group(2), match.group(3)
+    if c is not None:
+        return int(a) * 3600 + int(b) * 60 + int(c)
+    return int(a) * 60 + int(b)
 
 
 def _format_time(seconds: int) -> str:
-    """Format seconds as MM:SS or HH:MM:SS."""
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
     if h > 0:
@@ -52,124 +60,75 @@ def _format_time(seconds: int) -> str:
 
 
 class TimestampChunker(BaseChunker):
-    """Split audio/video transcript by timestamp boundaries."""
+    """Slice transcripts at `[MM:SS]` boundaries, delegate splitting to recursive."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)
         self._recursive = RecursiveChunker(config)
 
     def chunk(self, markdown: str, metadata: dict[str, Any]) -> list[Chunk]:
-        """Split by timestamps, fallback to recursive if none found."""
         if not markdown.strip():
             return []
 
-        # Extract timestamped entries
-        entries = self._extract_entries(markdown)
-
-        if not entries:
-            # No timestamps → recursive fallback
+        matches = list(_TS_POS_RE.finditer(markdown))
+        if not matches:
             return self._recursive.chunk(markdown, metadata)
 
-        # Separate header (non-timestamped) from transcript body
-        header = self._extract_header(markdown)
+        header = markdown[: matches[0].start()].rstrip()
 
-        # Group entries into chunks that fit max_tokens
-        chunks = self._build_chunks(entries, header, metadata)
+        # Each segment carries (start_sec, end_sec, text). text starts AT the
+        # [MM:SS] line so the chunk keeps the marker for readability.
+        segments: list[tuple[int, int, str]] = []
+        for i, m in enumerate(matches):
+            start_sec = _ts_to_seconds(m)
+            next_start = (
+                matches[i + 1].start() if i + 1 < len(matches) else len(markdown)
+            )
+            text = markdown[m.start():next_start].rstrip()
+            segments.append((start_sec, start_sec, text))  # end filled below
+        # end_sec = next segment's start_sec (or own start if last)
+        segments = [
+            (s, segments[i + 1][0] if i + 1 < len(segments) else s, t)
+            for i, (s, _, t) in enumerate(segments)
+        ]
 
-        # Renumber
-        for i, c in enumerate(chunks):
+        # Merge tiny adjacent segments up to a soft ceiling so we don't emit
+        # fragment chunks. Ceiling reuses max_tokens × default overflow — the
+        # same knob RecursiveChunker uses internally, so behaviour is
+        # consistent across both chunkers.
+        merge_ceiling = int(self._max_tokens * self._get_overflow("default"))
+        merged: list[tuple[int, int, str]] = []
+        for start, end, text in segments:
+            tok = self.estimate_tokens(text)
+            if merged:
+                p_start, p_end, p_text = merged[-1]
+                p_tok = self.estimate_tokens(p_text)
+                if p_tok < self._min_tokens and p_tok + tok <= merge_ceiling:
+                    merged[-1] = (p_start, end, p_text + "\n\n" + text)
+                    continue
+            merged.append((start, end, text))
+
+        # Per segment, delegate to RecursiveChunker. Tag every emitted chunk
+        # with the owning segment's start/end seconds. Header (frontmatter
+        # before the first timestamp) is prepended to the first segment.
+        out: list[Chunk] = []
+        for i, (start, end, text) in enumerate(merged):
+            body = (header + "\n\n" + text) if (header and i == 0) else text
+            sub_chunks = self._recursive.chunk(body, metadata)
+            for sc in sub_chunks:
+                sc.metadata = {
+                    **sc.metadata,
+                    "start_time": _format_time(start),
+                    "end_time": _format_time(end),
+                    "start_seconds": start,
+                    "end_seconds": end,
+                }
+                out.append(sc)
+
+        # Renumber chunk_index / total_chunks across the flat output list.
+        for i, c in enumerate(out):
             c.metadata["chunk_index"] = i
-            c.metadata["total_chunks"] = len(chunks)
+            c.metadata["total_chunks"] = len(out)
             c.metadata["tokens"] = self.estimate_tokens(c.text)
 
-        return chunks
-
-    def _extract_entries(self, markdown: str) -> list[dict[str, Any]]:
-        """Extract timestamped entries from markdown."""
-        entries: list[dict[str, Any]] = []
-        for match in _TIMESTAMP_RE.finditer(markdown):
-            seconds = _parse_seconds(match)
-            text = match.group(4).strip() if match.group(4) else match.group(3) or ""
-            # Re-check: group(4) is the text after timestamp when 3 groups (HH:MM:SS)
-            # or the text after timestamp when 2 groups (MM:SS)
-            # The regex already captures the text in group(4)
-            entries.append({
-                "seconds": seconds,
-                "text": text,
-                "line": match.group(0),  # full original line
-            })
-        return entries
-
-    def _extract_header(self, markdown: str) -> str:
-        """
-        Extract non-timestamped content before the first timestamp.
-        This is typically the title, metadata, ## Transcript heading, etc.
-        """
-        first_match = _TIMESTAMP_RE.search(markdown)
-        if not first_match:
-            return ""
-        header = markdown[:first_match.start()].strip()
-        return header
-
-    def _build_chunks(
-        self,
-        entries: list[dict[str, Any]],
-        header: str,
-        metadata: dict[str, Any],
-    ) -> list[Chunk]:
-        """Group timestamped entries into chunks respecting max_tokens."""
-        chunks: list[Chunk] = []
-        current_lines: list[str] = []
-        current_tokens = 0
-        chunk_start_sec: int | None = None
-        chunk_end_sec: int = 0
-
-        for entry in entries:
-            line = entry["line"]
-            line_tokens = self.estimate_tokens(line)
-
-            if chunk_start_sec is None:
-                chunk_start_sec = entry["seconds"]
-
-            # Check if adding this line exceeds max_tokens
-            if current_tokens + line_tokens > self._max_tokens and current_lines:
-                # Flush current chunk
-                text = "\n\n".join(current_lines)
-                if header and not chunks:
-                    # Prepend header to first chunk only
-                    text = header + "\n\n" + text
-
-                chunk_meta = {
-                    **metadata,
-                    "start_time": _format_time(chunk_start_sec or 0),
-                    "end_time": _format_time(chunk_end_sec),
-                    "start_seconds": chunk_start_sec or 0,
-                    "end_seconds": chunk_end_sec,
-                }
-                chunks.append(Chunk(text=text, metadata=chunk_meta))
-
-                # Start new chunk
-                current_lines = []
-                current_tokens = 0
-                chunk_start_sec = entry["seconds"]
-
-            current_lines.append(line)
-            current_tokens += line_tokens
-            chunk_end_sec = entry["seconds"]
-
-        # Flush remaining
-        if current_lines:
-            text = "\n\n".join(current_lines)
-            if header and not chunks:
-                text = header + "\n\n" + text
-
-            chunk_meta = {
-                **metadata,
-                "start_time": _format_time(chunk_start_sec or 0),
-                "end_time": _format_time(chunk_end_sec),
-                "start_seconds": chunk_start_sec or 0,
-                "end_seconds": chunk_end_sec,
-            }
-            chunks.append(Chunk(text=text, metadata=chunk_meta))
-
-        return chunks
+        return out

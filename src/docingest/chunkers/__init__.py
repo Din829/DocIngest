@@ -51,9 +51,14 @@ def _check_heading_gaps(markdown: str, max_gap: int = 2) -> bool:
     return True
 
 
-def _check_heading_content_sizes(markdown: str) -> bool:
+def _check_heading_content_sizes(
+    markdown: str,
+    min_tokens: int = 100,
+    max_tokens: int = 2000,
+    pass_ratio: float = 0.5,
+) -> bool:
     """
-    Check if content between headings is reasonably sized (100-2000 tokens).
+    Check if content between headings is reasonably sized.
 
     Returns True if most sections have appropriate content length.
     """
@@ -63,12 +68,11 @@ def _check_heading_content_sizes(markdown: str) -> bool:
 
     reasonable = 0
     for section in sections[1:]:  # Skip content before first heading
-        tokens = len(section.strip()) // 4
-        if 100 <= tokens <= 2000:
+        tokens = BaseChunker.estimate_tokens(section.strip())
+        if min_tokens <= tokens <= max_tokens:
             reasonable += 1
 
-    # At least half should be reasonable
-    return reasonable >= len(sections[1:]) / 2
+    return reasonable >= len(sections[1:]) * pass_ratio
 
 
 def compute_structure_score(markdown: str, config: dict[str, Any]) -> int:
@@ -85,6 +89,9 @@ def compute_structure_score(markdown: str, config: dict[str, Any]) -> int:
     auto_cfg = get_nested(config, "chunking.auto", {})
     min_headings = auto_cfg.get("min_headings", 3)
     max_gap = auto_cfg.get("max_heading_gap_levels", 2)
+    min_section_tokens = auto_cfg.get("min_section_tokens", 100)
+    max_section_tokens = auto_cfg.get("max_section_tokens", 2000)
+    section_size_pass_ratio = auto_cfg.get("section_size_pass_ratio", 0.5)
 
     score = 0
 
@@ -95,7 +102,12 @@ def compute_structure_score(markdown: str, config: dict[str, Any]) -> int:
     if _check_heading_gaps(markdown, max_gap):
         score += 1
 
-    if _check_heading_content_sizes(markdown):
+    if _check_heading_content_sizes(
+        markdown,
+        min_tokens=min_section_tokens,
+        max_tokens=max_section_tokens,
+        pass_ratio=section_size_pass_ratio,
+    ):
         score += 1
 
     return score
@@ -208,6 +220,27 @@ class AutoChunker(BaseChunker):
 
 
 # ---------------------------------------------------------------------------
+# Whole chunker
+# ---------------------------------------------------------------------------
+
+class WholeChunker(BaseChunker):
+    """Keep the whole document as one chunk."""
+
+    def chunk(self, markdown: str, metadata: dict[str, Any]) -> list[Chunk]:
+        if not markdown.strip():
+            return []
+        return [Chunk(
+            text=markdown,
+            metadata={
+                **metadata,
+                "chunk_index": 0,
+                "total_chunks": 1,
+                "tokens": self.estimate_tokens(markdown),
+            },
+        )]
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -229,6 +262,17 @@ def create_chunker(config: dict[str, Any]) -> BaseChunker:
         return HeadingChunker(config)
     elif strategy == "recursive":
         return RecursiveChunker(config)
+    elif strategy == "slide":
+        from .slide import SlideChunker
+        return SlideChunker(config)
+    elif strategy == "sheet":
+        from .sheet import SheetChunker
+        return SheetChunker(config)
+    elif strategy == "timestamp":
+        from .timestamp import TimestampChunker
+        return TimestampChunker(config)
+    elif strategy == "whole":
+        return WholeChunker(config)
     else:
         # Unknown strategy → auto
         return AutoChunker(config)

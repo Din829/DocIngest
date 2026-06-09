@@ -165,7 +165,7 @@ def main(
     strategy: Optional[str] = typer.Option(
         None,
         "--strategy",
-        help="Override chunking strategy: auto, heading, recursive, slide, sheet.",
+        help="Override chunking strategy: auto, heading, recursive, slide, sheet, timestamp, whole.",
     ),
     max_pages: Optional[int] = typer.Option(
         None,

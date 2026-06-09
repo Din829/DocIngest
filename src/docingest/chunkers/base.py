@@ -190,7 +190,8 @@ class BaseChunker(ABC):
 
     def _get_overflow_strategy(self, block_type: str = "default") -> str:
         """
-        Get the on_overflow strategy (bypass | row_split | warn_and_bypass)
+        Get the on_overflow strategy
+        (bypass | row_split | item_split | warn_and_bypass)
         for a protected block type. Falls back to 'default' key, then to
         'bypass' for maximum backwards compatibility.
         """

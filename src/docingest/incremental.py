@@ -195,9 +195,18 @@ _RELEVANT_CONFIG_PATHS = [
                                            # enabled / interval_sec / max_frames all
                                            # change what visual content lands in the
                                            # transcript, so a change must re-run.
+    "parsing.audio.native_video.enabled",  # #5: native video vs ASR+frames changes
+                                           # the transcript/visual markdown path.
+    "parsing.audio.native_video.fps",      # #5: Gemini native-video sampling rate
+                                           # can change which visual details land in
+                                           # the generated markdown. Upload/poll
+                                           # timeout knobs are intentionally excluded:
+                                           # they affect reliability, not content.
     "parsing.url.enabled",                 # #5: URL resolution toggle
     "models.audio_transcription.primary.provider",   # #5: ASR engine
     "models.audio_transcription.primary.model",      # #5: ASR model
+    "models.video_understanding",          # #5: native video model chain and
+                                           # max_response_tokens affect output.
 ]
 
 

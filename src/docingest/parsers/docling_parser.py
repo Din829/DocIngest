@@ -1164,10 +1164,16 @@ class DoclingParser(BaseParser):
                 parse_meta["xlsx_embedded_images"] = embedded
                 self._last_parse_metadata = parse_meta
 
-        # If no page images from Docling (e.g., PPT SimplePipeline),
-        # try external conversion as fallback
+        # If no page images from Docling (e.g., PPT SimplePipeline, or a
+        # scanned PDF whose layout pass produced none), try external conversion
+        # as fallback — but ONLY when Vision is enabled. Page images exist
+        # solely to feed per-page Vision; with Vision off, rendering them is
+        # pure wasted work. This matters a LOT for scanned/image-heavy PDFs:
+        # the fallback shells out to LibreOffice, which on a 30 MB 10-page scan
+        # took ~113 s (measured) of work nobody consumes. Skip it.
+        vision_enabled = get_nested(self.config, "parsing.vision.enabled", True)
         has_any_image = any(p.image_path for p in pages_data)
-        if not has_any_image and pages_data:
+        if not has_any_image and pages_data and vision_enabled:
             self._try_external_page_images(file_path, assets_dir, pages_data)
 
         return pages_data
@@ -1484,33 +1490,43 @@ class DoclingParser(BaseParser):
         import tempfile
         from ..utils.binary_finder import find_binary, run_soffice_convert
 
-        # Cross-platform LibreOffice lookup — handles Windows Program Files
-        # installs, macOS /Applications bundles, and config/env overrides.
-        soffice = find_binary("soffice", self.config)
-        if not soffice:
-            logger.debug("LibreOffice not found — skipping PPT page image export")
-            return
+        # Resolve target DPI from config (unified across all paths)
+        image_dpi = get_nested(self.config, "parsing.vision.image_dpi", 180)
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                # Step 1: Convert to PDF via LibreOffice (helper supplies the
-                # writable UserInstallation profile soffice needs to run,
-                # esp. inside a packaged exe).
-                run_soffice_convert(
-                    file_path, tmpdir, "pdf",
-                    config=self.config, timeout=120,
-                )
-                pdf_files = list(Path(tmpdir).glob("*.pdf"))
-                if not pdf_files:
-                    return
+                # Step 1: obtain a PDF to rasterize.
+                #   - PDF input IS already a PDF → use it directly. Routing it
+                #     through LibreOffice would re-import every object as a Draw
+                #     shape and rasterize graphics, then re-export — on a 30 MB
+                #     10-page scan that measured ~113 s of pointless work (LO is
+                #     not built for PDF→PDF). pdf2image renders the original in
+                #     a few seconds instead.
+                #   - Non-PDF (PPT/DOCX/...) has no PDF form → convert via
+                #     LibreOffice headless first (the original purpose of this
+                #     fallback).
+                if file_path.suffix.lower() == ".pdf":
+                    render_pdf = file_path
+                else:
+                    soffice = find_binary("soffice", self.config)
+                    if not soffice:
+                        logger.debug(
+                            "LibreOffice not found — skipping page image export"
+                        )
+                        return
+                    run_soffice_convert(
+                        file_path, tmpdir, "pdf",
+                        config=self.config, timeout=120,
+                    )
+                    pdf_files = list(Path(tmpdir).glob("*.pdf"))
+                    if not pdf_files:
+                        return
+                    render_pdf = pdf_files[0]
 
-                # Resolve target DPI from config (unified across all paths)
-                image_dpi = get_nested(self.config, "parsing.vision.image_dpi", 180)
-
-                # Step 2: PDF pages → images via Docling or pdf2image
+                # Step 2: PDF pages → images via pdf2image or Docling fallback
                 try:
                     from pdf2image import convert_from_path
-                    images = convert_from_path(str(pdf_files[0]), dpi=image_dpi)
+                    images = convert_from_path(str(render_pdf), dpi=image_dpi)
                     for i, img in enumerate(images):
                         if i < len(pages_data):
                             name = f"{file_path.stem}-page-{pages_data[i].page_no:03d}.png"
@@ -1530,7 +1546,7 @@ class DoclingParser(BaseParser):
                     conv = DocumentConverter(
                         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
                     )
-                    result = conv.convert(str(pdf_files[0]))
+                    result = conv.convert(str(render_pdf))
                     for page_no, page in result.document.pages.items():
                         if page.image is None:
                             continue

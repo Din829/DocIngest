@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1551,6 +1552,7 @@ def _is_empty_supplement(text: str) -> bool:
 def _enrich_with_vision(
     parse_result,
     config: dict[str, Any],
+    on_page: Callable[[int, int], None] | None = None,
 ) -> None:
     """
     Per-page Vision enrichment with fallback chain — parallel execution.
@@ -1559,6 +1561,15 @@ def _enrich_with_vision(
       1. Send page image + Docling text to AI (parallel across pages)
       2. If Vision succeeds → append AI result to that page section
       3. If Vision fails → keep Docling text as-is (fallback)
+
+    on_page: optional progress callback ``on_page(done, total)`` invoked as
+        Vision pages complete (``done`` = pages finished so far, ``total`` =
+        pages actually sent to Vision after triage/cap). Default None = no
+        progress reporting (behaviour identical to before). Vision runs in a
+        ThreadPoolExecutor, so the ``done`` counter is incremented under a lock
+        (a real concurrency boundary, not defensive padding). Both the batched
+        and per-page paths report through this; the report cadence is
+        ``parsing.vision.progress_interval`` (default 1 = every page).
 
     Optional triage (parsing.vision.triage.enabled) skips pages that are
     purely text with no visual elements — saving API cost without losing info.
@@ -1686,6 +1697,10 @@ def _enrich_with_vision(
 
     doc_format = parse_result.metadata.get("format")
     vision_timeout = get_nested(config, "models.vision.timeout_sec", 180)
+    # Ceiling for the batched-Vision wall-clock cap. None = no ceiling (the
+    # cap is just vision_timeout × batch_size). Separate knob because batched
+    # calls are inherently longer than single-page ones; see config comment.
+    vision_batch_timeout_max = get_nested(config, "models.vision.batch_timeout_max_sec", 1800)
     results: dict[int, str] = {}  # page_index → vision result text
     described = 0
     failed = 0
@@ -1699,6 +1714,37 @@ def _enrich_with_vision(
     # than just a count. A 1-element list so the nested _call_vision closure can
     # write to it without a `nonlocal` declaration.
     _vision_last_error: list[str] = []
+
+    # --- Progress reporting infrastructure (opt-in via on_page) ---
+    # Vision is the longest silent stretch inside a single file (measured: a
+    # 1.9 MB PDF sat 76 s with zero feedback). When on_page is provided, report
+    # "done/total" as pages complete so a UI can show a live sub-progress bar.
+    # done is bumped under a lock because both Vision paths run in a
+    # ThreadPoolExecutor and `+= 1` is not atomic under the GIL — a real
+    # concurrency boundary, not defensive padding. total = pages actually sent
+    # to Vision (vision_tasks length, post-triage/cap). Cadence is configurable
+    # (default 1 = every page); the last page always fires so the bar reaches
+    # 100%.
+    _vision_total = len(vision_tasks)
+    _progress_interval = max(1, int(get_nested(config, "parsing.vision.progress_interval", 1)))
+    _progress_lock = threading.Lock()
+    _progress_done = [0]  # 1-element list so closures mutate without `nonlocal`
+
+    def _report_vision_progress(units: int = 1) -> None:
+        """Advance the Vision page counter by `units` and fire on_page on the
+        configured cadence (and always on the final unit). No-op when on_page
+        is None. Never lets a buggy callback break Vision — exceptions are
+        swallowed with a warning, mirroring _emit_progress."""
+        if on_page is None:
+            return
+        with _progress_lock:
+            _progress_done[0] += units
+            done = _progress_done[0]
+        if done % _progress_interval == 0 or done >= _vision_total:
+            try:
+                on_page(done, _vision_total)
+            except Exception as e:
+                logger.warning(f"on_page callback raised {type(e).__name__}: {e}; ignored.")
 
     # ------------------------------------------------------------------
     # Batched multi-image branch — for xlsx whose single sheet renders to
@@ -1802,7 +1848,13 @@ def _enrich_with_vision(
             # Scale timeout with batch size, capped so a hung API surfaces eventually.
             # Single-batch wall-clock cap is independent of how many batches run
             # in parallel — concurrency doesn't change per-call latency.
-            batch_timeout = min(vision_timeout * len(batch_imgs), 600)
+            # Ceiling is configurable (models.vision.batch_timeout_max_sec);
+            # None disables the ceiling so the cap is just timeout × batch.
+            scaled = vision_timeout * len(batch_imgs)
+            batch_timeout = (
+                scaled if vision_batch_timeout_max is None
+                else min(scaled, vision_batch_timeout_max)
+            )
 
             try:
                 batch_text = run_with_timeout(
@@ -1817,6 +1869,22 @@ def _enrich_with_vision(
                     ),
                     batch_timeout,
                 )
+            except TimeoutError as e:
+                # Tell the caller which knob to tune: scaled=timeout×batch was
+                # capped by batch_timeout_max_sec. Both fields matter — the user
+                # might want to raise either timeout_sec OR the ceiling.
+                hit_cap = (
+                    vision_batch_timeout_max is not None
+                    and scaled > vision_batch_timeout_max
+                )
+                hint = (
+                    f"hit batch_timeout_max_sec={vision_batch_timeout_max}s "
+                    f"(raise models.vision.batch_timeout_max_sec or set to null)"
+                    if hit_cap
+                    else f"per-call cap={vision_timeout}s × batch={len(batch_imgs)} "
+                         f"(raise models.vision.timeout_sec)"
+                )
+                return batch_idx, None, f"TimeoutError: {e} — {hint}"
             except Exception as e:
                 return batch_idx, None, f"{type(e).__name__}: {e}"
             if not (batch_text and batch_text.strip()):
@@ -1856,6 +1924,12 @@ def _enrich_with_vision(
                 # wrapped is guaranteed non-None when err is None (see _run_one_batch).
                 assert wrapped is not None
                 results_by_idx[idx] = wrapped
+                # Sub-progress: advance by this batch's page count (last batch
+                # may be short). total = n_total = len(vision_tasks), so the
+                # batched and per-page paths report the same "Vision pages
+                # done / total" semantics to the UI.
+                _batch_pages = min(max_batch, n_total - idx * max_batch)
+                _report_vision_progress(_batch_pages)
                 # Approx progress signal — order is "completion order" not
                 # idx order, which matches what users expect for parallel work.
                 logger.info(
@@ -1865,6 +1939,12 @@ def _enrich_with_vision(
 
         if any_batch_failed:
             use_batched = False
+            # Batched mode aborted → the per-page branch below re-processes the
+            # SAME pages from scratch. Reset the progress counter so the UI
+            # bar restarts from 0 instead of double-counting the partial
+            # batched run on top of the full per-page run.
+            with _progress_lock:
+                _progress_done[0] = 0
         else:
             # Successful batched run: merge by ORIGINAL batch order (idx) so
             # the assembled markdown preserves source page sequence even
@@ -1910,9 +1990,16 @@ def _enrich_with_vision(
                     vision_timeout,
                 )
             except TimeoutError as e:
-                logger.warning(f"Vision timed out for page {page_data.page_no}: {e}")
+                logger.warning(
+                    f"Vision timed out for page {page_data.page_no}: {e} "
+                    f"(per-call cap={vision_timeout}s — raise "
+                    f"models.vision.timeout_sec for slow endpoints / dense pages)"
+                )
                 if not _vision_last_error:
-                    _vision_last_error.append(f"timeout: {e}")
+                    _vision_last_error.append(
+                        f"timeout: {e} — raise models.vision.timeout_sec "
+                        f"(current={vision_timeout}s)"
+                    )
                 return idx, None
             except Exception as e:
                 logger.warning(f"Vision failed for page {page_data.page_no}: {e}")
@@ -1946,6 +2033,9 @@ def _enrich_with_vision(
                     # check. Does NOT alter the fallback — the page still keeps
                     # its Docling text as before; we only remember it failed.
                     failed_page_texts.append(_idx_to_text.get(idx, ""))
+                # Sub-progress: one page done (success or fail both count — the
+                # bar tracks Vision *completion*, not success rate).
+                _report_vision_progress(1)
 
     # Inject results into markdown sections.
     # Two modes depending on whether the source has pagebreak markers:
@@ -2415,7 +2505,7 @@ def _resolve_parse_timeout(file_path: Path, config: dict[str, Any]) -> float | N
     the page count can't be probed (non-PDF / probe failure). Returns None
     (= no timeout) only when the fixed value itself is null.
     """
-    fixed = get_nested(config, "parsing.timeout_sec", 300)
+    fixed = get_nested(config, "parsing.timeout_sec", 600)
     if not get_nested(config, "parsing.dynamic_timeout.enabled", True):
         return fixed
     pages = _probe_page_count(file_path)
@@ -2434,6 +2524,7 @@ def process_single_file(
     config: dict[str, Any],
     output_dir: Path,
     existing_names: set[str] | None = None,
+    on_file_progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[FileResult, list]:
     """
     Process a single file through Phase 1 → 2 → 3.
@@ -2444,6 +2535,11 @@ def process_single_file(
         chunker: Chunker instance (None if chunking disabled).
         config: Full config dict.
         output_dir: Base output directory (e.g. ./knowledge/).
+        on_file_progress: Optional within-file progress callback
+            ``on_file_progress(phase, done, total)``. Currently fired by the
+            Vision phase (phase="vision") as pages complete, so a UI can show
+            sub-file progress during the longest silent stretch. Default None =
+            no within-file reporting (behaviour identical to before).
 
     Returns:
         FileResult with processing details.
@@ -2476,6 +2572,12 @@ def process_single_file(
     # count instead of the same flat cap a 10-page memo gets (see
     # _resolve_parse_timeout / parsing.dynamic_timeout).
     parse_timeout = _resolve_parse_timeout(file_path, config)
+    # Parse is a Docling black box (no per-page hook), so we can only signal
+    # "busy parsing" — not a percentage. Emitting sub_total=0 tells the UI to
+    # show an indeterminate/spinner state for this phase instead of sitting
+    # frozen for the ~30 s a large PDF takes before Vision starts.
+    if on_file_progress is not None:
+        on_file_progress("parse", 0, 0)
     try:
         from .utils.timeout import run_with_timeout
         parse_result = run_with_timeout(
@@ -2484,7 +2586,24 @@ def process_single_file(
         )
     except TimeoutError as e:
         result.success = False
-        result.error = f"Parse timed out: {e}"
+        # Tell the caller exactly which knob to raise — both humans and agents
+        # see the error string, and "timed out after Ns" alone doesn't reveal
+        # whether to raise parsing.timeout_sec or parsing.dynamic_timeout.max_sec.
+        ext = file_path.suffix.lstrip(".").lower()
+        dyn_on = get_nested(config, "parsing.dynamic_timeout.enabled", True)
+        is_paged_pdf = ext == "pdf" and dyn_on
+        knob = (
+            "parsing.dynamic_timeout.max_sec" if is_paged_pdf
+            else "parsing.timeout_sec"
+        )
+        env_knob = "DOCINGEST__" + knob.replace(".", "__")
+        result.error = (
+            f"Parse timed out: {e}. "
+            f"This is {knob} (current={parse_timeout}s). "
+            f"Raise it for this input — e.g. {env_knob}=1800, or set in your "
+            f"docingest.yaml. For long-form video, native_video uploads can "
+            f"also stall on Files API: see parsing.audio.native_video.files_api_poll_timeout_sec."
+        )
         result.error_type = "timeout"
         return result, []
     except (FileNotFoundError, PermissionError, OSError) as e:
@@ -2587,12 +2706,22 @@ def process_single_file(
     # --- Phase 1.3: Ensure page images for Vision (formats without native page rendering) ---
     # All three Office formats route through the same LibreOffice → PDF → screenshots
     # backend. Each has its own config section so limits can be tuned per format.
-    if result.format in ("xlsx", "xls"):
-        _ensure_excel_page_images(file_path, parse_result, config)
-    elif result.format in ("docx", "doc"):
-        _ensure_docx_page_images(file_path, parse_result, config)
-    elif result.format in ("pptx", "ppt"):
-        _ensure_pptx_page_images(file_path, parse_result, config)
+    #
+    # Gated on parsing.vision.enabled: these page images exist ONLY to feed
+    # per-page Vision (Phase 1.5). With Vision off, rendering them via
+    # LibreOffice is pure wasted work — and it's expensive (a single PPTX
+    # measured 8.3 s of LibreOffice rendering). This is the biggest instance of
+    # the "render images nobody consumes" trap because EVERY Office file hits
+    # Phase 1.3, unlike the PDF fallback which only fires when Docling produced
+    # no page image. Vision-off integrators (e.g. markdown-only callers) paid
+    # this on every Office document before this guard.
+    if get_nested(config, "parsing.vision.enabled", True):
+        if result.format in ("xlsx", "xls"):
+            _ensure_excel_page_images(file_path, parse_result, config)
+        elif result.format in ("docx", "doc"):
+            _ensure_docx_page_images(file_path, parse_result, config)
+        elif result.format in ("pptx", "ppt"):
+            _ensure_pptx_page_images(file_path, parse_result, config)
 
     # --- Phase 1.4: Post-parse hooks (pre-Vision) ---
     # Hooks that inject structured data the Vision step should be aware of
@@ -2612,7 +2741,14 @@ def process_single_file(
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):
         try:
-            _enrich_with_vision(parse_result, config)
+            # Wrap the file-level callback into the (done, total) shape
+            # _enrich_with_vision expects, tagging the phase as "vision".
+            _vision_on_page = (
+                (lambda done, total: on_file_progress("vision", done, total))
+                if on_file_progress is not None
+                else None
+            )
+            _enrich_with_vision(parse_result, config, on_page=_vision_on_page)
         except VisionSystemicFailure as e:
             # Every Vision page failed AND those pages depended on Vision for
             # their content (scanned / garbled). Fail THIS file — don't write a
@@ -3154,6 +3290,24 @@ def run_pipeline(
                 "error_type":  <str — "" when success>,
             }
 
+        A second, OPTIONAL event kind reports progress WITHIN a single file so
+        a UI isn't frozen during a long file (Vision is the worst offender —
+        measured 76 s of silence on a 1.9 MB PDF). Consumers that only handle
+        ``kind == "file_done"`` ignore it automatically (backwards-compatible)::
+
+            {
+                "kind":        "file_progress",
+                "phase":       "vision",           # the sub-stage reporting
+                "file":        "<basename>",
+                "current":     <1-based index of the file being processed>,
+                "total":       <total files in this run>,
+                "sub_current": <Vision pages completed so far>,
+                "sub_total":   <Vision pages sent (post-triage/cap)>,
+            }
+
+        Cadence of file_progress is ``parsing.vision.progress_interval``
+        (default 1 = every page; raise it for very long documents).
+
     Returns:
         PipelineResult with details of all processed files. When safety
         strict mode aborts the run, result.safety.aborted is True and
@@ -3472,6 +3626,35 @@ def run_pipeline(
                     )
                 break
 
+            # Within-file progress (Vision pages) → emit a distinct
+            # kind="file_progress" event. Old consumers that filter on
+            # kind=="file_done" ignore it automatically (backwards-compatible).
+            # current/total are file-level (this is file _progress_done+1 of
+            # _progress_total); sub_current/sub_total are the within-file
+            # Vision page counts. No-op unless the caller passed on_progress.
+            _fp_basename = file_path.name
+
+            def _on_file_progress(
+                phase: str, sub_done: int, sub_total: int, _name=_fp_basename
+            ) -> None:
+                if on_progress is None:
+                    return
+                try:
+                    on_progress({
+                        "kind": "file_progress",
+                        "phase": phase,
+                        "file": _name,
+                        "current": _progress_done + 1,
+                        "total": _progress_total,
+                        "sub_current": sub_done,
+                        "sub_total": sub_total,
+                    })
+                except Exception as e:
+                    _pipeline_logger.warning(
+                        f"on_progress (file_progress) raised "
+                        f"{type(e).__name__}: {e}; ignored."
+                    )
+
             file_result, file_chunks = process_single_file(
                 file_path=file_path,
                 parser=parser,
@@ -3479,6 +3662,7 @@ def run_pipeline(
                 config=config,
                 output_dir=output_dir,
                 existing_names=existing_names,
+                on_file_progress=_on_file_progress,
             )
 
             # Tag lifecycle status for run_log. Order matters:
@@ -3630,14 +3814,22 @@ def run_pipeline(
         except Exception as e:
             _pipeline_logger.warning(f"Tags enrichment failed: {e}")
 
-    # Write errors.json if any failures
+    # Write errors.json if any failures, OR remove a stale one from a prior
+    # failing run when this run succeeded. errors.json is a per-run snapshot
+    # (run_log.py docstring); leaving last run's failures behind makes a
+    # green run look broken.
     report_file = get_nested(config, "error_handling.report_file", "errors.json")
+    errors_path = output_dir / report_file
     if pipeline_result.errors:
-        errors_path = output_dir / report_file
         errors_path.write_text(
             json.dumps(pipeline_result.errors, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    elif errors_path.exists():
+        try:
+            errors_path.unlink()
+        except OSError as e:
+            _pipeline_logger.warning(f"Could not remove stale errors.json: {e}")
 
     # Quality report: scan sources/*.md for [?] and [unreadable] markers
     # left by Vision when it encountered partially-readable content. Gives
