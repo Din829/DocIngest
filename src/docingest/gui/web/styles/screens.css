@@ -12,9 +12,10 @@
   width: 100%;
 }
 .brand-mark {
-  font-size: 22px;
-  color: var(--ink);
-  line-height: 1;
+  width: 26px;
+  height: 26px;
+  object-fit: contain;   /* 1024×1024 logo: 等比缩放，不裁切不拉伸 */
+  display: block;
 }
 .brand-name {
   font-family: var(--font-serif);
@@ -375,10 +376,33 @@
 .stop-btn:hover { background: var(--line); }
 
 /* ---- 04 完了・成果物 ---- */
+/* This screen has the tallest content (big serif title + stats + two columns).
+   Make the main area its own scroll container: short content stays vertically
+   centered (justify-content:center + the .center-col auto margins below), tall
+   content scrolls inside this screen instead of being clipped by the window
+   edge. overflow-y:auto only shows a scrollbar when content actually exceeds
+   the area, so the default large-window layout is visually unchanged. */
 .done-main {
   flex: 1 1 0;
   min-height: 0;
+  overflow-y: auto;
+  /* "safe center": center when content fits, fall back to flex-start when it
+     doesn't. Without "safe", a column taller than the viewport gets its top
+     pushed off-screen by the centering algorithm AND .center-col's
+     flex-shrink:0 means overflow:auto can't recover the top — the hero
+     becomes unreachable. Chromium 81+ (so WebView2 is fine). */
+  justify-content: safe center;
   padding: var(--sp-7) var(--sp-8) var(--sp-8);
+}
+/* flex-shrink:0 stops the column being squeezed when it's taller than the
+   area (which would distort the layout instead of scrolling). Vertical
+   centering for the short-content case is handled by the parent's
+   justify-content:center — deliberately NOT margin:auto, which has a known
+   top-clipping bug with flex + overflow scroll on older Chromium/WebView2
+   (the top of overscrolling content becomes unreachable). justify-content
+   centers when it fits and scrolls safely from the top when it doesn't. */
+.done-main .center-col {
+  flex-shrink: 0;
 }
 
 /* Stats (pen: 4 metrics across, top+bottom hairline, padding [$sp-5,0]) */
@@ -405,9 +429,15 @@
 .nr-icon { font-size: 14px; }
 .nr-icon.is-warn { color: var(--warn); }
 .nr-icon.is-muted { color: var(--ink-3); }
+/* Failed-file rows use the one alert color reserved for things that need
+   attention (frontend-design §四: color only for what must be noticed). */
+.nr-icon.is-error { color: var(--danger); }
 .nr-text { font-size: 12px; line-height: 1.5; color: var(--ink-2); }
 
-/* Two columns */
+/* Two columns. flex-start keeps each column at its own natural height so
+   the row doesn't fight .center-col's flex-shrink:0 (cross-stretching here
+   collapses the height chain and pushes the hero off-screen — verified).
+   The preview body sets its own height via clamp below. */
 .done-cols { width: 100%; align-items: flex-start; }
 .sec-label {
   font-size: 12px;
@@ -416,11 +446,42 @@
   color: var(--ink-3);
 }
 
+/* Run summary line (B): plain-language "N ファイル · M ページ · K チャンク".
+   A quiet caption above the artefact list — no box, just spacing + a hairline
+   under it to separate from the file list (frontend-design §四: no box-in-box). */
+.done-summary {
+  font-size: 12px;
+  color: var(--ink-2);
+  padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--line);
+}
+.done-summary:empty { display: none; }
+
 /* Artifact rows (pen ArtRow: icon + name/desc) */
 .art-row { width: 100%; padding: var(--sp-2) 0; }
 .art-icon { font-size: 15px; color: var(--ink-3); }
 .art-name { font-size: 12px; color: var(--ink); }
 .art-desc { font-size: 11px; color: var(--ink-3); }
+/* Clickable artefacts: a quiet hover tint + pointer signals "open this",
+   without boxing each row (no box-in-box). Negative side margin + matching
+   padding lets the hover bleed slightly past the text so it reads as a row
+   target, not a button. */
+.art-clickable {
+  cursor: pointer;
+  border-radius: 8px;
+  margin-left: -8px;
+  margin-right: -8px;
+  padding-left: 8px;
+  padding-right: 8px;
+  transition: background 0.12s ease;
+}
+.art-clickable:hover { background: var(--inset); }
+
+/* Cost↔token metric is clickable. Keep it subtle — a pointer + the faintest
+   hover tint signals "interactive" without turning a stat into a button
+   (frontend-design §四: don't dress data up as a control). */
+.m-cost-metric { cursor: pointer; border-radius: 8px; transition: background 0.12s ease; }
+.m-cost-metric:hover { background: var(--inset); }
 
 /* Done actions (pen: accent open button + two ghost buttons) */
 .open-btn {
@@ -446,6 +507,54 @@
 
 /* Preview (pen PreviewC: header select + bordered panel body) */
 .preview-col { min-width: 0; }
+/* 「コピー」 button — a quiet tool inside the preview header (next to the file
+   select), not a third main action. Subtle by default, ink on hover. Turns the
+   ok color briefly on success (flashCopied). Dimmed when nothing to copy. */
+.pv-copy {
+  font-size: 11px;
+  color: var(--ink-3);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: 6px;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.pv-copy:hover { color: var(--ink); background: var(--inset); }
+.pv-copy .pvc-icon { font-size: 13px; }
+.pv-copy.is-copied { color: var(--ok); }
+.pv-copy:disabled { opacity: 0.4; cursor: default; }
+.pv-copy:disabled:hover { color: var(--ink-3); background: none; }
+
+/* 原文/整形版 segmented toggle in the preview header. Quiet, text-only tabs;
+   the active one gets the ink color. Only shown when a refined copy exists. */
+.pv-view-toggle { gap: 2px; }
+.pvt-tab {
+  font-size: 11px;
+  color: var(--ink-3);
+  padding: 2px 8px;
+  border-radius: 6px;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.pvt-tab:hover { color: var(--ink); }
+.pvt-tab.is-active { color: var(--ink); background: var(--inset); }
+
+/* Indeterminate spinner for the refine button (no fake progress: refine gives
+   no per-step signal, so an honest "working" spinner is correct). Hidden until
+   the button has .is-loading. Honors reduced-motion below. */
+.btn-spinner {
+  display: none;
+  width: 13px;
+  height: 13px;
+  margin-right: 7px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: btn-spin 0.7s linear infinite;
+}
+.btn-accent.is-loading .btn-spinner { display: inline-block; }
+@keyframes btn-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .btn-spinner { animation: none; }
+}
 .pv-select {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -456,7 +565,17 @@
 }
 .pv-body {
   width: 100%;
-  height: 300px;
+  /* Fixed height — a layout fact of this screen, not a token (cf.
+     base.css' "one-off sizes stay inline"). Tried viewport-relative
+     (clamp + vh): it overflowed at the default 920h window because
+     center-col is flex-shrink:0 and pushes the hero off when sized
+     against 100vh instead of done-main. A fixed value sidesteps the
+     whole height chain — done-main's overflow:auto still scrolls if
+     anyone shrinks the window past the comfort point.
+     520 ≈ the left actions column's height (artefact list + 4 action
+     buttons + gaps), so the preview frame bottom aligns with the last
+     action button. Adjust if the actions list changes shape. */
+  height: 520px;
   border-radius: 10px;
   background: var(--panel);
   border: 1px solid var(--line);
@@ -751,6 +870,33 @@
 }
 .build-btn [data-lucide] { font-size: 15px; }
 .build-btn:hover { opacity: 0.92; }
+
+/* Build options: per-run choices between cost notice and the build button.
+   No nested borders — the outer build-card is already a bordered panel, so
+   inner controls separate by spacing + inset background, not by lines (the
+   "框中框" anti-pattern in frontend-design-pro §四). */
+.bc-options { width: 100%; text-align: left; }
+.bc-mode { width: 100%; }
+.bc-mode-opt {
+  flex: 1;
+  border-radius: 10px;
+  padding: var(--sp-3) var(--sp-4);
+  text-align: left;
+  background: transparent;
+  border: none;
+}
+.bc-mode-opt { cursor: pointer; transition: background 120ms ease; }
+.bc-mode-opt:hover:not(.is-selected) { background: var(--line); }
+.bc-mode-opt.is-selected { background: var(--inset); }
+.bmo-title { font-size: 13px; font-weight: 600; color: var(--ink); }
+.bmo-desc  { font-size: 11px; line-height: 1.5; color: var(--ink-2); }
+.bc-enrich {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-1);
+}
+.bce-label { font-size: 13px; color: var(--ink); }
+.bce-desc  { font-size: 11px; color: var(--ink-2); }
+
 /* 12 building note */
 .graph-note { font-size: 12px; color: var(--ink-3); text-align: center; }
 

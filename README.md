@@ -159,7 +159,7 @@ Options:
 ```
 -o, --output PATH    Output directory (default: ./knowledge/<input-name>/ for single input, ./knowledge/ for mixed)
 -c, --config PATH    Project config YAML
---strategy TEXT      Override chunking strategy: auto | heading | recursive | slide | sheet
+--strategy TEXT      Override chunking strategy: auto | heading | recursive | slide | sheet | timestamp | whole
                      (auto picks heading/recursive/slide/sheet/timestamp/whole by file format)
 --max-pages INTEGER  Parse only the first N pages of paged inputs (PDF/PPTX/DOCX).
                      Caps the whole parse (layout + Vision + chunking), and the
@@ -304,11 +304,14 @@ result = docingest.ingest(
 )
 ```
 
-**Progress callback (optional)** — pass `on_progress=...` to receive one event per file completion (cached / added / updated / failed / skipped). Useful when piping progress to a UI or SSE stream. The callback runs synchronously on the pipeline thread; exceptions are swallowed (logged at warning level) so a buggy callback can't break the run:
+**Progress callback (optional)** — pass `on_progress=...` to receive progress events. Two kinds: `kind="file_done"` once per file completion (cached / added / updated / failed / skipped), and `kind="file_progress"` for *within-file* progress (Vision page `sub_current/sub_total` while a long file is being enriched, plus a "parsing" busy signal) — so a UI bar isn't frozen during a big file. Old consumers that only handle `file_done` ignore the new kind automatically. Useful when piping progress to a UI or SSE stream. The callback runs synchronously on the pipeline thread; exceptions are swallowed (logged at warning level) so a buggy callback can't break the run:
 
 ```python
 def on_event(e):
-    print(f"[{e['current']}/{e['total']}] {e['file']} — {e['status']}")
+    if e["kind"] == "file_progress":          # within-file (Vision pages / parsing)
+        print(f"  └ {e['file']} {e['phase']} {e.get('sub_current')}/{e.get('sub_total')}")
+    else:                                      # file_done
+        print(f"[{e['current']}/{e['total']}] {e['file']} — {e['status']}")
 
 docingest.ingest("./docs/", output="./kb/", on_progress=on_event)
 ```
@@ -652,7 +655,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Phase breakdown, design
 - **Format-aware Vision supplement** — xlsx (rendered cleanly by openpyxl) lets Vision SUPPLEMENT only the visual content (charts / pictures / stamps) and never re-transcribe the table, removing the Docling↔Vision duplication **at the source** (measured: per-section re-transcription 65–92% → 0–5%, and body text is never dropped because it lives in the openpyxl render the supplement can't touch). PDF/PPT stay on full whole-page transcription — Docling fragments their 方眼紙 tables, so they need it to recover the body. Per-format via `parsing.<format>.vision.supplement_only` (global default off, xlsx on).
 - **PPTX chart direct-read** — python-pptx extracts chart data (categories, series, values) as 100% accurate Markdown tables. Vision supplements with visual context.
 - **DOCX math equations** — OMML → LaTeX preprocessing before Docling parses. `$E=mc^{2}$` instead of garbled text.
-- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists) and per-type `on_overflow` strategy — oversized Markdown tables are split at data-row boundaries with the header repeated in every sub-chunk (2026 industry standard, handles Docling's merged-cell expansion). Single-pass heading merge (prelude + orphan-heading + small-section policies) produces zero-fragment chunks with the deepest-available title_path. Adjacent byte-identical chunks auto-deduplicated. All behaviour is config-driven — every knob in `chunking.heading.*` and `chunking.protection.*`.
+- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists) and per-type `on_overflow` strategy — oversized Markdown tables are split at data-row boundaries with the header repeated in every sub-chunk, and oversized lists split at item boundaries before falling back to recursive splitting for a single huge item. Single-pass heading merge (prelude + orphan-heading + small-section policies) produces zero-fragment chunks with the deepest-available title_path. Adjacent byte-identical chunks auto-deduplicated. All behaviour is config-driven — every knob in `chunking.heading.*` and `chunking.protection.*`.
 - **Excel via openpyxl (default)** — xlsx is rendered by `openpyxl` instead of Docling: every sheet's body lives under its own `## SheetName` heading (so chunk `title_path` always points at the right sheet), merged cells stay anchor-only (no N×N value duplication), entirely-empty columns are pruned out of wide layouts. Embedded pictures pasted into cells (PNG/JPEG/GIF/BMP/TIFF/WebP **and** EMF/WMF — read directly from the xlsx OOXML structure, bypassing openpyxl's silent EMF drop) are anchored to their actual row with a `<!-- image: <filename> -->` marker so Vision triage can pick them up and downstream RAG / Agentic Search can locate them. Falls back to Docling automatically if openpyxl is unavailable or the workbook can't open. Disable via `parsing.xlsx.use_openpyxl_renderer: false`.
 - **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction.
 - **Legacy Office support (`.xls` / `.doc` / `.ppt`)** — pre-2007 binary Office files are auto-converted to their modern OOXML form (`.xlsx` / `.docx` / `.pptx`) via LibreOffice as Phase 0.5, then routed through the full modern-format path (Docling / openpyxl renderer + Vision + chunking). Docling rejects the binary forms outright, so this conversion is what makes them work at all. The original filename / mimetype / mtime are preserved in `metadata.lineage.original_input`, and a `format_convert` entry is recorded in `metadata.lineage.transformations`. Conversion result is cached at `.cache/_legacy_convert/<sha256>.<ext>` so the same file converts exactly once per output dir. LibreOffice missing → warning + degrades to TextParser fallback (the pipeline never raises). Disable per format via `parsing.<xls|doc|ppt>.auto_convert_to_*: false`.
@@ -722,3 +725,4 @@ your own changes.
 
 - **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt. **§10** covers the optional `docingest.graph` layer (boundaries, module layout, three-tier caching, swapping backends).
 - **[INTEGRATION.md](docs/INTEGRATION.md)** — How to integrate DocIngest into your own system (CLI subprocess / Python library / MCP), per-scenario recipes, cross-cutting concerns
+- **[COMPETITIVE_POSITIONING.md](docs/COMPETITIVE_POSITIONING.md)** — Where DocIngest sits vs. cloud suites (Azure/AWS/GCP) and local tools (Docling/MinerU/markitdown); who its users are, which fights to pick and which to skip, and what that means for development priorities. The moat: Japanese Excel spec-sheet (方眼紙) handling backed by real-sample access.

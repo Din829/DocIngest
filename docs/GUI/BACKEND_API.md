@@ -32,7 +32,7 @@ JS 界面（手写 HTML/CSS）
 |---|---|---|
 | `inspect(paths)` | `api.inspect(paths)` | 预检表：每文件 `{name, format, size_mb, pages, est_cost_usd, recommendation}`（inspect 实测字段） |
 | `start_ingest(paths, name, opts)` | 分配隔离目录（第三节）→ `api.ingest(output=<dir>, on_progress=推送, ...)` | 完成返回库概要；进度见下 |
-| 进度推送 | `ingest` 的 `on_progress(event)` 回调 → `window.evaluate_js` 推 JS | JS 收 `{kind,status,file,current,total,chunks,elapsed_ms,error,error_type}`，刷 03 屏 |
+| 进度推送 | `ingest` 的 `on_progress(event)` 回调 → `window.evaluate_js` 推 JS | 两种事件：`kind="file_done"` 文件级 `{kind,status,file,current,total,chunks,elapsed_ms,error,error_type}`；`kind="file_progress"` 文件内 `{kind,phase,file,current,total,sub_current,sub_total}`（`phase="vision"` 带页号、`phase="parse"` 为忙碌态）。03 屏可做"文件 3/10 + 该文件 Vision 页 5/11"两级进度条 |
 | `confirm_ingest(...)` | 09 成本确认「确认」→ 同上但 `acknowledge_large=True` | — |
 
 > 长任务（ingest 跑几分钟）必须异步：桥方法在后台线程跑 ingest，`on_progress`

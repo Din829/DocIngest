@@ -16,8 +16,29 @@ import sys
 from typing import Any
 
 
-def _check_import(module: str) -> tuple[str | None, str | None]:
-    """Try importing a module. Returns (version, None) or (None, error)."""
+def _check_import(module: str, *, fast: bool = False) -> tuple[str | None, str | None]:
+    """Check whether a module is available. Returns (version, None) or (None, error).
+
+    fast=False (default): real ``__import__`` — gives the true version string
+    but executes the package's top-level code. Some optional packages are heavy
+    (sentence_transformers alone takes ~5s); the full scan can take ~9s. CLI
+    keeps this default so ``docingest doctor`` shows real versions.
+
+    fast=True: ``importlib.util.find_spec`` only. Detects presence in <1ms per
+    module without executing any package code; the full scan drops to ~6ms.
+    Trade-off: version becomes the sentinel "installed" (presence-only). Use
+    when the caller only needs a yes/no (the GUI environment-check screen
+    displays 「検出済み / 未設定」 and never shows the version)."""
+    if fast:
+        import importlib.util
+        try:
+            spec = importlib.util.find_spec(module)
+        except (ValueError, ModuleNotFoundError) as e:
+            # find_spec can raise on broken parent packages — treat as missing.
+            return None, str(e)
+        if spec is None:
+            return None, f"No module named '{module}'"
+        return "installed", None
     try:
         mod = __import__(module)
         version = getattr(mod, "__version__", getattr(mod, "VERSION", "installed"))
@@ -61,11 +82,23 @@ _COST_SWITCHES: list[tuple[str, str, str]] = [
 ]
 
 
-def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
+def run_doctor(
+    config: dict[str, Any] | None = None,
+    *,
+    fast: bool = False,
+) -> dict[str, Any]:
     """
     Run full environment check. Returns structured results.
 
     Can be called programmatically (returns dict) or via CLI (prints table).
+
+    fast=False (default, CLI path): real ``__import__`` per package — slow
+    (~9s on a full install, dominated by sentence_transformers) but yields
+    real version strings.
+
+    fast=True (GUI path): presence-only via ``importlib.util.find_spec``;
+    full scan drops to ~10ms. Versions become the sentinel "installed".
+    Use when the caller only needs ok/missing flags (the env-check screen).
     """
     results: dict[str, Any] = {
         "python": {}, "core": {}, "optional": {}, "tools": {}, "api_keys": {},
@@ -97,7 +130,7 @@ def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
         "requests": "requests",
     }
     for pkg_name, import_name in core_packages.items():
-        ver, err = _check_import(import_name)
+        ver, err = _check_import(import_name, fast=fast)
         results["core"][pkg_name] = {
             "version": ver,
             "ok": ver is not None,
@@ -116,7 +149,7 @@ def run_doctor(config: dict[str, Any] | None = None) -> dict[str, Any]:
         "sentence-transformers": {"import": "sentence_transformers", "install": 'pip install -e ".[graph-local]"', "purpose": "Local embeddings for GraphRAG (zero API cost)"},
     }
     for pkg_name, info in optional_packages.items():
-        ver, err = _check_import(info["import"])
+        ver, err = _check_import(info["import"], fast=fast)
         results["optional"][pkg_name] = {
             "version": ver,
             "ok": ver is not None,

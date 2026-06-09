@@ -90,6 +90,108 @@ def inspect_paths(paths: list[str | Path]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Artifact inventory — what was ACTUALLY produced on disk (04 done screen)
+# ---------------------------------------------------------------------------
+# The done screen lists "生成物". Which artefacts exist depends on the run's
+# `purpose` / `outputs` (e.g. "Markdown のみ" produces NO chunks.jsonl). Hard-
+# coding the four-item list in the frontend would make the UI lie when an
+# artefact wasn't produced. So we scan the output dir and report what's really
+# there — pure existence checks, no LLM, cheap. (UI-不撒谎: frontend-design §二)
+
+# Each artefact: (key, probe). probe(dir) -> count|bool|None. The frontend maps
+# key → label/icon; a falsy/None probe means "not produced" → don't render it.
+def _scan_artifacts(output_dir: "str | Path") -> list[dict[str, Any]]:
+    """Inventory the real artefacts under a library dir, in display order.
+    Returns ``[{key, present, count}]`` — count is a file/chunk tally where
+    meaningful (sources md count, chunks count from index), else None. Never
+    raises: a missing/unreadable dir yields an empty-ish list, the caller
+    renders whatever is present."""
+    d = Path(output_dir)
+    items: list[dict[str, Any]] = []
+
+    # sources/: count the .md files actually written.
+    src = d / "sources"
+    md_count = 0
+    if src.is_dir():
+        try:
+            md_count = sum(1 for p in src.iterdir() if p.suffix.lower() == ".md")
+        except OSError:
+            md_count = 0
+    items.append({"key": "sources", "present": md_count > 0, "count": md_count})
+
+    # chunks.jsonl: present only when chunking ran. Count from index stats so
+    # we don't re-read the jsonl (the index already aggregates total_chunks).
+    chunks_file = d / "chunks.jsonl"
+    chunk_count = None
+    if chunks_file.is_file():
+        idx = _read_index(d)
+        chunk_count = (idx.get("stats", {}) or {}).get("total_chunks")
+    items.append({
+        "key": "chunks", "present": chunks_file.is_file(), "count": chunk_count,
+    })
+
+    # index.json: always written by a successful run (cache + discovery need it).
+    items.append({
+        "key": "index", "present": (d / "index.json").is_file(), "count": None,
+    })
+
+    # knowledge_map.yaml: only when the knowledge_map stage ran.
+    items.append({
+        "key": "knowledge_map",
+        "present": (d / "knowledge_map.yaml").is_file(),
+        "count": None,
+    })
+
+    # graph/: optional GraphRAG layer (built separately). Surface it when built
+    # so the done screen reflects reality, not just the ingest-time artefacts.
+    items.append({
+        "key": "graph", "present": (d / "graph").is_dir(), "count": None,
+    })
+
+    # Only return artefacts that actually exist — the frontend renders the list
+    # verbatim, so filtering here keeps "UI 不撒谎" the single source of truth.
+    return [it for it in items if it["present"]]
+
+
+def _read_index(d: Path) -> dict[str, Any]:
+    """Best-effort read of a library's index.json (for chunk counts). Empty
+    dict on any failure — callers treat a missing count as 'unknown'."""
+    try:
+        import json
+        return json.loads((d / "index.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+# Artefact key → on-disk path, relative to the library dir. Used when the user
+# clicks an artefact row to "really open" it (sources is previewed in-window;
+# the machine-readable ones open in the OS default app — they're meant for
+# code editors, not a GUI viewer). None means "no single file" (sources is a
+# dir; the frontend previews it in-window instead of opening it here).
+_ARTIFACT_PATHS = {
+    "sources": "sources",            # a dir — opened only as a fallback
+    "chunks": "chunks.jsonl",
+    "index": "index.json",
+    "knowledge_map": "knowledge_map.yaml",
+    "graph": "graph",                # a dir
+    "run_log": "run.log",            # ingest log (always written by the pipeline)
+}
+
+
+def artifact_path(library_dir: str, key: str) -> str:
+    """Resolve an artefact key to its absolute on-disk path within a library,
+    or "" when the key is unknown or the file/dir doesn't exist. The path is
+    confined to the library dir (key maps to a fixed relative path — no user
+    string is joined in, so there's no traversal surface, but we still verify
+    existence so the caller never shells open a missing path)."""
+    rel = _ARTIFACT_PATHS.get(key)
+    if not rel:
+        return ""
+    target = (Path(library_dir) / rel).resolve()
+    return str(target) if target.exists() else ""
+
+
+# ---------------------------------------------------------------------------
 # Ingest (03 progress → 04 done)
 # ---------------------------------------------------------------------------
 
@@ -143,6 +245,8 @@ def run_ingest(
         "output_dir": result.output_dir,
         "stats": result.stats,
         "summary": api.get_summary(output),
+        # Real artefacts on disk (depends on purpose/outputs) — see _scan_artifacts.
+        "artifacts": _scan_artifacts(output),
     }
 
 
@@ -156,7 +260,12 @@ def list_libraries() -> list[dict[str, Any]]:
 
 
 def library_summary(library_dir: str) -> dict[str, Any]:
-    return api.get_summary(library_dir)
+    """Summary for opening an EXISTING library (history). Adds the same real
+    artefact inventory the done screen uses after a fresh ingest, so an opened
+    library lists what's actually on disk (not a hardcoded set)."""
+    summary = api.get_summary(library_dir)
+    summary["artifacts"] = _scan_artifacts(library_dir)
+    return summary
 
 
 def preview_markdown(library_dir: str, filename: str) -> str:
@@ -181,8 +290,59 @@ def preview_markdown(library_dir: str, filename: str) -> str:
         return ""
 
 
+def list_refined(library_dir: str, source_filename: str) -> list[dict[str, str]]:
+    """Find refined copies of one source file. refine writes to
+    readable/<skill_short>/<name>, where skill_short is the skill minus its
+    "refine_" prefix and html skills emit a .html sibling (refine.py). So for a
+    source "spec.md" we look across all readable/<skill_short>/ dirs for either
+    "spec.md" or "spec.html". Returns [{skill, filename, path}] (skill is the
+    short name, e.g. "faithful"); empty when none exist. Pure, read-only,
+    best-effort: the preview "整形版" toggle is only enabled when this is
+    non-empty."""
+    readable = (Path(library_dir) / "readable").resolve()
+    if not readable.is_dir():
+        return []
+    stem = Path(source_filename).stem
+    out: list[dict[str, str]] = []
+    try:
+        for skill_dir in sorted(readable.iterdir()):
+            if not skill_dir.is_dir():
+                continue
+            for cand in (stem + ".md", stem + ".html"):
+                f = skill_dir / cand
+                if f.is_file():
+                    out.append({
+                        "skill": skill_dir.name,
+                        "filename": cand,
+                        "path": str(f.resolve()),
+                    })
+    except OSError:
+        return []
+    return out
+
+
+def preview_refined(library_dir: str, skill: str, filename: str) -> str:
+    """Read one refined file (readable/<skill>/<filename>) for the preview
+    pane's "整形版" view. Same boundary discipline as preview_markdown: confine
+    the resolved path under readable/ and refuse to escape it (skill + filename
+    are frontend-supplied -> validate at this boundary). Returns "" if absent.
+    HTML refine output is returned as-is (the frontend decides how to render)."""
+    base = (Path(library_dir) / "readable").resolve()
+    target = (base / skill / filename).resolve()
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return ""
+    if not target.is_file():
+        return ""
+    try:
+        return target.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
 # ---------------------------------------------------------------------------
-# Refine (04 → 10 dialog)
+# Refine (04 -> 10 dialog)
 # ---------------------------------------------------------------------------
 
 def refine(
@@ -249,17 +409,40 @@ def graph_status(library_dir: str) -> dict[str, Any]:
 def build_graph(
     library_dir: str,
     *,
+    mode: str | None = None,
+    enrich_chunks: bool = False,
+    force: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Build the knowledge graph for a library (calls an LLM per chunk).
     Reads chunks.jsonl; never touches originals. on_progress fires per chunk
     ({current,total,chunk_id,status}). User settings layer in as overrides so
-    the graph LLM matches the configured models."""
+    the graph LLM matches the configured models.
+
+    Per-run knobs (all default off → exactly the prior behaviour):
+      mode           — "vector_only" (cheap) or "full" (default in config).
+                       None = use the resolved config default.
+      enrich_chunks  — also write chunks_enriched.jsonl in the same call
+                       (CLI's --enrich-chunks). Injected via config override
+                       so it wins over a saved-settings default.
+      force          — ignore the per-chunk extraction cache.
+    """
     import docingest.graph as graph_api
+
+    # Start from saved user settings; layer per-run choices on top so a one-off
+    # choice on the build screen wins over the saved default (parallels how
+    # run_ingest merges 02-screen options).
+    overrides: dict[str, Any] = dict(get_settings() or {})
+    # The build screen's enrich switch is the authoritative intent for THIS run.
+    # Always write it (not just when True) so a saved-settings default can't
+    # silently flip the behaviour behind the user's back — UI tells the truth.
+    overrides["graph.enrich_chunks.enabled"] = bool(enrich_chunks)
 
     result = graph_api.build(
         library_dir,
-        config_overrides=get_settings() or None,
+        mode=mode,
+        force=force,
+        config_overrides=overrides or None,
         on_progress=on_progress,
     )
     return {
@@ -278,9 +461,14 @@ def build_graph(
 
 def doctor() -> dict[str, Any]:
     """Environment check (API keys + external tools), layered with saved
-    settings so cost-switch reporting matches the user's config."""
+    settings so cost-switch reporting matches the user's config.
+
+    fast=True: the env-check screen only renders 「検出済み / 未設定」 (no
+    version strings), so we skip the heavy __import__ path — drops the call
+    from ~9s to ~10ms on a full install (sentence_transformers alone costs
+    ~5s when imported just to read its version)."""
     config = api.build_config(config_overrides=get_settings() or None)
-    return run_doctor(config)
+    return run_doctor(config, fast=True)
 
 
 def load_settings() -> dict[str, Any]:
@@ -310,5 +498,37 @@ def effective_safety() -> dict[str, Any]:
 
 
 def store_settings(settings: dict[str, Any]) -> str:
-    """Persist user settings; returns the written path as a string."""
-    return str(save_settings(settings))
+    """Persist user settings; returns the written path as a string.
+    Also mirrors any *_API_KEY entries into os.environ so the env-check
+    screen — and downstream providers (litellm / genai), which all read
+    from environ — pick them up in the same process without restart."""
+    path = str(save_settings(settings))
+    _sync_api_keys_to_environ(settings)
+    return path
+
+
+# Keys treated as API credentials when mirroring settings → environ. Mirrors
+# the list the env-check screen displays (doctor.py).
+_API_KEY_NAMES = ("GEMINI_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY")
+
+
+def _sync_api_keys_to_environ(settings: dict[str, Any]) -> None:
+    """Copy any API key found in user settings into os.environ.
+    Single source of truth = environ (matches provider.py's policy: it
+    sets env vars then lets litellm/genai read them). Empty / missing
+    values do NOT clear environ — that would silently wipe a .env-supplied
+    key when the user opens settings without touching the field."""
+    import os
+    for name in _API_KEY_NAMES:
+        value = settings.get(name)
+        if value:
+            os.environ[name] = str(value)
+
+
+def hydrate_environ_from_settings() -> None:
+    """Called once at GUI startup. Reads the saved user settings and pushes
+    any *_API_KEY into os.environ, so a key the user previously entered in
+    the GUI is visible to doctor() / providers from the first action.
+    .env (load_dotenv) still runs separately at process start; this is the
+    GUI-saved-settings counterpart, not a replacement."""
+    _sync_api_keys_to_environ(get_settings() or {})

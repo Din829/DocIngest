@@ -63,6 +63,15 @@ class Api:
     def preview_markdown(self, library_dir: str, filename: str) -> str:
         return gui_logic.preview_markdown(library_dir, filename)
 
+    def list_refined(self, library_dir: str, source_filename: str) -> list[dict[str, str]]:
+        """Refined copies of one source file: [{skill, filename, path}].
+        Drives the preview pane's enabled/disabled refined-view toggle."""
+        return gui_logic.list_refined(str(library_dir), str(source_filename))
+
+    def preview_refined(self, library_dir: str, skill: str, filename: str) -> str:
+        """Read a refined file for the refined-view preview."""
+        return gui_logic.preview_refined(str(library_dir), str(skill), str(filename))
+
     def start_refine(
         self,
         library_dir: str,
@@ -113,10 +122,20 @@ class Api:
         """Is a graph built for this library? {available, built, counts}."""
         return gui_logic.graph_status(library_dir)
 
-    def start_build_graph(self, library_dir: str) -> dict[str, Any]:
+    def start_build_graph(
+        self,
+        library_dir: str,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Build the knowledge graph on a background thread (LLM per chunk —
         slow + costs money). Per-chunk progress is pushed; completion/failure
         are terminal events. Returns immediately.
+
+        ``options`` carries per-run knobs from the build screen (all optional;
+        omit to match the prior behaviour exactly):
+          mode           — "vector_only" | "full" (None = config default)
+          enrich_chunks  — bool, also write chunks_enriched.jsonl
+          force          — bool, ignore extraction cache
 
         Event channels:
           window.__onGraphProgress(event)  — {current,total,chunk_id,status}
@@ -124,6 +143,13 @@ class Api:
           window.__onGraphError(message)   — unexpected failure
         """
         lib = str(library_dir)
+        # Sanitize at this trust boundary — JS-supplied dict, marshal known
+        # keys with explicit types so a stray field can't leak into kwargs.
+        opts = options or {}
+        mode = opts.get("mode")
+        mode = str(mode) if mode else None
+        enrich_chunks = bool(opts.get("enrich_chunks"))
+        force = bool(opts.get("force"))
 
         def _push(fn: str, payload: Any) -> None:
             if self._window is not None:
@@ -132,7 +158,11 @@ class Api:
         def _worker() -> None:
             try:
                 result = gui_logic.build_graph(
-                    lib, on_progress=lambda ev: _push("__onGraphProgress", ev)
+                    lib,
+                    mode=mode,
+                    enrich_chunks=enrich_chunks,
+                    force=force,
+                    on_progress=lambda ev: _push("__onGraphProgress", ev),
                 )
                 _push("__onGraphDone", result)
             except Exception as e:
@@ -157,6 +187,25 @@ class Api:
     def open_folder(self, path: str) -> bool:
         """Open a library folder in the OS file manager. Pure shell concern,
         lives at the bridge edge (not gui_logic — it's UI, not data)."""
+        return self._os_open_dir(path)
+
+    def open_artifact(self, library_dir: str, key: str) -> bool:
+        """Reveal an artefact (chunks/index/knowledge_map/graph) in the OS file
+        manager, highlighting it. We DON'T open the file with its default app:
+        .jsonl / .yaml often have no file association, which would pop a clumsy
+        "choose an app" dialog. Revealing in the file manager is universal and
+        lets the user decide what to do with the file. The frontend handles
+        `sources` itself (in-window preview). Returns False when the artefact
+        doesn't exist (frontend can hint)."""
+        path = gui_logic.artifact_path(str(library_dir), str(key))
+        if not path:
+            return False
+        return self._os_reveal(path)
+
+    @staticmethod
+    def _os_open_dir(path: str) -> bool:
+        """Open a directory in the OS file manager. Best-effort: returns False
+        on any failure."""
         import os
         import subprocess
         import sys
@@ -168,6 +217,30 @@ class Api:
                 subprocess.run(["open", path], check=False)
             else:
                 subprocess.run(["xdg-open", path], check=False)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _os_reveal(path: str) -> bool:
+        """Reveal a file in the OS file manager, selected/highlighted, so the
+        user sees exactly which file. Windows: explorer /select. macOS: open -R.
+        Linux has no portable "reveal", so fall back to opening the parent
+        directory. Best-effort: returns False on any failure."""
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path as _Path
+
+        try:
+            if sys.platform.startswith("win"):
+                # explorer returns exit code 1 even on success — don't check it.
+                subprocess.run(["explorer", "/select,", os.path.normpath(path)])
+            elif sys.platform == "darwin":
+                subprocess.run(["open", "-R", path], check=False)
+            else:
+                # No portable reveal on Linux — open the containing directory.
+                subprocess.run(["xdg-open", str(_Path(path).parent)], check=False)
             return True
         except Exception:
             return False

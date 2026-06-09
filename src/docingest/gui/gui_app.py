@@ -54,13 +54,29 @@ def _install_drop_handler(window: Any) -> None:
 def main() -> None:
     import webview
 
+    # Mirror the CLI's startup sequence so the GUI process has the same
+    # environment view from the first action — without this, .env-supplied
+    # keys are only loaded when doctor() runs (it calls load_dotenv inline),
+    # so a non-doctor action (e.g. ingest, graph build) hitting a provider
+    # right after launch wouldn't find them. We also hydrate user-settings
+    # API keys into the environ here so a key entered earlier in the GUI
+    # survives a restart (single source of truth = environ; see gui_logic
+    # ._sync_api_keys_to_environ).
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    from . import gui_logic
+    gui_logic.hydrate_environ_from_settings()
+
     api = Api()
     window = webview.create_window(
         "DocIngest",
         url=str(_index_html_path()),
         js_api=api,
         width=1200,
-        height=860,
+        height=920,
         min_size=(960, 720),
         background_color="#FFFFFF",
     )

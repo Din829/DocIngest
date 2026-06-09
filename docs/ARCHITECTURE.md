@@ -15,7 +15,7 @@
 - **RAG**：`chunks.jsonl` 做向量检索
 - **Agentic Search**：`sources/*.md` 做 grep / glob
 
-核心思想：**Markdown 作为唯一中间格式**。不自己搞检索，不管 embedding。核心引擎本身不含 UI 逻辑——可选的桌面 GUI（`docingest.gui`，pywebview）是独立的工具壳，通过三层解耦直调 `api.py`，核心零感知（见 [GUI_DESIGN.md](GUI_DESIGN.md)）。
+核心思想：**Markdown 作为唯一中间格式**。不自己搞检索，不管 embedding。核心引擎本身不含 UI 逻辑——可选的桌面 GUI（`docingest.gui`，pywebview）是独立的工具壳，通过三层解耦直调 `api.py`，核心零感知（见 [GUI/GUI_DESIGN.md](GUI/GUI_DESIGN.md)）。
 
 ### 1.2 核心设计原则
 
@@ -608,7 +608,7 @@ chunking.strategy = "auto"（默认）
 | `auto` | 默认 | 按格式 + 结构自动选 |
 | `heading` | 结构化文档 | 按 H1-H3 切分，小段合并，大段递归再切 |
 | `recursive` | 非结构化 | 段落 → 句 → 字符 递归，`overlap_tokens` overlap |
-| `slide` | PPTX | pagebreak / HR / "Slide N" 标题检测 |
+| `slide` | PPTX | pagebreak / HR / 短编号标题检测 |
 | `sheet` | XLSX / CSV | pagebreak 或 `##` 检测分 sheet，每表头重复在子 chunk 顶部 |
 | `timestamp` | 音视频 | `[MM:SS]` 检测，每 chunk 带 `start_seconds` / `end_seconds` |
 | `whole` | 图像 / 极短 | 整文件一个 chunk |
@@ -631,11 +631,13 @@ chunking:
     on_overflow:
       table: "row_split"   # 超了按行分，每块复制表头（2026 业界做法）
       code_block: "bypass" # 超了保留不拆（拆会破坏语法）
-      list: "bypass"
+      list: "item_split"   # 超了按列表项分；单项仍超长则递归切
       default: "bypass"
 ```
 
 **表格行切分**（`chunkers/table_splitter.py`）：按数据行切分，每个子 chunk 重复表头，让每片独立可读。解决 Docling 对合并单元格展开产生的超宽表格问题。
+
+**列表项切分**（`chunkers/recursive.py`）：列表整体超过 overflow 预算后，按 list item 边界切分；如果某一个 item 自己仍然超过预算，则临时关闭 list 保护，交回 recursive 的段落 / 句子 / 字符 fallback 继续切。这个规则只看 Markdown 结构，不看“说 / 画面”等内容关键词。
 
 #### 后处理（`pipeline.py::_postprocess_chunks`）
 
@@ -1169,5 +1171,6 @@ chunks.jsonl  ──►  chunks_enriched.jsonl
 - 架构 / Phase / 扩展点变更 → 本文档
 - 用户指南（装、跑、MCP 配置）→ [README.md](../README.md)
 - 集成指南（嵌入到别的系统）→ [INTEGRATION.md](INTEGRATION.md)
+- 竞品定位 / 战场边界（该打哪些仗、不打哪些仗、开发方向）→ [COMPETITIVE_POSITIONING.md](COMPETITIVE_POSITIONING.md)
 
 改 pipeline.py 或扩展机制时同步更新 Phase 表（§2.2）和 代码地图（§3）。

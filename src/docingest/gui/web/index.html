@@ -26,7 +26,7 @@
     <section class="screen is-active" data-screen="home">
       <header class="topbar row between items-center">
         <div class="brand row items-center gap-3">
-          <i data-lucide="asterisk" class="brand-mark"></i>
+          <img src="Doclogo.png" alt="DocIngest" class="brand-mark" />
           <span class="brand-name">DocIngest</span>
         </div>
         <div class="top-actions row items-center gap-1">
@@ -118,7 +118,7 @@
           <i data-lucide="arrow-left"></i><span>戻る</span>
         </button>
         <div class="brand row items-center gap-3">
-          <i data-lucide="asterisk" class="brand-mark"></i>
+          <img src="Doclogo.png" alt="DocIngest" class="brand-mark" />
           <span class="brand-name">DocIngest</span>
         </div>
         <span class="topbar-spacer"></span>
@@ -155,7 +155,7 @@
           <i data-lucide="arrow-left"></i><span>戻る</span>
         </button>
         <div class="brand row items-center gap-3">
-          <i data-lucide="asterisk" class="brand-mark"></i>
+          <img src="Doclogo.png" alt="DocIngest" class="brand-mark" />
           <span class="brand-name">DocIngest</span>
         </div>
         <button class="gear-btn" data-go="settings-env" title="設定">
@@ -184,8 +184,12 @@
               <span class="m-label">失敗</span>
               <span class="m-value mono" id="m-failed">0</span>
             </div>
-            <div class="metric col gap-2">
-              <span class="m-label">合計コスト</span>
+            <!-- Cost ↔ token toggle: shows the friendly est. cost by default
+                 (safe to show a client); click to reveal the real token count
+                 for internal use. Label + value both swap. Title hints it. -->
+            <div class="metric col gap-2 m-cost-metric" id="m-cost-metric"
+                 title="クリックで使用トークン数を表示">
+              <span class="m-label" id="m-cost-label">合計コスト</span>
               <span class="m-value mono" id="m-cost">$0.0000</span>
             </div>
           </div>
@@ -196,36 +200,13 @@
           <!-- Two columns: left = artifacts + actions, right = preview -->
           <div class="done-cols row gap-6">
             <div class="left-col col gap-5" style="width: 300px;">
+              <!-- Run summary (plain language) + real artefacts. Both rendered
+                   by renderDone from real data — what was actually produced,
+                   not a hardcoded list (purpose=Markdown のみ → no chunks). -->
               <div class="files-sec col gap-3">
                 <span class="sec-label">生成物</span>
-                <div class="art-row row items-center gap-3">
-                  <i data-lucide="folder" class="art-icon"></i>
-                  <div class="art-text col">
-                    <span class="art-name mono">sources/</span>
-                    <span class="art-desc" id="art-sources-desc">0 件の Markdown</span>
-                  </div>
-                </div>
-                <div class="art-row row items-center gap-3">
-                  <i data-lucide="braces" class="art-icon"></i>
-                  <div class="art-text col">
-                    <span class="art-name mono">chunks.jsonl</span>
-                    <span class="art-desc" id="art-chunks-desc">0 チャンク</span>
-                  </div>
-                </div>
-                <div class="art-row row items-center gap-3">
-                  <i data-lucide="list-tree" class="art-icon"></i>
-                  <div class="art-text col">
-                    <span class="art-name mono">index.json</span>
-                    <span class="art-desc">ファイル索引</span>
-                  </div>
-                </div>
-                <div class="art-row row items-center gap-3">
-                  <i data-lucide="compass" class="art-icon"></i>
-                  <div class="art-text col">
-                    <span class="art-name mono">knowledge_map</span>
-                    <span class="art-desc">検索ガイド</span>
-                  </div>
-                </div>
+                <div class="done-summary" id="done-summary"></div>
+                <div class="art-list col gap-3" id="done-artifacts"></div>
               </div>
 
               <div class="done-actions col gap-3">
@@ -238,13 +219,25 @@
                 <button class="ghost-btn row center items-center gap-2" id="done-graph">
                   <i data-lucide="share-2"></i><span>知識グラフを構築</span>
                 </button>
+                <button class="ghost-btn row center items-center gap-2" id="done-log">
+                  <i data-lucide="scroll-text"></i><span>ログを開く</span>
+                </button>
               </div>
             </div>
 
             <div class="preview-col col gap-3 fill">
               <div class="pv-head row between items-center">
                 <span class="sec-label">プレビュー</span>
-                <select class="pv-select mono" id="pv-select"></select>
+                <div class="pv-head-right row items-center gap-3">
+                  <div class="pv-view-toggle row is-hidden" id="pv-view-toggle">
+                    <button class="pvt-tab is-active" data-view="source">原文</button>
+                    <button class="pvt-tab" data-view="refined">整形版</button>
+                  </div>
+                  <button class="pv-copy row items-center gap-2" id="pv-copy" title="本文をコピー">
+                    <i data-lucide="copy" class="pvc-icon"></i><span class="pvc-text">コピー</span>
+                  </button>
+                  <select class="pv-select mono" id="pv-select"></select>
+                </div>
               </div>
               <div class="pv-body" id="pv-body"></div>
             </div>
@@ -326,14 +319,6 @@
           </div>
 
           <div class="model-group col gap-3">
-            <span class="grp-label">音声文字起こし（ASR）</span>
-            <div class="model-row row between items-center">
-              <span class="mr-label">音声の文字起こし</span>
-              <select class="mr-select mono" id="model-asr"></select>
-            </div>
-          </div>
-
-          <div class="model-group col gap-3">
             <span class="grp-label">API キー</span>
             <div class="key-list col gap-3" id="model-keys"></div>
           </div>
@@ -392,7 +377,7 @@
           <i data-lucide="arrow-left"></i><span>戻る</span>
         </button>
         <div class="brand row items-center gap-3">
-          <i data-lucide="asterisk" class="brand-mark"></i>
+          <img src="Doclogo.png" alt="DocIngest" class="brand-mark" />
           <span class="brand-name">DocIngest</span>
         </div>
         <span class="topbar-spacer"></span>
@@ -410,6 +395,43 @@
               <i data-lucide="info" class="bc-ci"></i>
               <span>構築には LLM の利用料がかかります。</span>
             </div>
+
+            <!-- Build options. Two-card mode pick (cost vs detail) + an
+                 opt-in switch for chunk enrichment. Hidden internal keys
+                 (vector_only / full / graph.enrich_chunks.enabled) — the
+                 user sees the trade-off, not the config flag. Defaults
+                 match the CLI: mode=full, enrich=off. -->
+            <div class="bc-options col gap-3">
+              <div class="bc-mode row gap-3">
+                <button class="bc-mode-opt col gap-1 is-selected" data-mode="full">
+                  <span class="bmo-title">詳しく作る</span>
+                  <span class="bmo-desc">テーマ単位の質問にも答えやすい・コスト高</span>
+                </button>
+                <button class="bc-mode-opt col gap-1" data-mode="vector_only">
+                  <span class="bmo-title">節約して作る</span>
+                  <span class="bmo-desc">用語と関係のみ・安く速い</span>
+                </button>
+              </div>
+              <div class="bc-enrich row between items-center">
+                <div class="bce-text col">
+                  <span class="bce-label">チャンクに用語の説明を埋め込む</span>
+                  <span class="bce-desc">検索で文脈が補われやすくなります</span>
+                </div>
+                <button class="ps-switch" id="bc-enrich-switch" role="switch" aria-checked="false">
+                  <span class="ps-knob"></span>
+                </button>
+              </div>
+              <div class="bc-enrich row between items-center" id="bc-force-row" hidden>
+                <div class="bce-text col">
+                  <span class="bce-label">キャッシュを無視して再構築</span>
+                  <span class="bce-desc">既に構築されている場合に、最初からやり直します</span>
+                </div>
+                <button class="ps-switch" id="bc-force-switch" role="switch" aria-checked="false">
+                  <span class="ps-knob"></span>
+                </button>
+              </div>
+            </div>
+
             <button class="build-btn row center items-center gap-2" id="graph-build">
               <i data-lucide="sparkles"></i><span>知識グラフを構築</span>
             </button>
@@ -426,7 +448,7 @@
           <i data-lucide="arrow-left"></i><span>戻る</span>
         </button>
         <div class="brand row items-center gap-3">
-          <i data-lucide="asterisk" class="brand-mark"></i>
+          <img src="Doclogo.png" alt="DocIngest" class="brand-mark" />
           <span class="brand-name">DocIngest</span>
         </div>
         <span class="topbar-spacer"></span>
@@ -515,7 +537,7 @@
         </div>
         <div class="dlg-actions row end gap-3">
           <button class="btn-ghost" id="refine-cancel">キャンセル</button>
-          <button class="btn-accent" id="refine-go">整形する</button>
+          <button class="btn-accent" id="refine-go"><span class="btn-spinner" aria-hidden="true"></span><span class="btn-label">整形する</span></button>
         </div>
       </div>
     </div>

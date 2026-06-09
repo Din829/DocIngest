@@ -175,3 +175,53 @@ select {
   vertical-align: middle;
   flex-shrink: 0;
 }
+
+/* Toast: bottom-right, non-blocking success notice (replaces alert for
+   completions). Fades in/out via opacity+transform only (no reflow). */
+.app-toast {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 20;
+  max-width: 360px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 13px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.app-toast.is-shown { opacity: 1; transform: translateY(0); }
+@media (prefers-reduced-motion: reduce) {
+  .app-toast { transition: opacity 0.2s ease; transform: none; }
+}
+
+/* Quiet scrollbars — Linear/Notion-style "always reserved, almost invisible".
+   Track stays empty; thumb is a soft tinted bar that only animates color
+   (no layout change). Two visibility tiers:
+     • idle / mouse not over the scrollable area  → very faint
+     • mouse hovering the scrollable element      → mid grey
+     • mouse on the thumb itself                  → darker grey
+   Width is reserved (8px) so content never reflows when colors change. */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background-color: rgba(168, 163, 153, 0.18);   /* --ink-3 @ 18% — barely-there idle */
+  border-radius: 4px;
+  transition: background-color 0.2s ease;
+}
+/* The :hover here is on the scrollable host element (the one with overflow);
+   WebKit binds the pseudo-element to that host, so hovering the area lifts
+   the thumb's tint — not the page-wide hover chain. */
+:hover::-webkit-scrollbar-thumb { background-color: rgba(168, 163, 153, 0.5); }
+::-webkit-scrollbar-thumb:hover  { background-color: rgba(107, 103, 96, 0.7); }  /* --ink-2 @ 70% */
+/* Firefox fallback — WebView2 ignores this, kept for portability. */
+* { scrollbar-width: thin; scrollbar-color: rgba(168, 163, 153, 0.3) transparent; }
+@media (prefers-reduced-motion: reduce) {
+  ::-webkit-scrollbar-thumb { transition: none; }
+}

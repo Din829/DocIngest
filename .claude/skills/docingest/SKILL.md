@@ -29,10 +29,11 @@ for the refine styles) — when in doubt, run those rather than trusting this co
 
 | Command | What it does | When to use / skip | Key flags |
 |---|---|---|---|
-| `run` | Process docs → Markdown + chunks + index | Main command. Run after `inspect` for large/unknown inputs; directly for small trusted ones. Re-running the same `-o` is cheap (incremental cache). | `-o/--output` (REQUIRED for multi-input); `--purpose markdown\|rag\|agentic\|full`; `--outputs md,chunks,index,...`; `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet`; `--max-pages N` (parse only first N pages of PDF/PPTX/DOCX); `--parallel N` (Vision/ASR workers); `--force`; `-y/--yes`; `--json`; `--verbose/-v`; `-c/--config` |
+| `run` | Process docs → Markdown + chunks + index | Main command. Run after `inspect` for large/unknown inputs; directly for small trusted ones. Re-running the same `-o` is cheap (incremental cache). | `-o/--output` (REQUIRED for multi-input); `--purpose markdown\|rag\|agentic\|full`; `--outputs md,chunks,index,...`; `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet\|timestamp\|whole`; `--max-pages N` (parse only first N pages of PDF/PPTX/DOCX); `--parallel N` (Vision/ASR workers); `--force`; `-y/--yes`; `--json`; `--verbose/-v`; `-c/--config` |
 | `inspect` | Estimate size/pages/cost — **no parsing** | ALWAYS first for large/unknown/expensive inputs (Vision is 1 API call per page). Skip only for a few small text files. | `--json`; `-c/--config` |
 | `refine` | Rewrite a Markdown file into a human-readable version | ONLY when the user wants a readable/published version. **NOT** a RAG step — RAG consumes the raw `sources/*.md`. | `--skill refine_default\|refine_faithful\|refine_html`; `-o/--output`; `-c/--config` |
 | `doctor` | Check environment: packages, external tools, API keys | After install, or when something fails unexpectedly. | (none) |
+| `visualize` | Draw parse bounding boxes onto rendered page images | QA/debugging for parsed layouts when bounding boxes are enabled. | `--pages`; `--labels`; `--numbers` |
 | `skills list` | List the refine SKILLs `refine --skill` can use | When unsure which refine style fits; `--json` for programmatic discovery. | `--json` |
 
 ## graph subcommands (`docingest graph <cmd>`) — opt-in

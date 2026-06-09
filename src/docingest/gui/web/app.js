@@ -124,14 +124,18 @@ const api = {
   listLibraries: () => window.pywebview.api.list_libraries(),
   getSummary: (dir) => window.pywebview.api.get_summary(dir),
   previewMarkdown: (dir, file) => window.pywebview.api.preview_markdown(dir, file),
+  listRefined: (dir, file) => window.pywebview.api.list_refined(dir, file),
+  previewRefined: (dir, skill, file) => window.pywebview.api.preview_refined(dir, skill, file),
   startRefine: (dir, files, skill, ack) =>
     window.pywebview.api.start_refine(dir, files, skill, !!ack),
   doctor: () => window.pywebview.api.doctor(),
   getSettings: () => window.pywebview.api.get_settings(),
   saveSettings: (s) => window.pywebview.api.save_settings(s),
   openFolder: (path) => window.pywebview.api.open_folder(path),
+  openArtifact: (dir, key) => window.pywebview.api.open_artifact(dir, key),
   graphStatus: (dir) => window.pywebview.api.graph_status(dir),
-  startBuildGraph: (dir) => window.pywebview.api.start_build_graph(dir),
+  startBuildGraph: (dir, options) =>
+    window.pywebview.api.start_build_graph(dir, options || null),
 };
 
 // ---- app state -----------------------------------------------------------
@@ -146,6 +150,11 @@ const state = {
   // has no "cached" count, so the done screen (04) reads these front-end
   // tallies instead of inventing a backend field. Reset at ingest start.
   tally: { done: 0, cached: 0, failed: 0, skipped: 0 },
+  costMode: "cost",      // done-screen cost metric: "cost" (default) | "tokens"
+  costView: null,        // {cost, tokens, cacheHits} stashed by renderDone
+  currentPreviewMd: "",  // raw text of the previewed file (for copy)
+  previewView: "source", // "source" (sources/) | "refined" (readable/)
+  refinedFor: null,      // {skill, filename} of the refined copy of current file, or null
 };
 
 // ---- home (01/02) wiring -------------------------------------------------
@@ -199,6 +208,7 @@ const options = {
   strategy: "auto",
   safetyMode: "strict",
   purpose: "full",
+  force: false,        // true → 増分キャッシュを無視して全件再処理
 };
 
 // Build the config the bridge passes to ingest(). Only non-default choices are
@@ -211,6 +221,9 @@ function buildIngestOptions() {
   if (options.safetyMode && options.safetyMode !== "strict") {
     overrides["safety.mode"] = options.safetyMode;
   }
+  // 再処理: 増分キャッシュを無視する。デフォルト false なので true の時だけ送る。
+  // api._normalize_overrides がドット記法を {"incremental": {"force": true}} に展開する。
+  if (options.force) overrides["incremental.force"] = true;
   const result = {};
   if (Object.keys(overrides).length) result.config_overrides = overrides;
   // Output purpose preset → the api `purpose` arg. "full" is the default
@@ -238,6 +251,11 @@ function renderProcSettings() {
   body.appendChild(
     optRowSelect("出力する内容", OUTPUT_PURPOSES, options.purpose, (v) => {
       options.purpose = v;
+    })
+  );
+  body.appendChild(
+    optRowSwitch("キャッシュを無視して再処理", options.force, (v) => {
+      options.force = v;
     })
   );
 }
@@ -596,10 +614,13 @@ function deriveLibraryName(paths) {
 }
 
 // ---- processing screen (03) ----------------------------------------------
-// Backend emits one file_done event per file (completion-only, file-level —
-// no mid-file stage). So we pre-list every file as 待機中, then on each event
-// mark that file done (by real status) and the NEXT one 処理中. The "処理中"
-// state is inferred (current+1), not claimed from the backend — honest.
+// Backend emits a file_done event per file (completion-only, file-level). So we
+// pre-list every file as 待機中, then on each event mark that file done (by real
+// status) and the NEXT one 処理中. The "処理中" state is inferred (current+1),
+// not claimed from the backend — honest.
+// It ALSO emits file_progress events for within-file stages (Vision page
+// sub_current/sub_total, or a "parse" busy signal), so the 処理中 row shows a
+// live "Vision 5/11 ページ" instead of a frozen "処理中…". See updateFileProgress.
 
 // Map a backend file_done status → row visual state.
 //   added/updated/forced → done ; cached → cached ; failed → failed ;
@@ -709,7 +730,33 @@ function updateProcHeader(done, total) {
 
 // ---- ingest progress hooks (pushed from Python via evaluate_js) ----------
 
+// Within-file sub-progress (file_progress event). Updates the 処理中 row's info
+// text with a live stage: "Vision N/M ページ" while pages are being enriched,
+// "解析中…" during the (黒箱) parse phase. Matches the row by basename first
+// (accurate under parallelism); falls back to the single is-active row. A no-op
+// if the file's row is already settled or not found — purely cosmetic, never
+// touches the file_done bookkeeping (settled flags / tally / header).
+function updateFileProgress(event) {
+  const rows = Array.from(document.querySelectorAll("#proc-list .p-row"));
+  let row = rows.find((r) => r.dataset.file === event.file && !r.dataset.settled);
+  if (!row) row = rows.find((r) => r.classList.contains("is-active"));
+  if (!row) return;
+  const info = row.querySelector(".pr-info");
+  if (!info) return;
+  if (event.phase === "vision" && event.sub_total > 0) {
+    info.textContent = `Vision ${event.sub_current}/${event.sub_total} ページ`;
+  } else if (event.phase === "parse") {
+    info.textContent = "解析中…";
+  }
+}
+
 window.__onIngestProgress = function (event) {
+  // Two event kinds. file_progress = within-file stage (Vision pages / parse);
+  // update the live row text and stop — it carries no file-completion info.
+  if (event.kind === "file_progress") {
+    updateFileProgress(event);
+    return;
+  }
   // event: {kind,status,file,current,total,chunks,elapsed_ms,error,error_type}
   // Mark the completed file (matched by basename) with its real status. Files
   // may complete out of list order (parallel processing), so we do NOT infer
@@ -757,27 +804,119 @@ window.__onIngestError = function (message) {
 function renderDone(summary) {
   const stats = summary.stats || {};
   const lib = summary.summary || {};
-  const libStats = lib.stats || {};
+  // Artifacts come from gui_logic._scan_artifacts — the REAL files on disk.
+  // run_ingest puts them at summary.artifacts; openLibrary's library_summary
+  // returns them nested under summary.summary.artifacts. Accept both.
+  const artifacts = summary.artifacts || lib.artifacts || [];
 
   // Stats: done/failed from backend stats; cached from front-end tally (no
-  // backend field); cost from the pre-flight total we showed at confirm time.
+  // backend field). Cost metric is a cost↔token toggle (renderCostMetric).
   setText("m-done", String(stats.successful != null ? stats.successful : state.tally.done));
   setText("m-cached", String(state.tally.cached));
   setText("m-failed", String(stats.failed != null ? stats.failed : state.tally.failed));
-  const cost = state.inspectMeta?.totals?.est_cost_usd;
-  setText("m-cost", cost != null ? `$${cost.toFixed(4)}` : "—");
   // Failed metric turns alert-colored only when there ARE failures.
   const mf = document.getElementById("m-failed");
   if (mf) mf.style.color = (stats.failed || state.tally.failed) ? "var(--danger)" : "";
 
-  // Artifact descriptions from the real library summary.
-  const fileCount = libStats.total_files != null ? libStats.total_files : (lib.files || []).length;
-  setText("art-sources-desc", `${fileCount} 件の Markdown`);
-  setText("art-chunks-desc", `${libStats.total_chunks || 0} チャンク`);
+  // Cost ↔ token: stash both values, render per the current toggle mode.
+  state.costView = {
+    cost: state.inspectMeta?.totals?.est_cost_usd,
+    tokens: stats.token_usage?.total_tokens,
+    cacheHits: stats.token_usage?.total_cache_hits,
+  };
+  renderCostMetric();
+
+  // Plain-language run summary (B) + real artefact list (A).
+  renderRunSummary(lib);
+  renderArtifacts(artifacts);
 
   renderNotices(stats, lib);
   renderPreviewSelector(lib);
   renderIcons();
+}
+
+// Run summary in plain language: "N ファイル・M ページ・K チャンク". Pages are
+// summed from the per-file index entries (only files that have a page count);
+// omit a dimension when its number isn't available rather than show "0 ページ"
+// for, say, an audio-only run. (frontend-design §五: speak plainly.)
+function renderRunSummary(lib) {
+  const box = document.getElementById("done-summary");
+  if (!box) return;
+  const files = lib.files || [];
+  const libStats = lib.stats || {};
+  const fileCount = libStats.total_files != null ? libStats.total_files : files.length;
+  const pages = files.reduce((sum, f) => sum + (f.pages || 0), 0);
+  const chunks = libStats.total_chunks;
+
+  const parts = [`${fileCount} ファイル`];
+  if (pages > 0) parts.push(`${pages} ページ`);
+  if (chunks != null) parts.push(`${chunks} チャンク`);
+  box.textContent = parts.join(" · ");
+}
+
+// Real artefacts on disk → display rows. Driven by gui_logic's scan, so a
+// "Markdown のみ" run shows only sources/, never a phantom chunks.jsonl.
+// label/icon/desc are display copy keyed by the backend artefact key.
+const ARTIFACT_META = {
+  sources: { icon: "folder", name: "sources/", desc: (c) => `${c} 件の Markdown` },
+  chunks: { icon: "braces", name: "chunks.jsonl", desc: (c) => c != null ? `${c} チャンク` : "チャンク" },
+  index: { icon: "list-tree", name: "index.json", desc: () => "ファイル索引" },
+  knowledge_map: { icon: "compass", name: "knowledge_map", desc: () => "検索ガイド" },
+  graph: { icon: "share-2", name: "graph/", desc: () => "知識グラフ" },
+};
+
+function renderArtifacts(artifacts) {
+  const list = document.getElementById("done-artifacts");
+  if (!list) return;
+  list.innerHTML = "";
+  for (const art of artifacts) {
+    const meta = ARTIFACT_META[art.key];
+    if (!meta) continue;
+    // Rows are clickable: sources/ focuses the preview; the machine-readable
+    // artefacts open their real file in the OS default app (a code editor /
+    // browser, where they belong). data-key drives the delegated handler.
+    const row = el("div", "art-row art-clickable row items-center gap-3");
+    row.dataset.key = art.key;
+    row.appendChild(icon(meta.icon, "art-icon"));
+    const text = el("div", "art-text col");
+    text.appendChild(el("span", "art-name mono", meta.name));
+    text.appendChild(el("span", "art-desc", meta.desc(art.count)));
+    row.appendChild(text);
+    list.appendChild(row);
+  }
+  renderIcons();
+}
+
+// Delegated click on artefact rows. sources/ is a directory of md the preview
+// pane already renders — clicking it scrolls the preview into view rather than
+// opening a folder. Everything else opens its real file via the OS default app.
+document.getElementById("done-artifacts")?.addEventListener("click", (e) => {
+  const row = e.target.closest(".art-row");
+  if (!row || !state.currentLibraryDir) return;
+  const key = row.dataset.key;
+  if (key === "sources") {
+    document.querySelector(".preview-col")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    return;
+  }
+  api.openArtifact(state.currentLibraryDir, key);
+});
+
+// Cost ↔ token toggle. Default view = est. cost (friendly, safe to show a
+// client). Click the metric to reveal the real token count (internal use).
+// Both label and value swap; state.costMode persists within the session so the
+// choice sticks across re-renders. "—" when the value genuinely isn't known.
+function renderCostMetric() {
+  const cv = state.costView || {};
+  const label = document.getElementById("m-cost-label");
+  if (state.costMode === "tokens") {
+    const t = cv.tokens;
+    setText("m-cost", t != null ? t.toLocaleString() : "—");
+    if (label) label.textContent = "使用トークン";
+  } else {
+    const c = cv.cost;
+    setText("m-cost", c != null ? `$${c.toFixed(4)}` : "—");
+    if (label) label.textContent = "合計コスト";
+  }
 }
 
 // NoticeBox: backend warnings (page-cap, OCR downgrade, ...) + unreadable
@@ -787,6 +926,19 @@ function renderNotices(stats, lib) {
   if (!box) return;
   box.innerHTML = "";
   const rows = [];
+
+  // Failed files first — the most important "did it work?" signal. stats.errors
+  // carries {file, error, error_type}; show which file + a plain reason so the
+  // user knows what to fix, instead of just a "失敗 N" number with no detail.
+  for (const e of stats.errors || []) {
+    const file = e.file ? `${basename(e.file)}：` : "";
+    const reason = e.error_type === "encrypted"
+      ? "パスワード保護（解除が必要）"
+      : e.error_type === "timeout"
+        ? "時間切れ（大きすぎる可能性）"
+        : "解析に失敗";
+    rows.push({ icon: "x", cls: "is-error", text: `${file}${reason}` });
+  }
 
   for (const w of stats.warnings || []) {
     const file = w.file ? `${w.file}：` : "";
@@ -840,19 +992,83 @@ function renderPreviewSelector(lib) {
   sel.addEventListener("change", () => loadPreview(sel.value));
 }
 
+// 原文/整形版 toggle: switch the preview view and re-render the current file.
+document.getElementById("pv-view-toggle")?.addEventListener("click", (e) => {
+  const tab = e.target.closest(".pvt-tab");
+  if (!tab) return;
+  state.previewView = tab.dataset.view;
+  updateViewToggle();
+  const sel = document.getElementById("pv-select");
+  renderPreviewBody(sel && sel.value ? basename(sel.value) : "");
+});
+
 async function loadPreview(filename) {
   const body = document.getElementById("pv-body");
   if (!body || !state.currentLibraryDir) return;
+  const name = basename(filename);
+  // Probe whether this source has a refined copy; enable the 原文/整形版 toggle
+  // only when one exists. Pick the first refined copy (one skill at a time in
+  // the GUI flow). Reset to the source view when switching files.
   try {
-    const md = await api.previewMarkdown(state.currentLibraryDir, basename(filename));
-    if (!md) {
+    const refs = await api.listRefined(state.currentLibraryDir, name);
+    state.refinedFor = refs && refs.length ? refs[0] : null;
+  } catch {
+    state.refinedFor = null;
+  }
+  if (!state.refinedFor) state.previewView = "source";
+  updateViewToggle();
+  await renderPreviewBody(name);
+}
+
+// Render the preview body for the current view (source or refined). Stashes the
+// raw text for the copy button. Refined HTML output is shown as-is; md is
+// rendered. Falls back gracefully on read failure.
+async function renderPreviewBody(name) {
+  const body = document.getElementById("pv-body");
+  if (!body || !state.currentLibraryDir) return;
+  try {
+    let text = "";
+    let isHtml = false;
+    if (state.previewView === "refined" && state.refinedFor) {
+      const r = state.refinedFor;
+      text = await api.previewRefined(state.currentLibraryDir, r.skill, r.filename);
+      isHtml = /\.html$/i.test(r.filename);
+    } else {
+      text = await api.previewMarkdown(state.currentLibraryDir, name);
+    }
+    state.currentPreviewMd = text ? stripFrontmatter(text) : "";
+    updateCopyButton();
+    if (!text) {
       body.textContent = "（内容が空です）";
       return;
     }
-    body.innerHTML = renderMarkdown(md);
+    // Refined HTML is a fidelity-preserving fragment; sanitize and show. Md
+    // (both source and md-refined) goes through the markdown renderer.
+    if (isHtml) {
+      body.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(text) : text;
+    } else {
+      body.innerHTML = renderMarkdown(text);
+    }
   } catch (err) {
+    state.currentPreviewMd = "";
+    updateCopyButton();
     body.textContent = "（プレビューの読み込みに失敗しました）";
   }
+}
+
+// Show the 原文/整形版 toggle only when a refined copy exists; reflect the
+// active view. Disabled-by-absence keeps the UI honest (no dead toggle).
+function updateViewToggle() {
+  const toggle = document.getElementById("pv-view-toggle");
+  if (!toggle) return;
+  if (!state.refinedFor) {
+    toggle.classList.add("is-hidden");
+    return;
+  }
+  toggle.classList.remove("is-hidden");
+  toggle.querySelectorAll(".pvt-tab").forEach((t) => {
+    t.classList.toggle("is-active", t.dataset.view === state.previewView);
+  });
 }
 
 // MD → sanitized HTML. Strips YAML frontmatter (the sources/*.md files start
@@ -885,7 +1101,119 @@ function setText(id, text) {
 document.getElementById("done-open")?.addEventListener("click", () => {
   if (state.currentLibraryDir) api.openFolder(state.currentLibraryDir);
 });
-document.getElementById("done-graph")?.addEventListener("click", () => showScreen("graph-empty"));
+// 知識グラフ画面へ。graphStatus は初回呼び出しで lightrag を import するため
+// 数秒〜十数秒かかる（doctor と同じ性質）。await すると押下から画面遷移までが
+// 体感の空白になるので、まず未構築前提で即切替し、status は後追いで反映する。
+// 既に構築済みのライブラリでは「未構築 → 再構築」の文言反転が起きるが、
+// それは再訪時のみ・かつ目立たない位置で発生するため許容。
+document.getElementById("done-graph")?.addEventListener("click", () => {
+  setGraphBuildMode(false);          // まず HTML デフォルト（未構築）で見せる
+  showScreen("graph-empty");
+  if (!state.currentLibraryDir) return;
+  api.graphStatus(state.currentLibraryDir)
+    .then((st) => {
+      if (st && st.built) setGraphBuildMode(true);
+    })
+    .catch((err) => console.error("graph status failed", err));
+});
+
+// 「再構築」モードかどうかで graph-empty の表示を切り替える。
+//   未構築 → 通常文言、force スイッチは隠す（重建概念なし）
+//   既構築 → 説明文を再構築寄りに、force 行を見せる（デフォルト ON 推奨だが
+//            ユーザに最終決定権を渡す）
+function setGraphBuildMode(rebuild) {
+  const desc = document.querySelector(".build-card .bc-desc");
+  const btnLabel = document.querySelector("#graph-build span");
+  const forceRow = document.getElementById("bc-force-row");
+  const forceSwitch = document.getElementById("bc-force-switch");
+  if (rebuild) {
+    if (desc) desc.textContent = "このナレッジベースには既に知識グラフがあります。再構築すると、現在の設定で作り直されます。";
+    if (btnLabel) btnLabel.textContent = "再構築";
+    if (forceRow) forceRow.hidden = false;
+    // 再構築時のデフォルトは「キャッシュも無視」— 普通そうしたいから来ている
+    if (forceSwitch && !forceSwitch.classList.contains("is-on")) {
+      forceSwitch.classList.add("is-on");
+      forceSwitch.setAttribute("aria-checked", "true");
+    }
+  } else {
+    if (desc) desc.textContent = "このナレッジベースには、まだ知識グラフがありません。構築すると、複数の文書をまたいだ「関係」や「テーマ」を質問できるようになります。";
+    if (btnLabel) btnLabel.textContent = "知識グラフを構築";
+    if (forceRow) forceRow.hidden = true;
+    if (forceSwitch) {
+      forceSwitch.classList.remove("is-on");
+      forceSwitch.setAttribute("aria-checked", "false");
+    }
+  }
+}
+// run.log は pipeline が必ず出すが、旧バージョン製の library には無い場合がある。
+// open_artifact は存在しない場合 False を返すので、その時だけユーザに伝える。
+document.getElementById("done-log")?.addEventListener("click", async () => {
+  if (!state.currentLibraryDir) return;
+  const ok = await api.openArtifact(state.currentLibraryDir, "run_log");
+  if (!ok) showToast("ログがありません");
+});
+
+// Cost ↔ token toggle: click the cost metric to flip between the friendly
+// est. cost (default, client-safe) and the real token count (internal). The
+// mode persists on state so it survives re-renders within the session.
+document.getElementById("m-cost-metric")?.addEventListener("click", () => {
+  state.costMode = state.costMode === "tokens" ? "cost" : "tokens";
+  renderCostMetric();
+});
+
+// 「コピー」 — copy the currently previewed file's raw markdown to the
+// clipboard. WebView2 supports navigator.clipboard in a window context. Brief
+// "コピーしました" feedback on the button, then revert.
+const pvCopyBtn = document.getElementById("pv-copy");
+pvCopyBtn?.addEventListener("click", async () => {
+  const text = state.currentPreviewMd || "";
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    flashCopied();
+  } catch (err) {
+    // Clipboard API can reject (focus / permissions). Fall back to a hidden
+    // textarea + execCommand, which works in older WebView2 builds.
+    if (copyViaTextarea(text)) flashCopied();
+    else console.error("copy failed", err);
+  }
+});
+
+// Disable + dim the copy button when there's nothing to copy (empty preview).
+function updateCopyButton() {
+  if (!pvCopyBtn) return;
+  pvCopyBtn.disabled = !state.currentPreviewMd;
+}
+
+function flashCopied() {
+  const label = pvCopyBtn?.querySelector(".pvc-text");
+  if (!label) return;
+  const prev = label.textContent;
+  label.textContent = "コピーしました";
+  pvCopyBtn.classList.add("is-copied");
+  setTimeout(() => {
+    label.textContent = prev;
+    pvCopyBtn.classList.remove("is-copied");
+  }, 1400);
+}
+
+// Legacy clipboard fallback for WebView2 builds where navigator.clipboard is
+// blocked. Returns true on success.
+function copyViaTextarea(text) {
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
 
 // ---- refine-style dialog (10) --------------------------------------------
 // "読みやすく整形" opens the dialog; pick a skill; 整形する runs refine on the
@@ -920,7 +1248,11 @@ let _lastRefine = null;
 async function _startRefine(dir, file, skill, ack) {
   _lastRefine = { dir, file, skill };
   refineGoBtn.disabled = true;
-  refineGoBtn.textContent = "整形中…";
+  refineGoBtn.classList.add("is-loading");
+  const lbl = refineGoBtn.querySelector(".btn-label");
+  if (lbl) lbl.textContent = "整形中…";
+  const cancelBtn = document.getElementById("refine-cancel");
+  if (cancelBtn) cancelBtn.textContent = "閉じる（バックグラウンドで継続）";
   try {
     await api.startRefine(dir, [file], skill, ack);
   } catch (err) {
@@ -940,7 +1272,11 @@ refineGoBtn?.addEventListener("click", async () => {
 function resetRefineButton() {
   if (!refineGoBtn) return;
   refineGoBtn.disabled = false;
-  refineGoBtn.textContent = "整形する";
+  refineGoBtn.classList.remove("is-loading");
+  const lbl = refineGoBtn.querySelector(".btn-label");
+  if (lbl) lbl.textContent = "整形する";
+  const cancelBtn = document.getElementById("refine-cancel");
+  if (cancelBtn) cancelBtn.textContent = "キャンセル";
 }
 
 // The file currently shown in the 04 preview selector (refine target).
@@ -952,9 +1288,16 @@ function currentPreviewFile() {
 window.__onRefineDone = function (result) {
   hideOverlay("refine-style");
   resetRefineButton();
-  // Best-effort: tell the user it's done. readable/ output now exists on disk.
   const n = (result && result.files && result.files.length) || 0;
-  window.alert(`整形が完了しました（${n} 件）。readable フォルダに保存されました。`);
+  showToast(`整形が完了しました（${n} 件）`);
+  // Re-probe the current file's refined copy and switch the preview to it, so
+  // the user sees the result immediately without hunting for a folder.
+  const sel = document.getElementById("pv-select");
+  const name = sel && sel.value ? basename(sel.value) : "";
+  if (name) {
+    state.previewView = "refined";
+    loadPreview(name);
+  }
 };
 
 // Cost gate (refine.cost_check.mode=strict) blocked the run. Show the estimate
@@ -984,12 +1327,56 @@ window.__onRefineError = function (message) {
 // (backend gives no "stage" events — LightRAG is a black box), so screen 12
 // shows an honest chunk count + bar, NOT the four-stage mockup in the pen.
 
+// Mode pick (詳しく / 節約) — radio-style, single selection. Delegated on the
+// row so the listener doesn't get lost if the DOM is rebuilt.
+document.querySelector(".bc-mode")?.addEventListener("click", (e) => {
+  const opt = e.target.closest(".bc-mode-opt");
+  if (!opt) return;
+  document.querySelectorAll(".bc-mode-opt").forEach((o) =>
+    o.classList.toggle("is-selected", o === opt)
+  );
+});
+
+// Enrich / force switches — handwritten in HTML (single switches, don't go
+// through optRowSwitch). Same toggle logic — share it via the helper below.
+function bindSimpleSwitch(id) {
+  document.getElementById(id)?.addEventListener("click", (e) => {
+    const sw = e.currentTarget;
+    const next = !sw.classList.contains("is-on");
+    sw.classList.toggle("is-on", next);
+    sw.setAttribute("aria-checked", String(next));
+  });
+}
+bindSimpleSwitch("bc-enrich-switch");
+bindSimpleSwitch("bc-force-switch");
+
+// Read current build choices from the DOM. No JS state mirror — DOM is the
+// single source of truth, defaults match the HTML (mode=full, enrich=off,
+// force=off; force-row hidden when there's no existing graph).
+function readGraphBuildOptions() {
+  const selected = document.querySelector(".bc-mode-opt.is-selected");
+  const mode = selected ? selected.dataset.mode : "full";
+  const enrich = document
+    .getElementById("bc-enrich-switch")
+    ?.classList.contains("is-on") || false;
+  const force = document
+    .getElementById("bc-force-switch")
+    ?.classList.contains("is-on") || false;
+  const opts = {};
+  // Only send non-default fields so the backend's config defaults stand.
+  if (mode && mode !== "full") opts.mode = mode;
+  if (enrich) opts.enrich_chunks = true;
+  if (force) opts.force = true;
+  return opts;
+}
+
 document.getElementById("graph-build")?.addEventListener("click", async () => {
   if (!state.currentLibraryDir) return;
+  const options = readGraphBuildOptions();
   showScreen("graph-building");
   setGraphProgress(0, 0);
   try {
-    await api.startBuildGraph(state.currentLibraryDir);
+    await api.startBuildGraph(state.currentLibraryDir, options);
   } catch (err) {
     console.error("start build graph failed", err);
   }
@@ -1014,7 +1401,7 @@ window.__onGraphProgress = function (event) {
 window.__onGraphDone = function (result) {
   const e = result.entities || 0;
   const r = result.relations || 0;
-  window.alert(`知識グラフを構築しました（用語 ${e} / 関係 ${r}）。`);
+  showToast(`知識グラフを構築しました（用語 ${e} / 関係 ${r}）`);
   showScreen("done");
 };
 
@@ -1074,6 +1461,28 @@ async function openLibrary(dir) {
   } catch (err) {
     console.error("open library failed", err);
   }
+}
+
+// ---- toast (non-blocking completion notice) ------------------------------
+// A small bottom-right notice that fades in/out on its own. Replaces window.
+// alert for SUCCESS notifications (alert blocks the UI and reads as an error
+// dialog). Errors / confirmations still use alert/confirm where a decision is
+// needed.
+let _toastTimer = null;
+function showToast(message) {
+  let toast = document.getElementById("app-toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "app-toast";
+    toast.className = "app-toast";
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  // Force reflow so the fade-in transition re-runs on repeat toasts.
+  void toast.offsetWidth;
+  toast.classList.add("is-shown");
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => toast.classList.remove("is-shown"), 2600);
 }
 
 // ---- boot ----------------------------------------------------------------
@@ -1166,23 +1575,42 @@ async function renderEnvCheck() {
 }
 
 // ---- settings: AI model (06) ---------------------------------------------
-// Model dropdowns use plain-language tiers mapped to REAL model IDs (verified
-// against config/default.yaml). "既定" = the backend's actual default (Vision
-// defaults to flash, so 高速 is the default — pen's "高精度（既定）" label was
-// wrong; we follow the source of truth). Changing a dropdown or a key saves
-// immediately via save_settings (no Save button in the pen).
+// Vision のモデル選択のみ。ASR は default.yaml の qwen3-asr-flash を既定で
+// 走らせる（ユーザの選択肢として出さない）。
 //
-// Tier value = the config model ID. Saved as a flat dotted key; build_config
-// expands dotted keys into nested overrides (see api._normalize_overrides).
+// 切り替え時は単一 model id だけでなく provider と api_key_env も同期する必要
+// があるため（同じ vision タスクで Google → OpenAI に乗り換えると認証先が
+// 変わる）、各ティアは 3 つの設定値を持ち、保存時にまとめて書き込む。
+// 保存形式は flat dotted key（api._normalize_overrides がネストに展開）。
 const VISION_TIERS = [
-  { value: "gemini-3-flash-preview", label: "高速（既定）" },
-  { value: "gemini-3-pro-preview", label: "高精度" },
+  {
+    value: "gemini-3-flash-preview",
+    label: "Gemini 3 Flash（既定）",
+    provider: "google",
+    api_key_env: "GEMINI_API_KEY",
+  },
+  {
+    value: "gemini-3.1-pro-preview",
+    label: "Gemini 3.1 Pro（高精度）",
+    provider: "google",
+    api_key_env: "GEMINI_API_KEY",
+  },
+  {
+    value: "gpt-5.5",
+    label: "GPT-5.5（高精度）",
+    provider: "openai",
+    api_key_env: "OPENAI_API_KEY",
+  },
+  {
+    value: "gpt-5.4-mini",
+    label: "GPT-5.4 mini（節約）",
+    provider: "openai",
+    api_key_env: "OPENAI_API_KEY",
+  },
 ];
-const ASR_TIERS = [
-  { value: "qwen3-asr-flash", label: "標準（既定）" },
-];
-const VISION_KEY = "models.vision.primary.model";
-const ASR_KEY = "models.audio_transcription.primary.model";
+const VISION_MODEL_KEY = "models.vision.primary.model";
+const VISION_PROVIDER_KEY = "models.vision.primary.provider";
+const VISION_KEYENV_KEY = "models.vision.primary.api_key_env";
 
 const KEY_FIELDS = [
   { env: "GEMINI_API_KEY", cfg: "GEMINI_API_KEY" },
@@ -1203,9 +1631,8 @@ function fillTierSelect(selectEl, tiers, currentValue) {
 
 async function renderModelSettings() {
   const vSel = document.getElementById("model-vision");
-  const aSel = document.getElementById("model-asr");
   const keysEl = document.getElementById("model-keys");
-  if (!vSel || !aSel || !keysEl) return;
+  if (!vSel || !keysEl) return;
 
   let settings = {};
   let doctorData = {};
@@ -1218,11 +1645,9 @@ async function renderModelSettings() {
     console.error("load model settings failed", err);
   }
 
-  // Dropdowns: show saved value if present, else the default (first tier).
-  fillTierSelect(vSel, VISION_TIERS, settings[VISION_KEY] || VISION_TIERS[0].value);
-  fillTierSelect(aSel, ASR_TIERS, settings[ASR_KEY] || ASR_TIERS[0].value);
-  vSel.onchange = () => saveSetting(VISION_KEY, vSel.value);
-  aSel.onchange = () => saveSetting(ASR_KEY, aSel.value);
+  // Dropdown: show saved value if present, else the default (first tier).
+  fillTierSelect(vSel, VISION_TIERS, settings[VISION_MODEL_KEY] || VISION_TIERS[0].value);
+  vSel.onchange = () => saveVisionTier(vSel.value);
 
   // Key rows: "set / not set" from doctor (covers .env); editable, saves to
   // config.yaml. We never display .env key values (security + get_settings
@@ -1273,6 +1698,26 @@ async function saveSetting(key, value) {
     await api.saveSettings(current);
   } catch (err) {
     console.error("save setting failed", err);
+  }
+}
+
+// Vision tier 切替えは model / provider / api_key_env の 3 つを同時に書く
+// （Google → OpenAI に乗り換えると認証先が変わるため、model だけ書くと
+// provider が前回のままになり認証失敗する）。3 回 saveSetting すると間に
+// レース条件が生じる（各 await で旧 settings を読み直すので最後の書き込み
+// 以外が消える）ので、1 回の getSettings → set 3 つ → saveSettings に
+// まとめる。
+async function saveVisionTier(modelId) {
+  const tier = VISION_TIERS.find((t) => t.value === modelId);
+  if (!tier) return;
+  try {
+    const current = (await api.getSettings()) || {};
+    current[VISION_MODEL_KEY] = tier.value;
+    current[VISION_PROVIDER_KEY] = tier.provider;
+    current[VISION_KEYENV_KEY] = tier.api_key_env;
+    await api.saveSettings(current);
+  } catch (err) {
+    console.error("save vision tier failed", err);
   }
 }
 

@@ -20,6 +20,109 @@ Public Python API surface is exactly what `docingest/__init__.py` re-exports —
 
 ---
 
+## Before you write code — decision frame
+
+This section is a **decision frame, not a recipe**: the right config depends on
+your host's constraints. Use it to decide *what* to do; the **Scenarios** and
+**Deployment** sections below are the *how*, with working code.
+
+### 30-second decision tree
+
+| If the host is... | Use | Why |
+|---|---|---|
+| A Python app, single-tenant, OK with sync calls | Python library — `import docingest; docingest.ingest(...)` | Lowest friction |
+| A long-lived web service / worker / API | Library + **subprocess isolation** (see Trap 2) | C extensions ignore `threading` cancellation |
+| Non-Python (Node / Go / Bash / CI) | CLI subprocess + `--json` | JSON on stdout, banner on stderr |
+| An AI agent (Claude Desktop / Cursor / Copilot) | MCP server — `python -m docingest.mcp_server` | Tool docstrings drive agent behaviour |
+
+### Five questions to answer first
+
+1. **Which LLM provider?** OpenAI direct / Azure / Bedrock / Vertex / Gemini /
+   Anthropic? → Pick the matching Provider class from [README → Python Library](../README.md#python-library).
+   Don't roll your own credential plumbing — DocIngest already mirrors the right
+   env vars per provider.
+2. **Containerised? Non-root user?** → If yes, you need `parsing.ocr.rapidocr_model_paths`
+   pre-set (see [Deployment → Non-root containers](#non-root-containers--pre-download-ocr-models)).
+   Skipping this is the #1 silent-failure mode (Trap 4).
+3. **How big is the largest doc?** → Always run `docingest.inspect(paths)` first on
+   unknown / large inputs. Vision is one API call per page; a 300-page PDF can quietly
+   cost tens of dollars.
+4. **Is the cache directory persistent across restarts?** → If `output.dir` lives on
+   ephemeral container storage, override `incremental.cache_dir` to a mounted volume —
+   otherwise every restart re-pays for every Vision call (see [Deployment → Cache persistence](#cache-persistence)).
+5. **Do you need progress streaming?** → Library: `on_progress=...` callback. CLI:
+   `--json` (one final JSON; for live progress, scrape stderr). MCP: single response — no streaming.
+
+### Common traps (real ones, with pointers to the fix below)
+
+**Trap 1 — "success but the text looks wrong".** `result.stats["successful"] == 1`,
+but `markdown_files[0].content` is empty / tiny / binary-looking garbage. Rank causes:
+(1) RapidOCR couldn't write model files → Trap 4; (2) OCR produced empty pages → check
+`result.stats["warnings"]`; (3) the file was corrupt / wrong format → check
+`metadata["format"]`. **The invariant for a clean run is `successful == N AND warnings == []`** —
+always inspect warnings before trusting a success.
+
+**Trap 2 — C extensions ignore `threading.cancel()`.** A `ThreadPoolExecutor` task hangs
+on a malformed PDF and `future.cancel()` does nothing, because DocIngest calls into
+docling / pymupdf / onnxruntime (C extensions). For wall-clock guarantees beyond
+`parsing.timeout_sec`, run in a child process — see [Subprocess isolation](#subprocess-isolation-when-timeouts-matter).
+**Use `Pipe`, not `Queue`** (Trap 7).
+
+**Trap 3 — image is 8–11 GB.** `pip` pulled gigabytes of `nvidia-*` wheels. Vision-only
+deployments need neither torch nor CUDA; steer the install — see [Image size](#image-size--torch-is-the-only-thing-that-matters).
+
+**Trap 4 — non-root container can't OCR.** PDFs return short/empty markdown; logs show
+`PermissionError` near `rapidocr/models/`. RapidOCR downloads `.onnx` to its package dir
+(read-only on non-root). Pre-download in the build stage and set
+`parsing.ocr.rapidocr_model_paths.{det,cls,rec}` — see [Non-root containers](#non-root-containers--pre-download-ocr-models).
+Partial config (one path set) is an explicit error, not a silent fallback.
+
+**Trap 5 — subprocess logs vanish.** A child process "succeeded" but `az logs` /
+`kubectl logs` show nothing. `multiprocessing.spawn` doesn't forward child stdout/stderr.
+Capture child logs in a `StringIO` handler on the `docingest` logger, ship them through
+the same `Pipe` as the result, re-emit on the parent — see [Logging](#logging).
+
+**Trap 6 — "I changed config but output is the same".** The incremental cache only
+invalidates on changes to keys in `_RELEVANT_CONFIG_PATHS` (see [ARCHITECTURE.md §7.4](ARCHITECTURE.md)).
+If your knob truly affects output but isn't whitelisted, that's a DocIngest bug — file it.
+`force=True` is the escape hatch (expensive; use sparingly).
+
+**Trap 7 — subprocess hangs on `Queue.put` of large markdown.** Child returns but
+`is_alive()` stays True forever: `multiprocessing.Queue`'s feeder thread outlives the
+worker on a 100KB+ `put`. Use `multiprocessing.Pipe(duplex=False)` — synchronous, no
+feeder thread, clean exit.
+
+**Trap 8 — "successful=0, no errors, no logs" (cross-container path).** Batch ingest
+returns `total_files=N` but `successful=0`, `failed=N` with `error_type="io_error"`,
+`reason="not_found"`. The path doesn't exist in the calling process's filesystem (API
+container's `/tmp` ≠ worker container's `/tmp`). Use one of the three patterns in
+[Cross-container handoff](#cross-container--cross-process-file-handoff), and run
+`inspect()` before `ingest()` as a cheap pre-flight.
+
+**Trap 9 — "I passed `outputs=['chunks']` but `sources/*.md` is still on disk".**
+`outputs=` controls which **stages** run and which artefacts are read back — but
+`sources/*.md` and `index.json` are **always written** (cache + downstream stages need
+them). The reader is skipped, the files exist. If you need a clean disk, run into a
+`tempfile.mkdtemp()` and `shutil.rmtree()` after. What `outputs=["chunks"]` really saves
+is the knowledge_map LLM call + quality_report + run_log — see [Output whitelist](#output-whitelist-the-biggest-perf-knob).
+
+### What you MUST NOT do
+
+- ❌ **Share an `output_dir` between concurrent `ingest()` calls.** No internal locking;
+  second writer clobbers `chunks.jsonl` / `index.json`. One directory per call.
+- ❌ **Import from `docingest.pipeline` / `.parsers` / `.chunkers`** in consumer code.
+  Internal — public surface is whatever `docingest/__init__.py` re-exports.
+- ❌ **Pass `force=True` "to be safe".** The cache is content-addressed and
+  self-invalidating; forcing a rebuild on a 1000-file corpus is expensive and rarely needed.
+- ❌ **`install_signal_handler=True` in a long-running service.** That's for stand-alone
+  CLI runs; in a worker it competes with the host's SIGTERM handling.
+- ❌ **Log full API keys** — even at DEBUG. Forward bool / `"(unset)"` markers.
+- ❌ **Catch `KeyboardInterrupt` and retry.** A user hitting Ctrl+C wants to stop.
+- ❌ **Write your own Provider class** before checking the raw-dict path:
+  `vision={"primary": {"provider": "<litellm name>", ...}}` works for anything litellm supports.
+
+---
+
 ## Scenarios
 
 ### 1. Backend RAG batch (no UI)
@@ -72,7 +175,7 @@ async def ingest(paths: list[str]):
     return StreamingResponse(stream(), media_type="text/event-stream")
 ```
 
-**Key knobs**: `on_progress` fires once per file (cached / added / updated / failed / skipped). Event schema is documented in the `run_pipeline` docstring; treat it as a forward-compatible dict (don't `KeyError` on missing fields). Run the sync pipeline in a thread pool — `ingest()` is not async.
+**Key knobs**: `on_progress` fires a `kind="file_done"` event once per file (cached / added / updated / failed / skipped), plus `kind="file_progress"` events for within-file progress (Vision page `sub_current/sub_total`, and a "parsing" busy signal) so a long file doesn't freeze the bar. Filter on `kind` — consumers handling only `file_done` ignore the rest. Event schema is documented in the `run_pipeline` docstring; treat it as a forward-compatible dict (don't `KeyError` on missing fields). Run the sync pipeline in a thread pool — `ingest()` is not async.
 
 **Failure handling — don't fall into the "succeeded, 0 files" trap**: `ingest()` returns rather than raising, so a run where every file failed still comes back as a normal `IngestResult` with `stats["failed"] > 0`. An unaware caller that only checks "did it return" treats that as success and ships an empty knowledge base. Two safeguards:
 - Failures are **always logged at warning level** (`DocIngest: N file(s) failed — ...`), even on the library path — so they surface in your logs without you inspecting `stats`.

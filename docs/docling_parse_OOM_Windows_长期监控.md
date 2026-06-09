@@ -486,8 +486,12 @@ docling 把整本页对象/模型中间态攒在内存的**架构行为，与崩
 
 **已知边界（实现时标注，未顺手扩展——反过度防御）**：
 - 慢 ~7-9x，但只在真崩才触发。
-- **关 vision 时分批会误触发 LibreOffice 全量转换（~226s/批）**——真实场景 vision 开（默认）
-  不会，但 vision-off 的库用户（如 Mplat）走分批会很慢。只在"vision关+PDF崩+走分批"三重边界发生。
+- ~~**关 vision 时分批会误触发 LibreOffice 全量转换（~226s/批）**~~ **（2026-06-08 已修复）**——
+  根因是"关 vision 还在渲染只给 vision 用的页图"：① `_build_page_data` 的页图兜底加了
+  `parsing.vision.enabled` 守卫；② `_try_external_page_images` 对 PDF 输入直接 pdf2image 渲染、
+  不再过 LibreOffice（LO 不是为 PDF→PDF 设计的，官方机制会逐对象重导入）；③ pipeline Phase 1.3
+  的 xlsx/docx/pptx 页图渲染同样加了 vision 守卫（这个影响更大——每个 Office 文件都走 Phase 1.3）。
+  实测：30MB 10页扫描件关 vision 从 130s→19s；15MB PPTX 关 vision 从含 8.3s LibreOffice 渲染→2.5s。
 - 跨页表格分批可能切断（WEO 表单页完整不受影响，社区已知局限）。
 - **vision 结果 overflow → 边界页 title_path 错标**：分批拼接让 section 数和 vision 页索引
   差 1，触发 `pipeline.py:1668` 的 overflow 分支（warning 文本是为 xlsx 写的，PDF 分批也命中）。
