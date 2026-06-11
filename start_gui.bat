@@ -15,7 +15,7 @@ if errorlevel 1 (
 
 "%PY%" -c "import webview" >nul 2>&1
 if errorlevel 1 (
-    echo [ERROR] pywebview not installed. Run:  "%PY%" -m pip install pywebview
+    echo [ERROR] pywebview not installed. Run:  "%PY%" -m pip install "pywebview>=6.2,<7"
     pause
     exit /b 1
 )

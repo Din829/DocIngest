@@ -17,6 +17,12 @@ Resolution order per binary (first hit wins):
   (System-installed binaries need no injection — find_binary's later steps
    find them. We only inject what we *bring*.)
 
+The same pattern covers docling's ML models: a packaged exe ships them under
+`_MEIPASS/_bundled_models`, and we point `DOCLING_ARTIFACTS_PATH` at that dir
+(docling's own settings read this env var; it must be set BEFORE docling is
+imported, which holds because entry points call this at startup while docling
+imports lazily at first parse). Offline exe → no HuggingFace download.
+
 Anything not found is simply not injected — find_binary falls through to its
 normal discovery / graceful-degrade path. We never raise: a missing optional
 binary is a known degrade (e.g. no ffprobe → no duration_sec), not an error.
@@ -32,6 +38,10 @@ from pathlib import Path
 # packaging step (--add-binary / --add-data) places them here; this is the
 # single agreed name both sides reference.
 _BUNDLE_SUBDIR = "_bundled_bin"
+
+# Subdirectory for docling's pre-downloaded ML models (layout / tableformer /
+# rapidocr). Same contract: packaging/docingest_gui.spec places them here.
+_MODELS_SUBDIR = "_bundled_models"
 
 # Per-binary: the env var find_binary reads + the filename(s) to look for
 # under the bundle dir (Windows .exe vs bare name).
@@ -105,5 +115,13 @@ def ensure_bundled_binaries() -> dict[str, str]:
         if path:
             os.environ[env_var] = path
             injected[env_var] = path
+
+    # docling models (packaged exe only). Same respect-existing rule.
+    base = getattr(sys, "_MEIPASS", None)
+    if base and not os.environ.get("DOCLING_ARTIFACTS_PATH"):
+        models = Path(base) / _MODELS_SUBDIR
+        if models.is_dir():
+            os.environ["DOCLING_ARTIFACTS_PATH"] = str(models)
+            injected["DOCLING_ARTIFACTS_PATH"] = str(models)
 
     return injected

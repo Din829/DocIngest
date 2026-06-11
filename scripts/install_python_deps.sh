@@ -5,14 +5,14 @@
 # don't have to remember which combo to install on a new machine.
 #
 # Usage:
-#   ./scripts/install_python_deps.sh             # core + mcp,audio,nlp,graph
+#   ./scripts/install_python_deps.sh             # core + mcp,audio,nlp,graph,gui
 #   ./scripts/install_python_deps.sh --minimal   # core only
 #   ./scripts/install_python_deps.sh --full      # also adds graph-local (~2GB torch)
 #   ./scripts/install_python_deps.sh --no-graph  # drop graph layer
 #   ./scripts/install_python_deps.sh --dry-run   # print the pip command, don't run
 #
 # Tip: also install these on top (not in pyproject):
-#   pip install pdf2image PyExifTool
+#   pip install pdf2image PyExifTool magika
 # They are imported lazily by DocIngest. Run scripts/verify_deps.py to see
 # whether anything is missing.
 
@@ -42,11 +42,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# gui (pywebview, lightweight) is part of every non-minimal profile so the
+# desktop GUI works out of the box after this script.
 case "$PROFILE" in
     minimal)   EXTRAS="" ;;
-    default)   EXTRAS="[mcp,audio,nlp,graph]" ;;
-    no-graph)  EXTRAS="[mcp,audio,nlp]" ;;
-    full)      EXTRAS="[mcp,audio,nlp,graph,graph-local]" ;;
+    default)   EXTRAS="[mcp,audio,nlp,graph,gui]" ;;
+    no-graph)  EXTRAS="[mcp,audio,nlp,gui]" ;;
+    full)      EXTRAS="[mcp,audio,nlp,graph,graph-local,gui]" ;;
 esac
 
 # CPU-only torch — installed BEFORE docling. docling pulls torch transitively
@@ -57,7 +59,7 @@ esac
 # no nvidia/cuda packages on top of a pre-installed CPU torch.
 TORCH_CMD="pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu"
 CMD="pip install -e \"${REPO_ROOT}${EXTRAS}\""
-EXTRA_CMD="pip install pdf2image PyExifTool"
+EXTRA_CMD="pip install pdf2image PyExifTool magika"
 
 echo "=== DocIngest Python deps install (profile: $PROFILE) ==="
 echo "Step 1 (CPU-only torch, before docling): $TORCH_CMD"

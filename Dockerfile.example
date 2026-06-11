@@ -83,15 +83,18 @@ RUN mkdir -p src/docingest && \
 # the CPU index is the sole source for torch and the CUDA wheel can't sneak in.
 RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# Profile-driven extras. Mirrors scripts/install_python_deps.sh.
+# Profile-driven extras. Mirrors scripts/install_python_deps.sh exactly —
+# including [gui]: pywebview is a ~2MB pure-Python package whose import is
+# safe headless (only webview.start() needs a display), and keeping the sets
+# identical lets VERIFY_PROFILE=strict pass out of the box.
 RUN case "${INSTALL_PROFILE}" in \
         minimal)   EXTRAS="" ;; \
-        no-graph)  EXTRAS="[mcp,audio,nlp]" ;; \
-        full)      EXTRAS="[mcp,audio,nlp,graph,graph-local]" ;; \
-        *)         EXTRAS="[mcp,audio,nlp,graph]" ;; \
+        no-graph)  EXTRAS="[mcp,audio,nlp,gui]" ;; \
+        full)      EXTRAS="[mcp,audio,nlp,graph,graph-local,gui]" ;; \
+        *)         EXTRAS="[mcp,audio,nlp,graph,gui]" ;; \
     esac && \
     pip install -e ".${EXTRAS}" && \
-    pip install pdf2image PyExifTool yt-dlp
+    pip install pdf2image PyExifTool yt-dlp magika
 
 # -----------------------------------------------------------------------------
 # Layer 3: OCR stack pre-download (must happen as ROOT)

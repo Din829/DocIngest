@@ -52,13 +52,13 @@ Wraps `pip install -e .[...]` with a sane default extras combo.
 
 | Flag | What changes |
 |---|---|
-| (none) | core + `[mcp,audio,nlp,graph]` + `pdf2image PyExifTool` |
-| `--minimal` | core only (still adds `pdf2image PyExifTool` — lazy imports) |
-| `--no-graph` | core + `[mcp,audio,nlp]` (drops GraphRAG layer) |
+| (none) | core + `[mcp,audio,nlp,graph,gui]` + `pdf2image PyExifTool magika` |
+| `--minimal` | core only (still adds `pdf2image PyExifTool magika` — lazy imports) |
+| `--no-graph` | core + `[mcp,audio,nlp,gui]` (drops GraphRAG layer) |
 | `--full` | core + everything + `[graph-local]` (+~2GB torch) |
 | `--dry-run` | print the pip command, don't run |
 
-Why `pdf2image` and `PyExifTool` are always installed: the DocIngest source `import`s them lazily but they are **not declared in pyproject.toml** — installing them here closes the gap.
+Why `pdf2image`, `PyExifTool` and `magika` are always installed: the DocIngest source `import`s them lazily but they are **not declared in pyproject.toml** — installing them here closes the gap.
 
 ### `install_system_deps.sh` (Linux / macOS)
 
@@ -88,7 +88,7 @@ Uses `winget` for everything except **poppler** — there is no official winget 
 
 ### `verify_deps.py`
 
-The gate. Checks Python core + tools + Python extras + the four hidden deps the built-in `docingest doctor` misses (poppler, JS runtime, pdf2image, pyexiftool).
+The gate. Checks Python core + tools + Python extras + the five hidden deps the built-in `docingest doctor` misses (poppler, JS runtime, pdf2image, pyexiftool, pywebview).
 
 | Flag | What changes |
 |---|---|
@@ -113,6 +113,8 @@ The gate. Checks Python core + tools + Python extras + the four hidden deps the 
 | `audio` | dashscope (Qwen3-ASR) |
 | `nlp` | sudachipy (Japanese keyword extraction) |
 | `graph` | lightrag-hku + nest_asyncio |
+| `detect` | magika (content-based file type detection) |
+| `gui` | pywebview (desktop GUI shell) |
 
 **Exit codes:**
 - `0` — all required deps satisfied

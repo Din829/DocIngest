@@ -5,10 +5,14 @@
 #   pip install -e ".[nlp]"       # + Japanese keyword extraction (SudachiPy)
 #   pip install -e ".[mcp]"       # + MCP Server (FastMCP)
 #   pip install -e ".[audio]"     # + Audio transcription (DashScope Qwen3-ASR)
-#   pip install -e ".[nlp,mcp,audio]"  # All optional
+#   pip install -e ".[gui]"       # + Desktop GUI (pywebview)
+#   pip install -e ".[nlp,mcp,audio,gui]"  # combos work too
 #
-# This file is for environments that require requirements.txt (e.g. Docker).
-# It mirrors pyproject.toml — if you update deps, update pyproject.toml first.
+# This file is for environments that require requirements.txt (e.g. tooling
+# that can't read pyproject). It mirrors pyproject.toml's CORE list — if you
+# update deps, update pyproject.toml FIRST, then sync the floors here.
+# Version floors below include security pins (CVE fixes); see the inline
+# comments in pyproject.toml for the per-package rationale.
 #
 # IMPORTANT — CPU-only torch: docling pulls torch transitively, and the default
 # Linux PyPI wheel is the ~5.6GB CUDA build (unused — DocIngest is CPU-only).
@@ -18,26 +22,33 @@
 # Do NOT add --index-url to this file: it would force ALL packages through the
 # CPU index, which doesn't carry litellm/typer/etc. and the install would fail.
 
-# === Core ===
-docling>=2.70
-litellm>=1.80
-typer>=0.12
+# === Core (mirrors pyproject.toml [project].dependencies) ===
+docling>=2.95
+litellm>=1.86.1
+google-genai>=2.0
+typer>=0.15
 pyyaml>=6.0
 rich>=13.0
 python-dotenv>=1.0
 diskcache>=5.6
 openpyxl>=3.1
-pillow>=10.0
+pillow>=11.3,<13
 python-pptx>=1.0
-beautifulsoup4>=4.12
+beautifulsoup4>=4.13
 defusedxml>=0.7
-pymupdf>=1.24
-requests>=2.31
+pymupdf>=1.26.7
+olefile>=0.47
+requests>=2.33
 
-# === Optional (uncomment as needed) ===
-# sudachipy>=0.6            # Japanese keyword extraction
-# sudachidict_core>=20240409
-# fastmcp>=2.0              # MCP Server
-# dashscope                 # Audio transcription (Qwen3-ASR)
+# === Lazy imports (not in pyproject; the install scripts add these) ===
+# pdf2image                 # Fast PDF page rendering (needs poppler binary)
+# PyExifTool                # File metadata hook (needs exiftool binary)
 # magika>=1.0               # Content-based file type detection
 # yt-dlp                    # YouTube/Bilibili URL support
+
+# === Optional extras (prefer pip install -e ".[name]"; floors mirror pyproject) ===
+# sudachipy>=0.6            # [nlp] Japanese keyword extraction
+# sudachidict_core>=20251022
+# fastmcp>=3.2,<4           # [mcp] MCP Server
+# dashscope>=1.25           # [audio] Qwen3-ASR transcription
+# pywebview>=6.2,<7         # [gui] Desktop GUI shell

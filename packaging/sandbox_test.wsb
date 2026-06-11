@@ -1,0 +1,24 @@
+<!-- Windows Sandbox config for the FINAL offline acceptance test.
+     Double-click this file (needs Windows Pro/Enterprise with the
+     "Windows Sandbox" feature enabled).
+
+     What it proves: the sandbox has NO Python, NO network, NO dev tools —
+     if the exe runs the smoke matrix and opens its window in here, every
+     dependency is genuinely inside the bundle. See packaging/README.md
+     for the test checklist. -->
+<Configuration>
+  <Networking>Disable</Networking>
+  <MappedFolders>
+    <MappedFolder>
+      <!-- Adjust if your repo lives elsewhere. -->
+      <HostFolder>C:\Users\q9951\Desktop\AgenticWorkflow\副项目-和Dinreact区分\DocIngest\packaging\dist\DocIngest</HostFolder>
+      <SandboxFolder>C:\DocIngest</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <!-- Run the offline smoke matrix automatically; results land in
+         C:\Users\WDAGUtilityAccount\Desktop\smoke_out\smoke.log -->
+    <Command>cmd /c "mkdir %USERPROFILE%\Desktop\samples %USERPROFILE%\Desktop\smoke_out 2>nul &amp; start cmd /k echo 1) Wait for samples: copy a few docs into Desktop\samples (or skip).  2) Run: C:\DocIngest\DocIngest.exe --smoke %USERPROFILE%\Desktop\samples %USERPROFILE%\Desktop\smoke_out   3) Check smoke_out\smoke.log says SMOKE PASSED.  4) Double-click C:\DocIngest\DocIngest.exe and confirm the window opens."</Command>
+  </LogonCommand>
+</Configuration>

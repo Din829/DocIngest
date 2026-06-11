@@ -5,11 +5,12 @@ DocIngest's built-in `docingest doctor` only prints a table; it never exits
 non-zero. This script wraps `doctor.run_doctor()` and turns missing deps into
 a real exit-1 so CI / Dockerfiles / deploy scripts can use it as a gate.
 
-It also covers four deps the built-in doctor misses:
+It also covers five deps the built-in doctor misses:
   - poppler (system binary, required by pdf2image fast PDF→image path)
   - node/deno/bun (JS runtime, required by yt-dlp for YouTube extractors)
-  - pdf2image (Python pkg, declared nowhere, used in pipeline.py:851)
-  - pyexiftool (Python pkg, declared nowhere, used in file_metadata.py:163)
+  - pdf2image (Python pkg, not in pyproject — installed by install scripts)
+  - pyexiftool (Python pkg, not in pyproject — installed by install scripts)
+  - pywebview (Python pkg, [gui] extra — the desktop GUI shell)
 
 Usage
 -----
@@ -33,6 +34,8 @@ Feature groups (used by --require / --strict)
     audio      dashscope (Qwen3-ASR)
     nlp        sudachipy (Japanese keyword extraction)
     graph      lightrag + openai + nest_asyncio (GraphRAG layer)
+    detect     magika (content-based file type detection)
+    gui        pywebview (desktop GUI shell)
 
 Exit codes
 ----------
@@ -176,6 +179,11 @@ _HINTS: dict[str, dict[str, str]] = {
         "darwin": "pip install PyExifTool",
         "linux": "pip install PyExifTool",
     },
+    "pywebview": {
+        "win32": 'pip install "pywebview>=6.2,<7"  # or: pip install -e ".[gui]"',
+        "darwin": 'pip install "pywebview>=6.2,<7"  # or: pip install -e ".[gui]"',
+        "linux": 'pip install "pywebview>=6.2,<7"  # or: pip install -e ".[gui]"',
+    },
 }
 
 
@@ -198,6 +206,8 @@ _GROUPS: dict[str, list[tuple[str, str]]] = {
     "audio":    [("opt", "dashscope")],
     "nlp":      [("opt", "sudachipy")],
     "graph":    [("opt", "lightrag-hku"), ("opt", "nest_asyncio")],
+    "detect":   [("opt", "magika")],
+    "gui":      [("extra", "pywebview")],
 }
 
 # Default profile: what must be present when no --require / --strict given.
@@ -230,6 +240,7 @@ def _collect_status() -> dict[str, Any]:
         "rapidocr": {"ok": _check_python_pkg("rapidocr") or _check_python_pkg("rapidocr_onnxruntime")},
         "pdf2image": {"ok": _check_python_pkg("pdf2image")},
         "pyexiftool": {"ok": _check_python_pkg("exiftool")},
+        "pywebview": {"ok": _check_python_pkg("webview")},
         "ffprobe": {"ok": _check_binary("ffprobe") is not None, "path": _check_binary("ffprobe")},
     }
 
