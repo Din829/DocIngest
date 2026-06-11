@@ -62,6 +62,45 @@ _pipeline_logger = logging.getLogger(__name__)
 _EXTERNAL_STOP = threading.Event()
 
 
+# ---------------------------------------------------------------------------
+# File-level concurrency gates (performance.file_concurrency > 1).
+#
+# _PARSE_GATE — parsing NEVER runs concurrently, by design (probe-verified):
+#   the Docling models are loaded once per parser instance (~1.9GB RSS after
+#   one parse), DoclingParser carries per-parse mutable state
+#   (_last_parse_metadata), and concurrent parses amplify the intermittent
+#   docling-parse Windows std::bad_alloc (probe: a 2nd model copy + a
+#   177-page PDF killed the process; see docs/docling_parse_OOM_Windows_
+#   长期监控.md). The concurrency win comes from OVERLAP instead: file B
+#   parses while file A waits on Vision I/O. The lock sits OUTSIDE
+#   run_with_timeout so the parse timeout budget never includes queueing
+#   time (and run_with_timeout never leaks a running zombie — measured).
+#
+# _WRITE_NAMES_GATE — write_markdown mutates the shared `existing_names`
+#   collision set; Phase 2 is cheap file I/O, so one coarse lock suffices.
+#
+# _VISION_GATE — caps TOTAL in-flight Vision calls across all files (each
+#   file's own pools stay parallel_files-sized; without a global cap,
+#   N files × parallel_files would stampede the provider's rate limit).
+#   Sized by run_pipeline from performance.vision_global_concurrency
+#   (null → parallel_files, so single-file behaviour is unchanged).
+#   Module-level by the same one-run-at-a-time assumption as
+#   _EXTERNAL_STOP above.
+# ---------------------------------------------------------------------------
+_PARSE_GATE = threading.Lock()
+_WRITE_NAMES_GATE = threading.Lock()
+_VISION_GATE: threading.BoundedSemaphore | None = None
+
+
+def _vision_permit():
+    """Context manager guarding one in-flight Vision call. No-op (nullcontext)
+    when the gate is uninitialised — e.g. _enrich_with_vision called outside
+    run_pipeline (tests, library callers going through api.refine paths)."""
+    from contextlib import nullcontext
+    gate = _VISION_GATE
+    return gate if gate is not None else nullcontext()
+
+
 def request_stop() -> None:
     """Ask the currently running pipeline to stop gracefully (thread-safe)."""
     _EXTERNAL_STOP.set()
@@ -1759,12 +1798,13 @@ def _enrich_embedded_images(
         if _EXTERNAL_STOP.is_set():
             return img, None, None
         try:
-            return img, describe_embedded_image_cached(
-                image_path=img["path"],
-                config=config,
-                cache=cache,
-                doc_format=doc_format,
-            ), None
+            with _vision_permit():
+                return img, describe_embedded_image_cached(
+                    image_path=img["path"],
+                    config=config,
+                    cache=cache,
+                    doc_format=doc_format,
+                ), None
         except Exception as e:
             return img, None, e
 
@@ -2238,18 +2278,19 @@ def _enrich_with_vision(
             )
 
             try:
-                batch_text = run_with_timeout(
-                    lambda: describe_pages_batched_cached(
-                        image_paths=batch_imgs,
-                        page_texts=batch_texts,
-                        config=config,
-                        cache=cache,
-                        structured_data=batch_struct,
-                        doc_format=doc_format,
-                        ground_truth=batch_gt,
-                    ),
-                    batch_timeout,
-                )
+                with _vision_permit():
+                    batch_text = run_with_timeout(
+                        lambda: describe_pages_batched_cached(
+                            image_paths=batch_imgs,
+                            page_texts=batch_texts,
+                            config=config,
+                            cache=cache,
+                            structured_data=batch_struct,
+                            doc_format=doc_format,
+                            ground_truth=batch_gt,
+                        ),
+                        batch_timeout,
+                    )
             except TimeoutError as e:
                 # Tell the caller which knob to tune: scaled=timeout×batch was
                 # capped by batch_timeout_max_sec. Both fields matter — the user
@@ -2370,17 +2411,18 @@ def _enrich_with_vision(
                 # convention for populating structured_extractions_per_page.
                 struct_data = structured_per_page.get(page_data.page_no)
                 pg_text = _pp_ground if _pp_ground is not None else page_data.text
-                return idx, run_with_timeout(
-                    lambda: describe_page_cached(
-                        image_path=page_data.image_path,
-                        page_text=pg_text,
-                        config=config,
-                        cache=cache,
-                        structured_data=struct_data,
-                        doc_format=doc_format,
-                    ),
-                    vision_timeout,
-                )
+                with _vision_permit():
+                    return idx, run_with_timeout(
+                        lambda: describe_page_cached(
+                            image_path=page_data.image_path,
+                            page_text=pg_text,
+                            config=config,
+                            cache=cache,
+                            structured_data=struct_data,
+                            doc_format=doc_format,
+                        ),
+                        vision_timeout,
+                    )
             except TimeoutError as e:
                 logger.warning(
                     f"Vision timed out for page {page_data.page_no}: {e} "
@@ -2984,10 +3026,14 @@ def process_single_file(
         on_file_progress("parse", 0, 0)
     try:
         from .utils.timeout import run_with_timeout
-        parse_result = run_with_timeout(
-            lambda: parser.parse(file_path, override_stream=override_stream),
-            parse_timeout,
-        )
+        # _PARSE_GATE: parsing is globally exclusive (see the gate's comment
+        # at module top). Lock OUTSIDE the timeout wrapper so the budget
+        # covers parsing only, never time spent queueing behind another file.
+        with _PARSE_GATE:
+            parse_result = run_with_timeout(
+                lambda: parser.parse(file_path, override_stream=override_stream),
+                parse_timeout,
+            )
     except TimeoutError as e:
         result.success = False
         # Tell the caller exactly which knob to raise — both humans and agents
@@ -3204,13 +3250,17 @@ def process_single_file(
     # --- Phase 2: Write Markdown + assets ---
     # original_file determines the sources/*.md filename — must be the
     # user's input, not the Phase-0.5-converted xlsx in .cache/.
-    output_path = write_markdown(
-        parse_result=parse_result,
-        original_file=Path(result.original_file),
-        output_dir=output_dir,
-        config=config,
-        existing_names=existing_names,
-    )
+    # _WRITE_NAMES_GATE: `existing_names` is the cross-file name-collision
+    # set; serialize the allocate-and-write so concurrent files can't pick
+    # the same sources/*.md name.
+    with _WRITE_NAMES_GATE:
+        output_path = write_markdown(
+            parse_result=parse_result,
+            original_file=Path(result.original_file),
+            output_dir=output_dir,
+            config=config,
+            existing_names=existing_names,
+        )
     result.output_path = str(output_path.relative_to(output_dir)).replace("\\", "/")
 
     # Estimate tokens (CJK-aware)
@@ -4030,158 +4080,242 @@ def run_pipeline(
             # Either way, fall through with no handler.
             _installed_handler = False
 
-    try:
-        for _idx, (file_path, prior_meta, cache_reason) in enumerate(to_process):
-            # Two stop sources, same semantics: SIGINT (CLI) or request_stop()
-            # (GUI / library host on a worker thread).
-            if _stop_requested["flag"] or _EXTERNAL_STOP.is_set():
-                remaining_paths = [t[0] for t in to_process[_idx:]]
+    # --- File-level concurrency setup ---
+    # file_concurrency == 1 (default): the sequential path below, behaviour
+    # identical to the pre-concurrency pipeline. > 1: files overlap — file B
+    # parses (exclusively, behind _PARSE_GATE) while file A waits on Vision
+    # I/O. Parsing itself NEVER runs concurrently; see the gate comments at
+    # module top for the probe-verified reasons.
+    file_concurrency = max(1, int(get_nested(config, "performance.file_concurrency", 1)))
+    global _VISION_GATE
+    _vg_raw = get_nested(config, "performance.vision_global_concurrency", None)
+    _vg = (
+        int(_vg_raw) if _vg_raw is not None
+        else int(get_nested(config, "performance.parallel_files", 4))
+    )
+    _VISION_GATE = threading.BoundedSemaphore(max(1, _vg))
+
+    def _make_file_progress(name: str):
+        """Within-file progress (Vision pages) → emit a distinct
+        kind="file_progress" event. Old consumers that filter on
+        kind=="file_done" ignore it automatically (backwards-compatible).
+        current/total are file-level (_progress_done+1 of _progress_total —
+        under concurrency this is the completed-count, an approximation);
+        sub_current/sub_total are the within-file Vision page counts.
+        No-op unless the caller passed on_progress."""
+        def _on_file_progress(phase: str, sub_done: int, sub_total: int) -> None:
+            if on_progress is None:
+                return
+            try:
+                on_progress({
+                    "kind": "file_progress",
+                    "phase": phase,
+                    "file": name,
+                    "current": _progress_done + 1,
+                    "total": _progress_total,
+                    "sub_current": sub_done,
+                    "sub_total": sub_total,
+                })
+            except Exception as e:
                 _pipeline_logger.warning(
-                    f"Stopping early due to interrupt; "
-                    f"{len(remaining_paths)} file(s) left unprocessed. "
-                    f"Aggregate outputs will be written for completed files."
+                    f"on_progress (file_progress) raised "
+                    f"{type(e).__name__}: {e}; ignored."
                 )
-                pipeline_result.interrupted = True
-                # Emit one "skipped" event per remaining file so a UI's
-                # progress bar can still reach 100% — the run is over,
-                # the caller should know how many were dropped.
-                for skipped in remaining_paths:
-                    _emit_progress(
-                        status="skipped",
-                        file_basename=skipped.name,
-                    )
-                break
+        return _on_file_progress
 
-            # Within-file progress (Vision pages) → emit a distinct
-            # kind="file_progress" event. Old consumers that filter on
-            # kind=="file_done" ignore it automatically (backwards-compatible).
-            # current/total are file-level (this is file _progress_done+1 of
-            # _progress_total); sub_current/sub_total are the within-file
-            # Vision page counts. No-op unless the caller passed on_progress.
-            _fp_basename = file_path.name
+    def _aggregate_one(
+        file_path: Path,
+        prior_meta,
+        cache_reason: str,
+        file_result,
+        file_chunks: list,
+    ) -> None:
+        """Order-sensitive bookkeeping for one processed file. ALWAYS runs on
+        the main thread in to_process order — regardless of file_concurrency,
+        index.json file order, chunks.jsonl order and the progress counter
+        match a sequential run exactly."""
+        # Tag lifecycle status for run_log. Order matters:
+        #   failure wins → forced wins over added/updated (it's a full
+        #   rebuild regardless of prior state) → prior_meta distinguishes
+        #   "added" (first time) from "updated" (cache invalidated).
+        if not file_result.success:
+            file_result.status = "failed"
+        elif force_rebuild:
+            file_result.status = "forced"
+        elif prior_meta is None:
+            file_result.status = "added"
+        else:
+            file_result.status = "updated"
+            file_result.cache_reason = cache_reason
 
-            def _on_file_progress(
-                phase: str, sub_done: int, sub_total: int, _name=_fp_basename
-            ) -> None:
-                if on_progress is None:
-                    return
+        pipeline_result.files.append(file_result)
+
+        # Aggregate per-file warnings into the run-level summary.
+        # Done independent of success — a partially-processed file may
+        # still have surfaced quality warnings worth visible at the
+        # aggregate level (e.g. a docx that hit page cap but didn't fail).
+        for w in file_result.warnings:
+            pipeline_result.warnings.append({
+                "file": file_path.name,
+                "message": w,
+            })
+
+        # Sum the per-file Vision triage tally into the corpus-wide total.
+        # Cached files carry an empty dict (they didn't re-run Vision), so
+        # this reflects work actually done THIS run — not a stale all-time
+        # total. Same key set across files; missing keys default to 0.
+        for k, v in (file_result.vision_triage or {}).items():
+            pipeline_result.vision_triage[k] = (
+                pipeline_result.vision_triage.get(k, 0) + int(v)
+            )
+
+        if file_result.success:
+            pipeline_result.successful += 1
+            pipeline_result.total_chunks += file_result.chunks_count
+            pipeline_result.total_tokens += file_result.tokens_estimated
+            new_chunks.extend(file_chunks)
+
+            # Add to index (returns the entry so we can store it in meta.json)
+            index_entry = index_builder.add_file(
+                parse_result=_make_index_parse_result(file_result, output_dir),
+                original_file=file_path,
+                output_path=output_dir / file_result.output_path,
+                output_dir=output_dir,
+                chunks_count=file_result.chunks_count,
+            )
+
+            # Persist meta.json for next incremental run
+            if incremental_enabled:
                 try:
-                    on_progress({
-                        "kind": "file_progress",
-                        "phase": phase,
-                        "file": _name,
-                        "current": _progress_done + 1,
-                        "total": _progress_total,
-                        "sub_current": sub_done,
-                        "sub_total": sub_total,
-                    })
+                    from .output.chunks_writer import build_chunk_id
+                    cache_key = compute_cache_key(file_path)
+                    chunk_ids = [build_chunk_id(c) for c in file_chunks]
+                    asset_rels = _collect_asset_rels_for_file(file_path, output_dir, config)
+                    meta = build_meta(
+                        file_path=file_path,
+                        cache_key=cache_key,
+                        config_hash=config_hash,
+                        format_str=file_result.format,
+                        source_md_rel=file_result.output_path,
+                        asset_rels=asset_rels,
+                        chunk_ids=chunk_ids,
+                        index_entry=index_entry,
+                    )
+                    save_cached_meta(cache_dir, meta)
                 except Exception as e:
                     _pipeline_logger.warning(
-                        f"on_progress (file_progress) raised "
-                        f"{type(e).__name__}: {e}; ignored."
+                        f"Could not save incremental cache for {file_path.name}: {e}"
                     )
+        else:
+            pipeline_result.failed += 1
+            pipeline_result.errors.append({
+                "file": file_result.original_file,
+                "error": file_result.error,
+                "error_type": file_result.error_type,
+            })
+            index_builder.add_error()
 
-            file_result, file_chunks = process_single_file(
-                file_path=file_path,
-                parser=parser,
-                chunker=chunker,
-                config=config,
-                output_dir=output_dir,
-                existing_names=existing_names,
-                on_file_progress=_on_file_progress,
-            )
+        # Emit one progress event per processed file. file_result.status
+        # is one of: added | updated | forced | failed (set above).
+        _emit_progress(
+            status=file_result.status or "added",
+            file_basename=file_path.name,
+            chunks=file_result.chunks_count,
+            elapsed_ms=file_result.parse_time_ms + file_result.chunk_time_ms,
+            error=file_result.error or None,
+            error_type=file_result.error_type,
+        )
 
-            # Tag lifecycle status for run_log. Order matters:
-            #   failure wins → forced wins over added/updated (it's a full
-            #   rebuild regardless of prior state) → prior_meta distinguishes
-            #   "added" (first time) from "updated" (cache invalidated).
-            if not file_result.success:
-                file_result.status = "failed"
-            elif force_rebuild:
-                file_result.status = "forced"
-            elif prior_meta is None:
-                file_result.status = "added"
-            else:
-                file_result.status = "updated"
-                file_result.cache_reason = cache_reason
+    try:
+        if file_concurrency == 1:
+            # Sequential path — the pre-concurrency behaviour, literally.
+            for _idx, (file_path, prior_meta, cache_reason) in enumerate(to_process):
+                # Two stop sources, same semantics: SIGINT (CLI) or
+                # request_stop() (GUI / library host on a worker thread).
+                if _stop_requested["flag"] or _EXTERNAL_STOP.is_set():
+                    remaining_paths = [t[0] for t in to_process[_idx:]]
+                    _pipeline_logger.warning(
+                        f"Stopping early due to interrupt; "
+                        f"{len(remaining_paths)} file(s) left unprocessed. "
+                        f"Aggregate outputs will be written for completed files."
+                    )
+                    pipeline_result.interrupted = True
+                    # Emit one "skipped" event per remaining file so a UI's
+                    # progress bar can still reach 100% — the run is over,
+                    # the caller should know how many were dropped.
+                    for skipped in remaining_paths:
+                        _emit_progress(
+                            status="skipped",
+                            file_basename=skipped.name,
+                        )
+                    break
 
-            pipeline_result.files.append(file_result)
-
-            # Aggregate per-file warnings into the run-level summary.
-            # Done independent of success — a partially-processed file may
-            # still have surfaced quality warnings worth visible at the
-            # aggregate level (e.g. a docx that hit page cap but didn't fail).
-            for w in file_result.warnings:
-                pipeline_result.warnings.append({
-                    "file": file_path.name,
-                    "message": w,
-                })
-
-            # Sum the per-file Vision triage tally into the corpus-wide total.
-            # Cached files carry an empty dict (they didn't re-run Vision), so
-            # this reflects work actually done THIS run — not a stale all-time
-            # total. Same key set across files; missing keys default to 0.
-            for k, v in (file_result.vision_triage or {}).items():
-                pipeline_result.vision_triage[k] = (
-                    pipeline_result.vision_triage.get(k, 0) + int(v)
-                )
-
-            if file_result.success:
-                pipeline_result.successful += 1
-                pipeline_result.total_chunks += file_result.chunks_count
-                pipeline_result.total_tokens += file_result.tokens_estimated
-                new_chunks.extend(file_chunks)
-
-                # Add to index (returns the entry so we can store it in meta.json)
-                index_entry = index_builder.add_file(
-                    parse_result=_make_index_parse_result(file_result, output_dir),
-                    original_file=file_path,
-                    output_path=output_dir / file_result.output_path,
+                file_result, file_chunks = process_single_file(
+                    file_path=file_path,
+                    parser=parser,
+                    chunker=chunker,
+                    config=config,
                     output_dir=output_dir,
-                    chunks_count=file_result.chunks_count,
+                    existing_names=existing_names,
+                    on_file_progress=_make_file_progress(file_path.name),
+                )
+                _aggregate_one(
+                    file_path, prior_meta, cache_reason, file_result, file_chunks
+                )
+        else:
+            # Pipeline-overlap path: workers run process_single_file (parse
+            # serialized by _PARSE_GATE, Vision capped by _VISION_GATE,
+            # markdown writes serialized by _WRITE_NAMES_GATE); the main
+            # thread consumes results in SUBMISSION order so every aggregate
+            # output is ordered exactly like a sequential run.
+            from concurrent.futures import ThreadPoolExecutor
+
+            def _work_one(fp: Path):
+                """Heavy per-file work. None = skipped by a stop request
+                before it started (same degrade as the sequential skip)."""
+                if _stop_requested["flag"] or _EXTERNAL_STOP.is_set():
+                    return None
+                return process_single_file(
+                    file_path=fp,
+                    parser=parser,
+                    chunker=chunker,
+                    config=config,
+                    output_dir=output_dir,
+                    existing_names=existing_names,
+                    on_file_progress=_make_file_progress(fp.name),
                 )
 
-                # Persist meta.json for next incremental run
-                if incremental_enabled:
+            with ThreadPoolExecutor(
+                max_workers=file_concurrency,
+                thread_name_prefix="docingest-file",
+            ) as _file_pool:
+                _futures = [
+                    _file_pool.submit(_work_one, fp) for fp, _, _ in to_process
+                ]
+                for (file_path, prior_meta, cache_reason), _fut in zip(
+                    to_process, _futures
+                ):
                     try:
-                        from .output.chunks_writer import build_chunk_id
-                        cache_key = compute_cache_key(file_path)
-                        chunk_ids = [build_chunk_id(c) for c in file_chunks]
-                        asset_rels = _collect_asset_rels_for_file(file_path, output_dir, config)
-                        meta = build_meta(
-                            file_path=file_path,
-                            cache_key=cache_key,
-                            config_hash=config_hash,
-                            format_str=file_result.format,
-                            source_md_rel=file_result.output_path,
-                            asset_rels=asset_rels,
-                            chunk_ids=chunk_ids,
-                            index_entry=index_entry,
+                        outcome = _fut.result()
+                    except BaseException:
+                        # Abort like the sequential path would: queued workers
+                        # see the flag at start and bail; then propagate.
+                        _stop_requested["flag"] = True
+                        raise
+                    if outcome is None:
+                        if not pipeline_result.interrupted:
+                            pipeline_result.interrupted = True
+                            _pipeline_logger.warning(
+                                "Stopping early due to interrupt; remaining "
+                                "files are skipped. Aggregate outputs will be "
+                                "written for completed files."
+                            )
+                        _emit_progress(
+                            status="skipped",
+                            file_basename=file_path.name,
                         )
-                        save_cached_meta(cache_dir, meta)
-                    except Exception as e:
-                        _pipeline_logger.warning(
-                            f"Could not save incremental cache for {file_path.name}: {e}"
-                        )
-            else:
-                pipeline_result.failed += 1
-                pipeline_result.errors.append({
-                    "file": file_result.original_file,
-                    "error": file_result.error,
-                    "error_type": file_result.error_type,
-                })
-                index_builder.add_error()
-
-            # Emit one progress event per processed file. file_result.status
-            # is one of: added | updated | forced | failed (set above).
-            _emit_progress(
-                status=file_result.status or "added",
-                file_basename=file_path.name,
-                chunks=file_result.chunks_count,
-                elapsed_ms=file_result.parse_time_ms + file_result.chunk_time_ms,
-                error=file_result.error or None,
-                error_type=file_result.error_type,
-            )
+                        continue
+                    _aggregate_one(file_path, prior_meta, cache_reason, *outcome)
     finally:
         if _installed_handler:
             try:

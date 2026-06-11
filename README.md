@@ -167,7 +167,11 @@ Options:
                      which parses every page but only Vision-enriches the first N.
 --no-chunks          Only output Markdown, skip chunks.jsonl
 --parallel INTEGER   Worker count for Vision API calls and ASR segmentation
-                     (file-level parallelism is not yet implemented)
+                     (the within-file pools)
+--parallel-files N   Process up to N files in overlap (default 1 = sequential).
+                     Parsing stays serialized by design — file B parses while
+                     file A waits on Vision I/O, which is where the time goes.
+                     Outputs stay input-ordered, byte-identical to sequential.
 --force              Ignore cache, full rebuild
 ```
 

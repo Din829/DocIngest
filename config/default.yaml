@@ -1188,11 +1188,28 @@ chunking:
 # =============================================================================
 performance:
   parallel_files: 4           # Worker count shared by Vision per-page calls
-                              # and ASR per-segment transcription.
-                              # NOTE: file-level parallelism is not yet
-                              # implemented — the pipeline processes files
-                              # sequentially; this key only controls the
-                              # inner ThreadPoolExecutor pools.
+                              # and ASR per-segment transcription (the
+                              # WITHIN-file pools). File-level overlap is a
+                              # separate knob: file_concurrency below.
+
+  # File-level pipeline overlap. 1 (default) = process files sequentially —
+  # behaviour identical to before this knob existed. 2-3 = file B parses
+  # while file A waits on Vision I/O. Parsing itself NEVER runs concurrently
+  # regardless of this value (probe-verified: the Docling models load once
+  # per parser (~1.9GB RSS), and concurrent parses amplify the intermittent
+  # docling-parse Windows std::bad_alloc — a global parse lock serializes
+  # them); the win comes from overlapping parse with the Vision wait, which
+  # dominates wall time. Outputs are aggregated in input order on the main
+  # thread, so index.json / chunks.jsonl are ordered exactly like a
+  # sequential run. Progress events from overlapping files interleave —
+  # leave this at 1 for UIs that assume one-file-at-a-time display.
+  file_concurrency: 1
+
+  # Global cap on TOTAL in-flight Vision calls across all files. null =
+  # follow parallel_files (single-file behaviour unchanged). Without this,
+  # file_concurrency × parallel_files calls would hit the provider at once
+  # and trip rate limits. Raise together with provider quota.
+  vision_global_concurrency: null
 
 # =============================================================================
 # Error Handling

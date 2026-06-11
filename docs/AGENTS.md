@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 DocIngest = document preprocessing engine. Any input (PDF / Office / HTML /
 images / audio / video / ZIP / URLs) → Markdown + chunks + index.
@@ -14,7 +14,7 @@ Per-flag detail: `docingest <cmd> --help`.
 
 | Command | What it does | When | Key flags |
 |---|---|---|---|
-| `run` | Docs → Markdown + chunks + index | Main command; after `inspect` for big inputs. Re-running same `-o` is cheap. | `-o` (REQUIRED for multi-input); `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet\|timestamp\|whole`; `--max-pages N` (parse only first N pages of PDF/PPTX/DOCX); `--parallel N`; `--force`; `-y/--yes`; `--json`; `-v` |
+| `run` | Docs → Markdown + chunks + index | Main command; after `inspect` for big inputs. Re-running same `-o` is cheap. | `-o` (REQUIRED for multi-input); `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet\|timestamp\|whole`; `--max-pages N` (parse only first N pages of PDF/PPTX/DOCX); `--parallel N`; `--parallel-files N`; `--force`; `-y/--yes`; `--json`; `-v` |
 | `inspect` | Estimate size/pages/cost — no parsing | ALWAYS first for large/unknown inputs (Vision = 1 call/page) | `--json` |
 | `refine` | Markdown → human-readable copy | Only when user wants a readable version; NOT a RAG step | `--skill refine_default\|refine_faithful\|refine_html`; `-o` |
 | `doctor` | Check env / deps / API keys | After install or on failure | (none) |

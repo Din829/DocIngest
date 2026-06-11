@@ -183,7 +183,16 @@ def main(
         "--parallel",
         help=(
             "Worker count for Vision API calls and ASR segmentation "
-            "(per-file concurrency; file-level parallelism is not implemented)."
+            "(the WITHIN-file pools; see --parallel-files for file overlap)."
+        ),
+    ),
+    parallel_files: Optional[int] = typer.Option(
+        None,
+        "--parallel-files",
+        help=(
+            "Process up to N files in overlap (default 1 = sequential). "
+            "Parsing stays serialized — the overlap hides parse time inside "
+            "other files' Vision wait. Outputs stay input-ordered."
         ),
     ),
     force: bool = typer.Option(
@@ -315,6 +324,9 @@ def main(
 
     if parallel:
         cli_overrides.setdefault("performance", {})["parallel_files"] = parallel
+
+    if parallel_files:
+        cli_overrides.setdefault("performance", {})["file_concurrency"] = parallel_files
 
     if force:
         cli_overrides.setdefault("incremental", {})["force"] = True

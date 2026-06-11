@@ -6,12 +6,14 @@ cannot stall the whole pipeline. Cross-platform — relies on
 `concurrent.futures.ThreadPoolExecutor`, not `signal.SIGALRM` (which is
 Unix-only and incompatible with non-main threads).
 
-Caveat: Python threads cannot be force-killed. If the wrapped callable
-ignores the timeout, it keeps running until it finishes naturally; the
-caller still returns promptly with TimeoutError so pipeline progress is
-preserved. The orphan thread costs RAM/CPU until it ends — acceptable for
-the rare hung-parse / hung-API case versus the alternative of an unbounded
-hang.
+Caveat: Python threads cannot be force-killed, and the `with` executor
+exits via shutdown(wait=True) — so on timeout the caller does NOT return
+promptly: TimeoutError propagates only after the wrapped callable finishes
+naturally (measured: a 5s sleep under a 1s cap raises after 5.0s, not 1s).
+The timeout therefore marks the call as failed and bounds what the
+pipeline ACCEPTS, not how long it physically waits. No orphan thread ever
+outlives the call — which also means a caller holding a lock around this
+wrapper never leaks that lock to a still-running zombie.
 """
 
 from __future__ import annotations
