@@ -1056,6 +1056,46 @@ def _generate_page_images_via_libreoffice(
         )
 
 
+def _office_file_has_no_visuals(
+    parse_result,
+    config: dict[str, Any],
+    fmt: str,
+) -> bool:
+    """True when the WHOLE file is provably text-only → page Vision (and the
+    LibreOffice render that exists only to feed it) can be skipped.
+
+    The parser collected the evidence from the raw OOXML:
+      - docx: ``docx_visual_signals`` — drawing / VML / ink / highlight /
+        tracked-change counts in the body (oracle-tested: on signal-free
+        files Vision's only output was header/footer furniture; ink and
+        highlight correctly flagged annotated review docs as visual).
+      - xlsx: ``xlsx_sheet_visuals`` — per-sheet drawing/ole element counts;
+        ALL visible sheets must be zero (any sheet missing from the scan
+        counts as visual).
+
+    Conservative by construction: absent metadata (scan failed, legacy
+    format, Docling-fallback xlsx path) or a disabled config switch → False
+    → the full current behaviour runs. Never decides to skip on missing
+    evidence."""
+    meta = parse_result.metadata or {}
+    if fmt == "docx":
+        if not get_nested(config, "parsing.docx.vision.skip_text_only", True):
+            return False
+        signals = meta.get("docx_visual_signals")
+        return isinstance(signals, dict) and bool(signals) \
+            and not any(signals.values())
+    if fmt == "xlsx":
+        if not get_nested(config, "parsing.xlsx.vision.sheet_triage", True):
+            return False
+        visuals = meta.get("xlsx_sheet_visuals")
+        visible = meta.get("xlsx_visible_sheet_names")
+        if not isinstance(visuals, dict) or not visuals \
+                or not isinstance(visible, list) or not visible:
+            return False
+        return all(visuals.get(name, 1) == 0 for name in visible)
+    return False
+
+
 def _ensure_excel_page_images(
     file_path: Path,
     parse_result,
@@ -1549,6 +1589,202 @@ def _is_empty_supplement(text: str) -> bool:
     return t in ("(no additional visual content)", "no additional visual content")
 
 
+def _xlsx_batch_ground_truth_slice(
+    sections: list[str],
+    visible: list[str],
+    page_map: dict[str, int],
+    batch_page_nos: list[int],
+    total_pages: int,
+) -> str | None:
+    """Ground truth for ONE batch: only the sheet sections its pages cover.
+
+    A batched supplement call needs "what's already captured" for ITS pages —
+    feeding the whole workbook repeats the full markdown once per batch
+    (measured: 5 × 192k chars on a 159-page workbook, the dominant input-token
+    share). Attribution uses the same anchored-range rule as the sheet triage:
+    a mapped sheet owns pages from its first page up to the next MAPPED
+    sheet's first page − 1 (the last mapped sheet owns through
+    ``total_pages``) — but only when no UNMAPPED visible sheet follows it in
+    workbook order (its pages, if any, would fall inside that range and the
+    attribution would lie).
+
+    Returns None when ANY batch page can't be confidently attributed — the
+    caller then sends the full markdown. A wrong slice is the one outcome to
+    avoid: the supplement prompt treats ground truth that doesn't match the
+    images as "extraction failed" and re-transcribes in full (cost and
+    duplication come back; nothing is lost, but the saving inverts).
+
+    Caller guarantees ``len(sections) == len(visible)`` (sections split on
+    PAGEBREAK_MARKER from the openpyxl render, one per visible sheet).
+    """
+    ordered_mapped = [s for s in visible if s in page_map]
+    if not ordered_mapped:
+        return None
+    anchors = [page_map[s] for s in ordered_mapped]
+    if anchors != sorted(set(anchors)):
+        return None
+
+    covered: set[int] = set()
+    for p in batch_page_nos:
+        owner_idx: int | None = None
+        for i, s in enumerate(ordered_mapped):
+            start = page_map[s]
+            end = (
+                page_map[ordered_mapped[i + 1]] - 1
+                if i + 1 < len(ordered_mapped) else total_pages
+            )
+            if start <= p <= end:
+                vi = visible.index(s)
+                nxt = visible[vi + 1] if vi + 1 < len(visible) else None
+                if nxt is not None and nxt not in page_map:
+                    return None
+                owner_idx = vi
+                break
+        if owner_idx is None:
+            return None
+        covered.add(owner_idx)
+    return f"\n{PAGEBREAK_MARKER}\n".join(sections[i] for i in sorted(covered))
+
+
+def _inject_after_marker(markdown: str, filename: str, block: str) -> str:
+    """Insert ``block`` on its own lines after the `<!-- image: file -->` marker.
+
+    Structural rule (not a format branch): when the marker's line is a table
+    row (xlsx cell-anchored markers are wrapped as ``| <!-- image: f --> | |``
+    so they don't split the table), the block is deferred to just after that
+    table ends — injecting mid-table would cut it in two and re-trigger the
+    SheetChunker header-duplication bug the wrapping exists to prevent. A
+    marker on its own line (docx) gets the block immediately after it.
+
+    If the marker isn't found (it was cleaned/merged away), the block is
+    appended at the end tagged with the filename so the transcription is
+    never lost. Returns the markdown unchanged only when ``block`` is empty."""
+    if not block.strip():
+        return markdown
+    marker = f"<!-- image: {filename} -->"
+    tagged = [f"<!-- vision-enriched image={filename} -->", *block.strip().split("\n")]
+    if marker not in markdown:
+        return markdown.rstrip() + "\n\n" + "\n".join(tagged) + "\n"
+
+    lines = markdown.split("\n")
+    idx = next(i for i, ln in enumerate(lines) if marker in ln)
+    if lines[idx].lstrip().startswith("|"):
+        insert_at = idx + 1
+        while insert_at < len(lines) and lines[insert_at].lstrip().startswith("|"):
+            insert_at += 1
+    else:
+        insert_at = idx + 1
+    lines[insert_at:insert_at] = ["", *tagged, ""]
+    return "\n".join(lines)
+
+
+def _enrich_embedded_images(
+    parse_result,
+    config: dict[str, Any],
+    cache,
+    doc_format: str | None,
+) -> None:
+    """Send above-threshold embedded figures to Vision at full resolution and
+    inject each transcription after its `<!-- image: file -->` marker.
+
+    The parser already saved every embedded picture and flagged which clear
+    the size threshold via ``send_vision`` (docx: _extract_docling_pictures;
+    xlsx: the openpyxl renderer — both write the same ``embedded_images``
+    metadata shape). This stage only runs the Vision read — kept out of the
+    parser so all Vision calls share one place (cache, cost tally, config).
+
+    Modifies ``parse_result.markdown`` in place. No-op unless the file produced
+    ``embedded_images`` and ``image_extraction.vision_enrich`` is on. The
+    per-file ``max_images_vision`` cap (per-format config), on trip, warns and
+    skips the remainder — the assets and markers are already written, so
+    nothing is lost; only the extra full-res read is deferred (never a silent
+    truncation)."""
+    import logging
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from .parsers.vision import describe_embedded_image_cached
+
+    logger = logging.getLogger(__name__)
+
+    images = parse_result.metadata.get("embedded_images") or []
+    to_send = [
+        img for img in images
+        if img.get("send_vision") and img.get("path") and img.get("filename")
+    ]
+    if not to_send:
+        return
+
+    cap_key = f"parsing.{(doc_format or '').lower()}.image_extraction.max_images_vision"
+    max_n = int(get_nested(config, cap_key, 30))
+    if len(to_send) > max_n:
+        logger.warning(
+            f"Embedded-image Vision: {len(to_send)} figure(s) qualify but cap is "
+            f"{max_n} — reading the first {max_n}, skipping {len(to_send) - max_n}. "
+            f"Assets + markers for the skipped ones are still written; raise "
+            f"{cap_key} to read them too."
+        )
+        to_send = to_send[:max_n]
+
+    # Parallel like the per-page pass (same worker knob) — figures are
+    # independent calls, and serially they dominate wall time: measured 109 s
+    # serial vs 37 s at parallel=4 for 6 figures on one review doc.
+    parallel = get_nested(config, "performance.parallel_files", 4)
+
+    def _read_figure(img: dict) -> tuple[dict, str | None, Exception | None]:
+        try:
+            return img, describe_embedded_image_cached(
+                image_path=img["path"],
+                config=config,
+                cache=cache,
+                doc_format=doc_format,
+            ), None
+        except Exception as e:
+            return img, None, e
+
+    failed = 0
+    descs: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = [executor.submit(_read_figure, img) for img in to_send]
+        for future in as_completed(futures):
+            img, desc, err = future.result()
+            if err is not None:
+                # A single figure failing must not abort the file — the marker
+                # and asset stay, the figure is simply not transcribed. Mirrors
+                # the per-page Vision fallback.
+                failed += 1
+                logger.warning(
+                    f"Embedded-image Vision failed for {img['filename']}: {err}"
+                )
+            elif desc and desc.strip():
+                descs[img["filename"]] = desc
+
+    # Inject in REVERSE figure order: when several markers sit inside the same
+    # table (xlsx), each block lands after that table's end — injecting in
+    # forward order would stack later figures' blocks ABOVE earlier ones
+    # (the table scan stops at the previously injected block). Reverse order
+    # makes the final blocks read in figure order. Deterministic across runs
+    # either way (never completion order).
+    enriched = 0
+    for img in reversed(to_send):
+        desc = descs.get(img["filename"])
+        if desc:
+            parse_result.markdown = _inject_after_marker(
+                parse_result.markdown, img["filename"], desc
+            )
+            enriched += 1
+
+    # Record alongside the per-page Vision tally so run_log / quality_report can
+    # surface the extra reads (cost visibility — these are additional API calls).
+    parse_result.metadata.setdefault("vision_triage", {}).update({
+        "embedded_sent": len(to_send),
+        "embedded_enriched": enriched,
+        "embedded_failed": failed,
+    })
+    logger.info(
+        f"Embedded-image Vision: {enriched} figure(s) transcribed, "
+        f"{failed} failed (of {len(to_send)} sent)."
+    )
+
+
 def _enrich_with_vision(
     parse_result,
     config: dict[str, Any],
@@ -1627,6 +1863,50 @@ def _enrich_with_vision(
     max_vision_raw = get_nested(config, "parsing.vision.max_pages", 50)
     max_vision_pages = int(max_vision_raw) if max_vision_raw is not None else None
 
+    # xlsx sheet-level triage (partially-visual workbooks): pages belonging to
+    # a sheet with ZERO drawing/ole elements show nothing beyond the cells the
+    # openpyxl render already extracted (oracle-measured: their supplements
+    # came back empty or pure furniture), so they skip Vision. Page ranges
+    # come from xlsx_sheet_page_map (sheet → first PDF page). The map may be
+    # PARTIAL — LibreOffice gives no bookmark to sheets with zero renderable
+    # content — so each range must be individually anchored: a visual-less
+    # sheet's pages are skipped only when the NEXT visible sheet (workbook
+    # order) is also mapped and bounds the range's end (or it is the final
+    # visible sheet). A neighbouring unmapped sheet's pages, if any exist,
+    # could otherwise be swallowed into the range and wrongly skipped — those
+    # stay on the Vision path. The all-sheets-empty case never reaches here
+    # (Phase 1.3 skipped the render entirely).
+    _sheet_skip_ranges: list[tuple[int, int | None]] = []  # (first, last incl; None=to end)
+    if (
+        get_nested(config, "parsing.xlsx.vision.sheet_triage", True)
+        and parse_result.metadata.get("format") == "xlsx"
+    ):
+        _sv = parse_result.metadata.get("xlsx_sheet_visuals")
+        _pm = parse_result.metadata.get("xlsx_sheet_page_map")
+        _vis = parse_result.metadata.get("xlsx_visible_sheet_names")
+        if isinstance(_sv, dict) and isinstance(_pm, dict) \
+                and isinstance(_vis, list) and _vis:
+            # PDF page order follows workbook sheet order; if the mapped
+            # anchors aren't strictly increasing in that order something is
+            # off about the map — disarm entirely (conservative).
+            _anchors = [_pm[s] for s in _vis if s in _pm]
+            if _anchors == sorted(set(_anchors)):
+                for _i, _s in enumerate(_vis):
+                    if _s not in _pm or _sv.get(_s, 1) != 0:
+                        continue  # unmapped or visual (missing from scan → visual)
+                    _nxt = _vis[_i + 1] if _i + 1 < len(_vis) else None
+                    if _nxt is None:
+                        _sheet_skip_ranges.append((_pm[_s], None))
+                    elif _nxt in _pm:
+                        _sheet_skip_ranges.append((_pm[_s], _pm[_nxt] - 1))
+                    # else: successor unmapped → range end unanchored → send
+
+    def _on_visualless_sheet(page_no: int) -> bool:
+        return any(
+            first <= page_no and (last is None or page_no <= last)
+            for first, last in _sheet_skip_ranges
+        )
+
     vision_tasks = []
     no_image = 0
     triage_skipped = 0
@@ -1637,11 +1917,22 @@ def _enrich_with_vision(
                             # exemption saved — and so an over-aggressive skip
                             # is traceable after the fact.
     cap_skipped = 0
+    sheet_triage_skipped = 0
     pages_with_pictures = 0  # pages that carry any picture signal (would have
                              # triggered Vision pre-triage) — the "trigger" count.
     for i, page_data in enumerate(parse_result.pages):
         if not page_data.image_path:
             no_image += 1
+            continue
+        # Sheet-level skip — but never when a hook injected structured data
+        # for this page (hooks are a public extension point, so a custom one
+        # may target a sheet our drawing scan saw as empty).
+        if (
+            _sheet_skip_ranges
+            and _on_visualless_sheet(page_data.page_no)
+            and not structured_per_page.get(page_data.page_no)
+        ):
+            sheet_triage_skipped += 1
             continue
         if getattr(page_data, "num_pictures", 0) > 0:
             pages_with_pictures += 1
@@ -1670,8 +1961,9 @@ def _enrich_with_vision(
     logger.info(
         f"Vision triage summary: trigger(pages w/ pictures)={pages_with_pictures}, "
         f"sent_to_vision={len(vision_tasks)}, triage_skipped={triage_skipped} "
-        f"(of which furniture={furniture_skipped}), cap_skipped={cap_skipped}, "
-        f"no_image_pages={no_image}"
+        f"(of which furniture={furniture_skipped}), "
+        f"sheet_triage_skipped={sheet_triage_skipped}, "
+        f"cap_skipped={cap_skipped}, no_image_pages={no_image}"
     )
     if cap_skipped:
         logger.warning(
@@ -1688,14 +1980,28 @@ def _enrich_with_vision(
         "sent_to_vision": len(vision_tasks),
         "triage_skipped": triage_skipped,
         "furniture_skipped": furniture_skipped,
+        "sheet_triage_skipped": sheet_triage_skipped,
         "cap_skipped": cap_skipped,
         "no_image_pages": no_image,
     })
 
+    doc_format = parse_result.metadata.get("format")
+
+    # Embedded-image enrichment FIRST: figures pasted as images (docx scoring
+    # rubric, xlsx screenshot sheet) lose their fine print in the shrunk
+    # whole-page render. The parser already saved each figure at full
+    # resolution and named its marker; this sends the above-threshold ones to
+    # Vision and injects each transcription near its `<!-- image: file -->`
+    # marker. Running BEFORE the page pass means supplement-mode page calls
+    # receive these transcriptions as part of their ground truth — so they
+    # only add what figures + body text don't already cover (annotations etc.)
+    # instead of re-transcribing the figures. Also independent of vision_tasks:
+    # figures must be read even when every page was triaged out.
+    _enrich_embedded_images(parse_result, config, cache, doc_format)
+
     if not vision_tasks:
         return
 
-    doc_format = parse_result.metadata.get("format")
     vision_timeout = get_nested(config, "models.vision.timeout_sec", 180)
     # Ceiling for the batched-Vision wall-clock cap. None = no ceiling (the
     # cap is just vision_timeout × batch_size). Separate knob because batched
@@ -1704,6 +2010,13 @@ def _enrich_with_vision(
     results: dict[int, str] = {}  # page_index → vision result text
     described = 0
     failed = 0
+    # Supplement-mode pages that explicitly answered "(no additional visual
+    # content)" — a SUCCESS (the ground truth already covers the page), tallied
+    # separately from `failed` because `failed` feeds the systemic-failure
+    # check: an all-text docx/xlsx where every page correctly says "nothing to
+    # add" must not look like a total Vision outage (those pages have empty
+    # page_data.text, which _is_vision_critical_page flags as critical).
+    supplement_none = 0
     # Docling text of pages that FAILED Vision — kept so the systemic-failure
     # check at the end can ask _is_vision_critical_page whether the failure
     # actually cost content (scanned/garbled pages) or just a visual supplement.
@@ -1798,6 +2111,25 @@ def _enrich_with_vision(
         # table (removes xlsx duplication at the source). parse_result.markdown
         # here is the pre-Vision openpyxl render. full mode passes "" (unused).
         batched_ground_truth = parse_result.markdown if batched_supplement else ""
+        # Per-batch ground-truth slicing prep: split ONCE into per-sheet
+        # sections (openpyxl emits exactly one per visible sheet, and both
+        # the Excel denoise and the embedded-figure injection preserve the
+        # pagebreak boundaries). Slicing arms only when the section count
+        # still matches the visible-sheet list — a hook that reshaped the
+        # markdown breaks the alignment, so we fall back to full ground
+        # truth per batch (the pre-slicing behaviour).
+        _vis_names = parse_result.metadata.get("xlsx_visible_sheet_names")
+        _pg_map = parse_result.metadata.get("xlsx_sheet_page_map")
+        _gt_sections: list[str] | None = None
+        if (
+            batched_supplement
+            and get_nested(config, "parsing.xlsx.vision.ground_truth_slice", True)
+            and isinstance(_vis_names, list) and _vis_names
+            and isinstance(_pg_map, dict) and _pg_map
+        ):
+            _secs: list[str] = batched_ground_truth.split(PAGEBREAK_MARKER)
+            if len(_secs) == len(_vis_names):
+                _gt_sections = _secs
         # Concatenate per-page structured_data so the batched prompt sees
         # the ground truth from every page in the BATCH (sliced per iteration
         # below, so each batch only sees its own pages' ground truth).
@@ -1845,6 +2177,22 @@ def _enrich_with_vision(
             ]
             batch_struct = "\n\n".join(batch_struct_parts) if batch_struct_parts else None
 
+            # Slice the ground truth to this batch's own sheets. None from the
+            # slicer (any attribution doubt) → full markdown, the pre-slicing
+            # behaviour.
+            batch_gt = batched_ground_truth
+            if _gt_sections is not None:
+                sliced = _xlsx_batch_ground_truth_slice(
+                    _gt_sections, _vis_names, _pg_map,
+                    batch_page_nos, len(parse_result.pages),
+                )
+                if sliced is not None:
+                    batch_gt = sliced
+                    logger.debug(
+                        f"batch {batch_idx + 1}/{n_batches}: ground truth sliced "
+                        f"to {len(sliced):,} of {len(batched_ground_truth):,} chars"
+                    )
+
             # Scale timeout with batch size, capped so a hung API surfaces eventually.
             # Single-batch wall-clock cap is independent of how many batches run
             # in parallel — concurrency doesn't change per-call latency.
@@ -1865,7 +2213,7 @@ def _enrich_with_vision(
                         cache=cache,
                         structured_data=batch_struct,
                         doc_format=doc_format,
-                        ground_truth=batched_ground_truth,
+                        ground_truth=batch_gt,
                     ),
                     batch_timeout,
                 )
@@ -1967,6 +2315,11 @@ def _enrich_with_vision(
         # pre-Vision here = the openpyxl table text) as the per-page Docling text
         # so supplement knows the table is already captured. full mode (PDF/PPT)
         # keeps the page's own text. Mirrors the batched-path ground_truth fix.
+        # docx (supplement via parsing.docx.vision.supplement_only) rides the
+        # same path: its LibreOffice pages also have empty page_data.text, and
+        # parse_result.markdown here already contains the embedded-figure
+        # transcriptions (injected before this pass) — so page calls only add
+        # what body text + figures don't cover (e.g. Word-layer annotations).
         from .parsers.vision import resolve_supplement_only
         _pp_supplement = resolve_supplement_only(config, doc_format)
         _pp_ground = parse_result.markdown if _pp_supplement else None
@@ -2020,13 +2373,16 @@ def _enrich_with_vision(
             for future in as_completed(futures):
                 idx, result_text = future.result()
                 cleaned = result_text.strip() if result_text else ""
-                # Supplement mode: "(no additional visual content)" means Docling
-                # already captured the page — emit NO vision-enriched block for
-                # it (that's the whole point of dedup). Treat it like an empty
-                # result so it isn't appended. Not a failure: the page is fine.
                 if cleaned and not _is_empty_supplement(cleaned):
                     results[idx] = cleaned
                     described += 1
+                elif cleaned:
+                    # Supplement mode: "(no additional visual content)" means
+                    # the ground truth already captured the page — emit NO
+                    # vision-enriched block (that's the whole point of dedup),
+                    # and count it as a clean outcome, not a failure (see
+                    # supplement_none above).
+                    supplement_none += 1
                 else:
                     failed += 1
                     # Record this page's Docling text for the systemic-failure
@@ -2112,7 +2468,8 @@ def _enrich_with_vision(
 
     mode_tag = "batched" if use_batched else f"parallel={get_nested(config, 'performance.parallel_files', 4)}"
     logger.info(
-        f"Vision enrichment: {described} described, {failed} failed, "
+        f"Vision enrichment: {described} described, "
+        f"{supplement_none} no-supplement, {failed} failed, "
         f"{no_image} no-image, {triage_skipped} triage-skipped, "
         f"{cap_skipped} cap-skipped ({mode_tag})"
     )
@@ -2163,6 +2520,7 @@ def _enrich_with_vision(
     # were log-only and never reached disk.
     parse_result.metadata.setdefault("vision_triage", {}).update({
         "described": described,
+        "supplement_none": supplement_none,
         "failed": failed,
         "critical_failed": critical_failed,
     })
@@ -2717,9 +3075,23 @@ def process_single_file(
     # this on every Office document before this guard.
     if get_nested(config, "parsing.vision.enabled", True):
         if result.format in ("xlsx", "xls"):
-            _ensure_excel_page_images(file_path, parse_result, config)
+            if _office_file_has_no_visuals(parse_result, config, "xlsx"):
+                _pipeline_logger.info(
+                    f"{file_path.name}: no visual elements on any visible sheet "
+                    f"— skipping LibreOffice render + page Vision "
+                    f"(parsing.xlsx.vision.sheet_triage)"
+                )
+            else:
+                _ensure_excel_page_images(file_path, parse_result, config)
         elif result.format in ("docx", "doc"):
-            _ensure_docx_page_images(file_path, parse_result, config)
+            if _office_file_has_no_visuals(parse_result, config, "docx"):
+                _pipeline_logger.info(
+                    f"{file_path.name}: text-only body (no drawing/ink/highlight"
+                    f"/tracked-change signals) — skipping LibreOffice render + "
+                    f"page Vision (parsing.docx.vision.skip_text_only)"
+                )
+            else:
+                _ensure_docx_page_images(file_path, parse_result, config)
         elif result.format in ("pptx", "ppt"):
             _ensure_pptx_page_images(file_path, parse_result, config)
 
@@ -2872,11 +3244,14 @@ def process_single_file(
             "docling_name",
             "mimetype",
             "binary_hash",
-            # File-level embedded-asset registry. The full list lives in
+            # File-level embedded-asset registries. The full list lives in
             # index.json (per-file "files[].assets"); chunk-side image
             # references are conveyed via inline `<!-- image: ... -->`
-            # markers in the chunk text itself.
+            # markers in the chunk text itself. `embedded_images` is the
+            # generic dict registry (docx + xlsx) driving full-res Vision;
+            # `xlsx_embedded_images` is the older path-only list.
             "xlsx_embedded_images",
+            "embedded_images",
             # File-level warnings (e.g. "Excel produced 19 pages, only
             # first 10 sent to Vision") — surfaced to sources/*.md
             # frontmatter, not per-chunk relevant.

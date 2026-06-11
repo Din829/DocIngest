@@ -457,6 +457,76 @@ def describe_page_cached(
 
 
 # ---------------------------------------------------------------------------
+# Embedded-image Vision (a single original-resolution figure, e.g. a docx
+# scoring table pasted as an image). Unlike _PAGE_PROMPT this sees ONE figure
+# at full resolution, not a shrunk whole page — so it transcribes the figure's
+# own text in full rather than supplementing a page. Same uncertainty markers
+# and anti-hallucination rules so the quality_report scan treats it identically.
+# ---------------------------------------------------------------------------
+_EMBEDDED_IMAGE_PROMPT = """\
+You are given ONE embedded figure extracted from a document at its ORIGINAL \
+resolution (it was pasted into the document as an image — e.g. a table, chart, \
+diagram, stamp, or screenshot).
+
+Your job: transcribe ALL text and structure visible in this figure into clean \
+Markdown, faithfully and completely.
+
+## Rules
+- If it is a TABLE, output a standard Markdown table (header row, separator \
+row, data rows). Preserve every cell's text and numbers verbatim.
+- If it is a CHART / diagram, transcribe axis labels, legends, node labels, and \
+any annotations; then add a one-line description of what it shows.
+- Preserve the original language and all numbers EXACTLY. Never invent values.
+- No preamble, no code-block wrapper — output only the Markdown content.
+
+## Uncertainty markers (USE ONLY THESE)
+`[?]` partial read; `[unreadable]` (reason: blur / obscured / cut-off / \
+low-res / handwritten) for an illegible region. FORBIDDEN: `[illegible]`, \
+`???`, ellipses, "(low confidence)".
+
+Now transcribe the figure."""
+
+
+def describe_embedded_image_cached(
+    image_path: str | Path,
+    config: dict[str, Any],
+    cache: AICache | None = None,
+    doc_format: str | None = None,
+) -> str:
+    """Vision transcription of ONE embedded figure at full resolution, cached.
+
+    Used by the pipeline's embedded-image enrichment (docx figures pasted as
+    images). Cache key = image content hash + a tag for this prompt, so it is
+    independent of the per-page Vision cache and re-runs only when the figure
+    pixels or the prompt text change. Mirrors ``describe_page_cached``'s caching
+    shape; the only differences are the dedicated prompt and that there is no
+    page_text / structured_data (a standalone figure has no surrounding page).
+    """
+    image_path = Path(image_path)
+    vision_model_config = resolve_vision_config(config, doc_format)
+    max_tokens = int(vision_model_config.get("max_response_tokens", 65536))
+    primary = vision_model_config.get("primary", {})
+    model_name = f"{primary.get('provider', 'openai')}/{primary.get('model', 'gpt-4o-mini')}"
+    prompt_tag = "embedded-" + _prompt_hash(_EMBEDDED_IMAGE_PROMPT)
+
+    if cache:
+        img_hash = content_hash_file(image_path)
+        return cache.get_or_call(
+            model_name=model_name,
+            content_hash=img_hash,
+            call_fn=lambda: describe_image(
+                image_path, _EMBEDDED_IMAGE_PROMPT, vision_model_config,
+                max_tokens=max_tokens,
+            ),
+            extra_key=f"embedded_vision|{prompt_tag}",
+        )
+    return describe_image(
+        image_path, _EMBEDDED_IMAGE_PROMPT, vision_model_config,
+        max_tokens=max_tokens,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Batched multi-image Vision (for xlsx whose single sheet spans many pages)
 # ---------------------------------------------------------------------------
 

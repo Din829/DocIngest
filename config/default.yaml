@@ -559,9 +559,61 @@ parsing:
 
     # Optional per-format Vision override. See parsing.pdf.vision for usage.
     vision:
+      # Supplement mode (like xlsx, unlike PDF/PPT): the page pass only ADDS
+      # what the ground truth doesn't cover, instead of re-transcribing the
+      # whole page. Sound for docx because its ground truth is trustworthy on
+      # both fronts: body text is Docling reading OOXML directly (not a layout
+      # model that fragments tables — the reason PDF/PPT must stay full), and
+      # figures are covered by image_extraction below, which transcribes each
+      # one at original resolution BEFORE the page pass runs. What the page
+      # pass still catches: Word-layer mark-up (red-pen boxes / strikethrough
+      # / comments live in the page render, NOT in embedded image pixels) and
+      # any visual the extraction didn't reach. Full mode here re-transcribed
+      # body + figures a second time (measured: 9.2k duplicate chars on a
+      # 4-page doc) — slower, pricier, and double content in RAG chunks.
+      supplement_only: true
+      # Text-only skip: when the docx BODY has zero visual signals
+      # (w:drawing pictures/charts, VML shapes, ink annotations, marker-pen
+      # highlights, tracked changes — counted from the raw OOXML at parse
+      # time), skip the LibreOffice render AND the page-Vision pass for the
+      # whole file: Docling already read the complete body text from the
+      # XML, so the page render can only show header/footer furniture.
+      # Oracle-tested on signal-free real docs: every Vision supplement was
+      # headers/footers/page numbers; annotated docs (red-pen ink, yellow
+      # highlight) all carry signals and keep the full pass. Header/footer
+      # pictures (logos) deliberately don't count as a signal. Any signal,
+      # or a failed scan → full current behaviour. false = always render+send.
+      skip_text_only: true
       # max_response_tokens: 32768
       # image_dpi: 200
       # model: { provider: ..., model: ... }
+
+    # Embedded-image extraction (docx inline / anchored figures).
+    # Why this exists: a docx whose tables are pasted as IMAGES (e.g. a
+    # scoring rubric saved as a screenshot) loses its fine print to the
+    # whole-page Vision pass — the figure is shrunk into the 1489px page
+    # render and its small text goes [unreadable]. Docling already decodes
+    # every embedded picture into doc.pictures (original pixels, in order);
+    # we save each to assets/, rewrite the matching empty `<!-- image -->`
+    # placeholder to `<!-- image: <file> -->` (so grep/RAG can locate it),
+    # and — for figures above min_dimension — send the ORIGINAL-resolution
+    # image to Vision once so its text is captured cleanly. Mirrors the
+    # xlsx embedded-image marker convention; reuses Docling's own ordering
+    # so no docx zip / OOXML parsing is needed.
+    image_extraction:
+      enabled: true              # save embedded pictures + write `<!-- image: file -->` markers
+      min_dimension: 200         # px; images smaller on BOTH sides (e.g. a 120×120
+                                 # OLE icon) are saved + marked but NOT sent to Vision
+                                 # — reading an icon wastes an API call. Marker still
+                                 # written so RAG can locate the asset.
+      vision_enrich: true        # send above-threshold pictures to Vision at full
+                                 # resolution (the fix for shrunk-figure [unreadable]).
+                                 # false = extract + mark only, zero extra API cost.
+      max_images_vision: 30      # per-file cap on embedded-image Vision calls. On
+                                 # trip: warn + skip the rest (NOT silent) — the
+                                 # extracted assets and markers are still written, so
+                                 # nothing is lost, only the extra Vision read is
+                                 # deferred. Raise for figure-dense docs.
 
   # ZIP archive expansion
   # Users often hand DocIngest a .zip full of mixed documents. When this
@@ -838,6 +890,49 @@ parsing:
       # this (global supplement_only=false) — Docling fragments their 方眼紙
       # tables, so they need full whole-page transcription to recover the body.
       supplement_only: true
+      # Sheet-level triage: a sheet whose raw OOXML carries ZERO drawing
+      # elements (pictures, shapes, connectors, chart frames) and no OLE
+      # objects has nothing the page render could add — openpyxl already
+      # extracted its cells — so its pages skip Vision. Counted straight
+      # from the zip's drawing XML, NOT openpyxl objects (those silently
+      # drop shapes/EMF, which would wrongly skip shape-drawn flow
+      # diagrams). All-empty workbook → the LibreOffice render is skipped
+      # too. Partially-visual workbook → only pages of empty sheets are
+      # skipped, and only when the sheet→page map covers every visible
+      # sheet; pages with hook-injected structured data are always sent.
+      # Oracle-tested: skipped sheets' supplements were empty or pure
+      # template furniture. false = always send everything.
+      sheet_triage: true
+      # Batched ground-truth slicing: each ≤20-page batch gets only ITS
+      # sheets' text as the "already captured, don't re-transcribe"
+      # reference instead of the whole workbook (which repeated the full
+      # markdown once per batch — measured 5×192k chars on a 159-page
+      # workbook, the dominant input-token share; local simulation: 50%
+      # saved even with conservative fallbacks). Attribution reuses the
+      # sheet_triage anchored-range rule; ANY doubt (unmapped neighbour
+      # sheet, page outside anchors, section/sheet count mismatch) sends
+      # the full markdown for that batch. A wrong slice would not lose
+      # data — the prompt treats mismatched ground truth as a failed
+      # extraction and re-transcribes in full (the saving inverts, the
+      # content stays) — but the conservative fallbacks keep even that
+      # from happening. false = always send the full markdown per batch.
+      ground_truth_slice: true
+
+    # Embedded-image full-res Vision (same mechanism + keys as
+    # parsing.docx.image_extraction). The denoising.extract_images step above
+    # already saves every xl/media/* picture to assets/ and the openpyxl
+    # renderer cell-anchors a `<!-- image: <file> -->` marker for each; this
+    # additionally sends pictures above min_dimension to Vision at ORIGINAL
+    # resolution — fixing screenshots pasted into sheets (画面レイアウト etc.)
+    # whose small text blurs in the LibreOffice page render. The transcription
+    # lands after the table holding the marker (inserting mid-table would
+    # split it). EMF/WMF are skipped naturally: PIL can't read their size, and
+    # Vision can't read EMF anyway — their markers and assets remain.
+    image_extraction:
+      enabled: true
+      min_dimension: 200         # px; smaller on BOTH sides (cell icons) → not sent
+      vision_enrich: true        # false = extract + mark only, zero extra API cost
+      max_images_vision: 30      # per-file cap; on trip warns and skips the rest
 
 # =============================================================================
 # Phase 2: Output Structure

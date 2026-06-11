@@ -443,6 +443,32 @@ class DoclingParser(BaseParser):
             if self._last_parse_metadata.get("xlsx_embedded_images"):
                 metadata["xlsx_embedded_images"] = self._last_parse_metadata["xlsx_embedded_images"]
 
+            # Visual-signal scan for the docx text-only Vision skip
+            # (parsing.docx.vision.skip_text_only). None on scan failure →
+            # key omitted → the pipeline keeps the full Vision pass.
+            if file_path.suffix.lower() == ".docx":
+                docx_signals = _collect_docx_visual_signals(file_path)
+                if docx_signals is not None:
+                    metadata["docx_visual_signals"] = docx_signals
+
+            # Extract docx embedded pictures → assets + name their `<!-- image -->`
+            # markers. Only docx, only when enabled. Docling already decoded the
+            # pixels into doc.pictures, so this neither re-parses the zip nor adds
+            # API cost here (the optional full-res Vision read happens later, in
+            # the pipeline's Vision stage, gated by image_extraction.vision_enrich).
+            if (
+                file_path.suffix.lower() == ".docx"
+                and get_nested(self.config, "parsing.docx.image_extraction.enabled", True)
+            ):
+                assets_dir = Path(get_nested(
+                    self.config, "output.dir", "./knowledge"
+                )) / get_nested(self.config, "output.assets_dir", "assets")
+                markdown, docx_pics = self._extract_docling_pictures(
+                    doc, markdown, file_path, assets_dir
+                )
+                if docx_pics:
+                    metadata["embedded_images"] = docx_pics
+
             # Extract per-element bounding boxes (if enabled)
             if get_nested(self.config, "output.include_bounding_boxes", True):
                 metadata["element_boxes"] = self._extract_bounding_boxes(doc)
@@ -1215,6 +1241,128 @@ class DoclingParser(BaseParser):
             logger.info(f"Extracted {len(extracted)} embedded images from {file_path.name}")
         return extracted
 
+    def _extract_docling_pictures(
+        self, doc, markdown: str, file_path: Path, assets_dir: Path
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Save Docling-decoded embedded pictures to assets/ and name their markers.
+
+        Docling decodes every embedded picture into ``doc.pictures`` with the
+        original pixels (``pic.image.uri`` = base64 data URI) AND emits one empty
+        ``<!-- image -->`` placeholder per picture in ``markdown``, in the SAME
+        order. So we never touch the docx zip / OOXML: we walk ``doc.pictures``,
+        decode each to ``assets/<stem>-img-NNN.png``, and rewrite the Nth empty
+        ``<!-- image -->`` to ``<!-- image: <file> -->`` so grep / RAG can locate
+        the asset and downstream Vision can read it at full resolution.
+
+        Returns ``(new_markdown, picture_list)`` where each picture dict has:
+        ``path`` (str), ``filename`` (str), ``width`` / ``height`` (int or None),
+        ``send_vision`` (bool — above min_dimension and vision_enrich on).
+
+        Anchoring is positional and tied to Docling's own ordering, so the
+        placeholder count normally equals ``len(doc.pictures)``. If a pre-parse
+        hook rewrote the markdown and the counts diverge, we anchor as many as
+        line up and list the rest under an "unanchored embedded images" footer —
+        the assets are always saved, never silently dropped.
+        """
+        import base64
+        import re
+
+        pictures = list(getattr(doc, "pictures", None) or [])
+        if not pictures:
+            return markdown, []
+
+        cfg = get_nested(self.config, "parsing.docx.image_extraction", {}) or {}
+        min_dim = int(cfg.get("min_dimension", 200))
+        vision_enrich = bool(cfg.get("vision_enrich", True))
+
+        assets_dir.mkdir(parents=True, exist_ok=True)
+
+        picture_list: list[dict[str, Any]] = []
+        for idx, pic in enumerate(pictures, start=1):
+            img = getattr(pic, "image", None)
+            uri = getattr(img, "uri", None) if img is not None else None
+            uri = str(uri) if uri is not None else ""
+            if not uri.startswith("data:"):
+                # Picture element with no inline pixels (Docling did not decode
+                # it) — nothing to save. The empty placeholder stays as-is.
+                continue
+            try:
+                header, b64 = uri.split(",", 1)
+                raw = base64.b64decode(b64)
+            except Exception as e:
+                logger.debug(f"docx picture {idx}: base64 decode failed ({e}); skipped")
+                continue
+
+            ext = "png"
+            if "image/" in header:
+                ext = header.split("image/", 1)[1].split(";", 1)[0] or "png"
+            filename = f"{file_path.stem}-img-{idx:03d}.{ext}"
+            out_path = assets_dir / filename
+            try:
+                out_path.write_bytes(raw)
+            except Exception as e:
+                logger.debug(f"docx picture {idx}: write failed ({e}); skipped")
+                continue
+
+            w = h = None
+            sz = getattr(img, "size", None)
+            if sz is not None:
+                w = int(getattr(sz, "width", 0)) or None
+                h = int(getattr(sz, "height", 0)) or None
+            big_enough = (
+                w is not None and h is not None and (w >= min_dim or h >= min_dim)
+            )
+            picture_list.append({
+                "path": str(out_path),
+                "filename": filename,
+                "width": w,
+                "height": h,
+                "send_vision": bool(vision_enrich and big_enough),
+            })
+
+        if not picture_list:
+            return markdown, []
+
+        # Rewrite empty placeholders to named ones, positionally. re.sub with a
+        # count of 1 per picture replaces the FIRST remaining empty placeholder
+        # each iteration, preserving order. Only bare `<!-- image -->` is matched
+        # (named markers and pagebreaks are left untouched).
+        empty_marker = re.compile(r"<!--\s*image\s*-->")
+        anchored = 0
+        for pic in picture_list:
+            new_md, n = empty_marker.subn(
+                f"<!-- image: {pic['filename']} -->", markdown, count=1
+            )
+            if n:
+                markdown = new_md
+                anchored += 1
+                pic["anchored"] = True
+            else:
+                pic["anchored"] = False
+
+        unanchored = [p for p in picture_list if not p.get("anchored")]
+        if unanchored:
+            # Counts diverged (hook-rewritten markdown). Never drop the assets —
+            # list them so they stay discoverable by grep / RAG.
+            lines = "\n".join(f"- <!-- image: {p['filename']} -->" for p in unanchored)
+            markdown = (
+                markdown.rstrip()
+                + "\n\n<!-- unanchored embedded images -->\n"
+                + lines
+                + "\n"
+            )
+            logger.warning(
+                f"{file_path.name}: {len(unanchored)} embedded image(s) had no "
+                f"matching placeholder — listed as unanchored (assets still saved)."
+            )
+
+        logger.info(
+            f"Extracted {len(picture_list)} embedded picture(s) from "
+            f"{file_path.name} ({anchored} anchored, "
+            f"{sum(1 for p in picture_list if p['send_vision'])} for Vision)."
+        )
+        return markdown, picture_list
+
     # -----------------------------------------------------------------
     # xlsx renderer (openpyxl-based)
     # -----------------------------------------------------------------
@@ -1450,8 +1598,52 @@ class DoclingParser(BaseParser):
                 # uses the same names downstream code reads from openpyxl.
                 "xlsx_visible_sheet_names": list(visible_sheet_names),
             }
+            # Per-sheet visual-element counts (raw OOXML scan) — drives the
+            # pipeline's sheet-level Vision triage. Empty dict on scan failure
+            # → key omitted → triage stays off for this file (send all).
+            sheet_visuals = _collect_xlsx_sheet_visuals(file_path)
+            if sheet_visuals:
+                metadata["xlsx_sheet_visuals"] = sheet_visuals
             if extracted:
                 metadata["xlsx_embedded_images"] = extracted
+
+            # Embedded-image registry for full-res Vision (same shape as the
+            # docx one, same `embedded_images` key — the pipeline's
+            # _enrich_embedded_images consumes both identically). The markers
+            # are already cell-anchored above; this only adds the size /
+            # send_vision data the enrichment needs. Dimensions via PIL on the
+            # extracted file: EMF/WMF fail to open → size stays None → never
+            # sent (correct: Vision can't read EMF either; the marker and
+            # asset remain discoverable).
+            if extracted and get_nested(
+                self.config, "parsing.xlsx.image_extraction.enabled", True
+            ):
+                img_cfg = get_nested(
+                    self.config, "parsing.xlsx.image_extraction", {}
+                ) or {}
+                min_dim = int(img_cfg.get("min_dimension", 200))
+                vision_enrich = bool(img_cfg.get("vision_enrich", True))
+                embedded_list: list[dict[str, Any]] = []
+                for p in extracted:
+                    w = h = None
+                    try:
+                        from PIL import Image as _PILImage
+                        with _PILImage.open(p) as im:
+                            w, h = im.size
+                    except Exception:
+                        pass
+                    big_enough = (
+                        w is not None and h is not None
+                        and (w >= min_dim or h >= min_dim)
+                    )
+                    embedded_list.append({
+                        "path": str(p),
+                        "filename": Path(p).name,
+                        "width": w,
+                        "height": h,
+                        "send_vision": bool(vision_enrich and big_enough),
+                    })
+                metadata["embedded_images"] = embedded_list
 
             logger.info(
                 f"xlsx rendered via openpyxl: {file_path.name} "
@@ -1618,6 +1810,139 @@ def _ooxml_normalize_target(target: str, base_path: str) -> str:
         else:
             stack.append(seg)
     return "/".join(stack)
+
+
+def _collect_docx_visual_signals(file_path: Path) -> dict[str, int] | None:
+    """Count the docx body's visual-signal elements straight from the zip.
+
+    Signals (regex on word/document.xml — the ``w:``/``v:`` prefixes are
+    fixed by the OOXML spec and were verified stable across a 78-file
+    corpus): ``drawing`` (inline/anchored pictures, charts, SmartArt),
+    ``pict`` (legacy VML shapes), ``ink`` (contentPart — pen annotations),
+    ``highlight`` (marker-pen runs), ``tracked`` (insertions/deletions).
+    All zero → the LibreOffice page render can show nothing beyond the
+    body text Docling already read from the XML, so the page-Vision pass
+    can be skipped (parsing.docx.vision.skip_text_only).
+
+    Header/footer parts are deliberately NOT scanned: their pictures are
+    overwhelmingly logo furniture (measured: header/footer text was the
+    bulk of the wasted supplement output), and a meaningful body visual
+    in a real document always shows up in document.xml.
+
+    Returns None when the file can't be read as OOXML — the consumer
+    treats missing data as "has visuals" and keeps the full Vision pass.
+    """
+    import re as _re
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(str(file_path)) as zf:
+            doc = zf.read("word/document.xml").decode("utf-8", "ignore")
+    except Exception as exc:
+        logger.debug(f"docx visual-signal scan failed ({exc}) — no triage data")
+        return None
+    return {
+        "drawing": len(_re.findall(r"<w:drawing[ >]", doc)),
+        "pict": len(_re.findall(r"<w:pict[ >]", doc)),
+        "ink": len(_re.findall(r"contentPart", doc)),
+        "highlight": len(_re.findall(r"<w:highlight[ >]", doc)),
+        "tracked": len(_re.findall(r"<w:(?:ins|del)[ >]", doc)),
+    }
+
+
+def _collect_xlsx_sheet_visuals(file_path: Path) -> dict[str, int]:
+    """Count visual elements per sheet, read from the raw OOXML (zip).
+
+    Returns ``{sheet_display_name: visual_element_count}`` where the count
+    sums the sheet's drawing-part elements — pictures (``pic``), shapes
+    (``sp``), connectors (``cxnSp``), groups (``grpSp``), chart/SmartArt
+    frames (``graphicFrame``) — plus embedded ``oleObject``s in the sheet
+    XML. Element names are matched by LOCAL name, so any namespace prefix
+    works. A sheet with count 0 has nothing the LibreOffice page render
+    could show beyond the cells openpyxl already extracted.
+
+    Deliberately NOT openpyxl-based: ``ws._images`` silently drops shapes
+    and EMF/WMF (see _collect_xlsx_image_anchors) — a flow diagram drawn
+    with shapes would read as "no visuals" and get its Vision pass wrongly
+    skipped. The raw drawing XML sees every element.
+
+    Best-effort like the anchor collector: any failure returns ``{}`` and
+    the consumer (pipeline sheet triage) treats absent data as "visual"
+    and sends everything — degraded means more Vision calls, never less.
+    """
+    import xml.etree.ElementTree as ET
+    import zipfile
+
+    _DRAWING_VISUALS = {"pic", "sp", "cxnSp", "grpSp", "graphicFrame"}
+
+    result: dict[str, int] = {}
+    if not zipfile.is_zipfile(str(file_path)):
+        return result
+    try:
+        with zipfile.ZipFile(str(file_path)) as zf:
+            names = set(zf.namelist())
+            wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+            wb_rels_xml = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+            wb_rels = {
+                rel.attrib.get("Id"): rel.attrib.get("Target", "")
+                for rel in wb_rels_xml
+            }
+            sheets_elem = wb_xml.find("main:sheets", _OOXML_NS)
+            if sheets_elem is None:
+                return result
+            r_ns = _OOXML_NS["r"]
+
+            for sh in sheets_elem.findall("main:sheet", _OOXML_NS):
+                sheet_name = sh.attrib.get("name", "")
+                rid = sh.attrib.get(f"{{{r_ns}}}id")
+                sheet_target = wb_rels.get(rid, "")
+                if not sheet_name or not sheet_target:
+                    continue
+                sheet_path = _ooxml_normalize_target(sheet_target, "xl/workbook.xml")
+                if sheet_path not in names:
+                    continue
+                try:
+                    sheet_xml = ET.fromstring(zf.read(sheet_path))
+                except ET.ParseError:
+                    continue
+
+                count = sum(
+                    1 for el in sheet_xml.iter()
+                    if el.tag.rsplit("}", 1)[-1] == "oleObject"
+                )
+
+                drawing_elem = sheet_xml.find("main:drawing", _OOXML_NS)
+                drawing_rid = (
+                    drawing_elem.attrib.get(f"{{{r_ns}}}id")
+                    if drawing_elem is not None else None
+                )
+                if drawing_rid:
+                    sheet_dir, _, sheet_fname = sheet_path.rpartition("/")
+                    sheet_rels_path = f"{sheet_dir}/_rels/{sheet_fname}.rels"
+                    if sheet_rels_path in names:
+                        try:
+                            srels = ET.fromstring(zf.read(sheet_rels_path))
+                            targets = {
+                                rel.attrib.get("Id"): rel.attrib.get("Target", "")
+                                for rel in srels
+                            }
+                            dtarget = targets.get(drawing_rid, "")
+                            dpath = _ooxml_normalize_target(dtarget, sheet_path)
+                            if dpath in names:
+                                dx = ET.fromstring(zf.read(dpath))
+                                count += sum(
+                                    1 for el in dx.iter()
+                                    if el.tag.rsplit("}", 1)[-1] in _DRAWING_VISUALS
+                                )
+                        except ET.ParseError:
+                            # Unreadable drawing part — assume visual rather
+                            # than risk skipping a sheet we couldn't inspect.
+                            count += 1
+                result[sheet_name] = count
+    except Exception as exc:
+        logger.debug(f"xlsx sheet visuals collect failed ({exc}) — no triage data")
+        return {}
+    return result
 
 
 def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any]]]:
