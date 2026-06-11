@@ -121,6 +121,7 @@ const api = {
   inspect: (paths) => window.pywebview.api.inspect(paths),
   startIngest: (paths, name, options, ack) =>
     window.pywebview.api.start_ingest(paths, name, options || null, !!ack),
+  stopIngest: () => window.pywebview.api.stop_ingest(),
   listLibraries: () => window.pywebview.api.list_libraries(),
   getSummary: (dir) => window.pywebview.api.get_summary(dir),
   previewMarkdown: (dir, file) => window.pywebview.api.preview_markdown(dir, file),
@@ -417,19 +418,20 @@ function refreshHomeFromSelection() {
 document.getElementById("list-clear")?.addEventListener("click", () => {
   state.paths = [];
   state.inspectRows = [];
+  hideRejectNote();
   refreshHomeFromSelection();
 });
 
 // Dropzone → native multi-select file picker (pywebview). Adds to selection.
+// Order matters: addInputs clears the rejection note, so accepted files go
+// in first, THEN the note for rejected ones (dialog backstop) is shown.
 document.getElementById("dropzone")?.addEventListener("click", async () => {
   try {
-    const picked = await api.pickFiles();
-    if (picked && picked.length) {
-      for (const p of picked) if (!state.paths.includes(p)) state.paths.push(p);
-      state.inspectRows = []; // selection changed → previous inspect is stale
-      state.inspectMeta = null;
-      refreshHomeFromSelection();
-    }
+    const res = await api.pickFiles();
+    const accepted = res?.accepted || [];
+    const rejected = res?.rejected || [];
+    if (accepted.length) addInputs(accepted);
+    if (rejected.length) showRejectNote(rejected);
   } catch (err) {
     console.error("file pick failed", err);
   }
@@ -443,6 +445,30 @@ window.__onFilesDropped = function (paths) {
   if (Array.isArray(paths) && paths.length) addInputs(paths);
   document.getElementById("dropzone")?.classList.remove("is-dragover");
 };
+
+// Unsupported-format note: files rejected by the Python-side format gate
+// (drag-drop push, or the file-dialog backstop via pickFiles' return) are
+// LISTED here, never silently dropped. Cleared on the next selection change
+// (addInputs / list-clear) — which is why every caller shows the note AFTER
+// adding its accepted files.
+window.__onFilesRejected = function (paths) {
+  document.getElementById("dropzone")?.classList.remove("is-dragover");
+  showRejectNote(paths);
+};
+
+function showRejectNote(paths) {
+  if (!Array.isArray(paths) || !paths.length) return;
+  const note = document.getElementById("file-reject-note");
+  if (!note) return;
+  const names = paths.map((p) => String(p).split(/[\\/]/).pop());
+  note.textContent = `対応していない形式のためスキップしました: ${names.join("、")}`;
+  note.hidden = false;
+}
+
+function hideRejectNote() {
+  const note = document.getElementById("file-reject-note");
+  if (note) note.hidden = true;
+}
 
 const _dz = document.getElementById("dropzone");
 if (_dz) {
@@ -470,6 +496,7 @@ function addInputs(items) {
     if (it && !state.paths.includes(it)) { state.paths.push(it); added = true; }
   }
   if (added) {
+    hideRejectNote();
     state.inspectRows = [];
     state.inspectMeta = null;
     refreshHomeFromSelection();
@@ -597,6 +624,7 @@ document.getElementById("cost-cancel")?.addEventListener("click", () =>
 document.getElementById("cost-confirm-btn")?.addEventListener("click", async () => {
   hideOverlay("cost-confirm");
   showScreen("processing");
+  resetStopButton();
   initProcessing();
   try {
     const name = state.libraryName || deriveLibraryName(state.paths);
@@ -605,6 +633,35 @@ document.getElementById("cost-confirm-btn")?.addEventListener("click", async () 
     console.error("start ingest failed", err);
   }
 });
+
+// Stop button (03): real backend stop, not a screen exit. In-flight Vision
+// calls finish, queued work is skipped, completed files are saved — then the
+// run ends through the NORMAL __onIngestDone flow (summary.interrupted=true),
+// so the done screen shows what was completed. Button locks to 停止中…
+// because a second click can't make it stop any faster.
+document.getElementById("proc-stop")?.addEventListener("click", async () => {
+  const btn = document.getElementById("proc-stop");
+  if (!btn || btn.disabled) return;
+  if (!window.confirm(
+    "処理を停止しますか？\n完了済みのファイルは保存され、残りはスキップされます。"
+  )) return;
+  btn.disabled = true;
+  const label = btn.querySelector("span");
+  if (label) label.textContent = "停止中…（実行中の処理を終了しています）";
+  try {
+    await api.stopIngest();
+  } catch (err) {
+    console.error("stop ingest failed", err);
+  }
+});
+
+function resetStopButton() {
+  const btn = document.getElementById("proc-stop");
+  if (!btn) return;
+  btn.disabled = false;
+  const label = btn.querySelector("span");
+  if (label) label.textContent = "処理を中止";
+}
 
 // A friendly default library name from the first selection (user can rename
 // later in the flow; pen has no name field on home, so we derive one).
@@ -926,6 +983,15 @@ function renderNotices(stats, lib) {
   if (!box) return;
   box.innerHTML = "";
   const rows = [];
+
+  // User-stopped run: say so first, plainly — the numbers below then read as
+  // "what was completed before the stop", not as a silent partial failure.
+  if (stats.interrupted) {
+    rows.push({
+      icon: "circle-pause", cls: "is-warn",
+      text: "ユーザーの操作で停止しました。完了済みのファイルのみ保存されています。",
+    });
+  }
 
   // Failed files first — the most important "did it work?" signal. stats.errors
   // carries {file, error, error_type}; show which file + a plain reason so the

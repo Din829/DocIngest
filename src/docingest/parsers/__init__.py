@@ -17,11 +17,48 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from ..config import get_nested
 from .base import BaseParser, ParseResult
 from .docling_parser import DoclingParser
 from .text_parser import TextParser
 
 logger = logging.getLogger(__name__)
+
+
+# Inputs handled by pipeline stages BEFORE any parser sees them, so no
+# parser's supported_extensions() reports them. Each is gated by its own
+# config switch — turn the feature off and the extension leaves the set.
+#   .xls/.doc/.ppt → Phase 0.5 LibreOffice conversion to OOXML
+#   .zip           → discover_files expansion
+_PIPELINE_LEVEL_EXTENSIONS: list[tuple[str, str]] = [
+    (".xls", "parsing.xls.auto_convert_to_xlsx"),
+    (".doc", "parsing.doc.auto_convert_to_docx"),
+    (".ppt", "parsing.ppt.auto_convert_to_pptx"),
+    (".zip", "parsing.zip.enabled"),
+]
+
+
+def supported_input_extensions(config: dict[str, Any]) -> set[str]:
+    """Every file extension the pipeline can process under this config.
+
+    The single source of truth for "what can DocIngest take as input" —
+    entry-point filters (GUI file dialog / drag-drop) should call this
+    instead of hardcoding a list. Composed of:
+
+      * the active parser's supported_extensions() (Docling ∪ Text ∪ Media;
+        media formats come from config and disappear automatically when the
+        audio extras aren't installed), plus
+      * pipeline-level inputs (legacy Office, ZIP), each present only while
+        its config switch is on.
+
+    Directories and URLs are separate input channels, not extensions, so
+    they are out of scope here.
+    """
+    exts = set(create_parser(config).supported_extensions())
+    for ext, cfg_path in _PIPELINE_LEVEL_EXTENSIONS:
+        if get_nested(config, cfg_path, True):
+            exts.add(ext)
+    return exts
 
 
 def create_parser(config: dict[str, Any]) -> BaseParser:

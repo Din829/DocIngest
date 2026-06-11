@@ -169,8 +169,44 @@ def _inspect_xlsx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         return {"pages": None, "error": str(e)}
 
 
+def _read_docx_app_pages(file_path: Path) -> int | None:
+    """Word's own page count from docProps/app.xml (<Pages>92</Pages>).
+
+    This is what Word last computed when saving — exact for normally-saved
+    documents, and free (one small XML from the zip, no python-docx load).
+    Returns None when the part / field is absent (some generators omit it)
+    or unparsable, so callers can fall back to estimation."""
+    import zipfile
+    from defusedxml import ElementTree as DET
+    try:
+        with zipfile.ZipFile(str(file_path)) as zf:
+            root = DET.fromstring(zf.read("docProps/app.xml"))
+        ns = "{http://schemas.openxmlformats.org/officeDocument/2006/extended-properties}"
+        node = root.find(f"{ns}Pages")
+        pages = int(node.text) if node is not None and node.text else 0
+        return pages if pages > 0 else None
+    except Exception:
+        return None
+
+
+def _count_docx_media(file_path: Path) -> int:
+    """Number of embedded media files (word/media/*) — drives the
+    embedded-image Vision term of the cost estimate. Free zip-list read."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(str(file_path)) as zf:
+            return sum(
+                1 for n in zf.namelist()
+                if n.startswith("word/media/") and not n.endswith("/")
+            )
+    except Exception:
+        return 0
+
+
 def _inspect_docx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
-    """DOCX: approximate page count + character count from paragraphs.
+    """DOCX: page count from Word's own app.xml metadata (exact), falling
+    back to a CJK-aware text estimate; plus char count and embedded-media
+    count (cost-estimate inputs).
     Legacy .doc short-circuits to a friendly note (python-docx can't read it)."""
     _ = config
     legacy = _legacy_office_note(file_path)
@@ -181,16 +217,34 @@ def _inspect_docx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
         doc = Document(str(file_path))
         word_count = 0
         chars_est = 0
+        cjk_chars = 0
         for p in doc.paragraphs:
             text = p.text or ""
             chars_est += len(text)
             word_count += len(text.split())
-        est_pages = max(1, word_count // 300)
+            # U+3000-9FFF: CJK punctuation / kana / unified ideographs;
+            # U+AC00-D7AF: hangul. Coarse but only feeds a page heuristic.
+            cjk_chars += sum(
+                1 for ch in text
+                if 0x3000 <= ord(ch) <= 0x9FFF or 0xAC00 <= ord(ch) <= 0xD7AF
+            )
+
+        app_pages = _read_docx_app_pages(file_path)
+        if app_pages is not None:
+            est_pages = app_pages
+        else:
+            # CJK chars per page ≈ 1000 (typical Word page, JP academic
+            # ~1100-1400 chars full, less with figures); spaced scripts
+            # keep words//300. Terms add so mixed docs get both.
+            latin_words = max(0, word_count - (cjk_chars // 2))
+            est_pages = max(1, cjk_chars // 1000 + latin_words // 300)
+
         return {
             "pages": est_pages,
             "chars_est": chars_est,
             "words": word_count,
-            "pages_estimated": True,
+            "pages_estimated": app_pages is None,
+            "media_files": _count_docx_media(file_path),
         }
     except Exception as e:
         logger.debug(f"DOCX inspection failed for {file_path.name}: {e}")

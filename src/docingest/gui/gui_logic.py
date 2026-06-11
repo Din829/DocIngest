@@ -475,6 +475,39 @@ def load_settings() -> dict[str, Any]:
     return get_settings()
 
 
+def supported_extensions() -> list[str]:
+    """Extensions the pipeline can process under the user's effective config
+    (saved settings layered over defaults). Backs the file-dialog filter and
+    the drag-drop gate — sourced from the core's own list so the GUI follows
+    config switches (zip off → no .zip) and never duplicates the catalog."""
+    from ..parsers import supported_input_extensions
+
+    config = api.build_config(config_overrides=get_settings() or None)
+    return sorted(supported_input_extensions(config))
+
+
+def split_supported(paths: Sequence[str]) -> dict[str, list[str]]:
+    """Partition input paths into ``{"accepted": [...], "rejected": [...]}``.
+
+    Directories pass through — discover_files expands them recursively and
+    the parse layer isolates any unsupported file inside. Plain files must
+    carry a supported extension: a GUI user picking an .exe should learn at
+    the door, not from a failed parse minutes later. Note this rejects
+    extension-less files on the GUI channel (CLI / library keep the magika
+    content-detection path; dragging such files into a GUI is rare enough
+    that a clear refusal beats a maybe-parse)."""
+    allowed = set(supported_extensions())
+    accepted: list[str] = []
+    rejected: list[str] = []
+    for p in paths:
+        path = Path(p)
+        if path.is_dir() or path.suffix.lower() in allowed:
+            accepted.append(str(p))
+        else:
+            rejected.append(str(p))
+    return {"accepted": accepted, "rejected": rejected}
+
+
 def effective_safety() -> dict[str, Any]:
     """Current effective safety thresholds (cost-limit screen needs real
     initial values, not hardcoded ones). Merges saved user settings over the

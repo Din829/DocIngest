@@ -69,6 +69,9 @@
               <span class="dz-text">ファイルをドロップ または クリックで選択</span>
             </button>
 
+            <!-- Unsupported-format note — filled by __onFilesRejected (app.js) -->
+            <div id="file-reject-note" class="file-reject-note" hidden></div>
+
             <div class="url-input row items-center gap-3">
               <i data-lucide="link" class="ui-icon"></i>
               <input
@@ -137,10 +140,13 @@
 
           <div class="progress-list col" id="proc-list"></div>
 
+          <!-- Real stop: asks the backend to halt (in-flight calls finish,
+               everything else is skipped, completed files are saved), then the
+               normal __onIngestDone flow shows the partial result. Wired in
+               app.js — deliberately NOT data-back, which only left the screen
+               while the run kept burning API calls in the background. -->
           <div class="stop-wrap row center">
-            <button class="stop-btn row items-center gap-2" id="proc-stop"
-                    data-back="home"
-                    data-back-confirm="ホームに戻ります。処理はバックグラウンドで続行し、完了後ライブラリ一覧に表示されます。よろしいですか？">
+            <button class="stop-btn row items-center gap-2" id="proc-stop">
               <i data-lucide="square" class="stop-icon"></i>
               <span>処理を中止</span>
             </button>
@@ -504,6 +510,10 @@
           <span class="ct-label" id="cost-total-label">合計</span>
           <span class="ct-value mono" id="cost-total">$0.0000</span>
         </div>
+
+        <!-- The estimate is a cache-cold upper bound (see safety.
+             est_tokens_per_vision_call) — re-runs hit the local cache. -->
+        <div class="ct-hint">※ 概算の上限値です。再処理時はキャッシュにより安くなります。</div>
 
         <div class="warn-note row items-center gap-2 is-hidden" id="cost-warn">
           <i data-lucide="triangle-alert" class="cw-icon"></i>

@@ -59,11 +59,22 @@ _DEFAULT_FALLBACK_PRICE = 0.005  # USD per Vision call; ultimate fallback
 
 def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> float:
     """
-    Estimate Vision / video API cost for a single file.
+    Estimate Vision / video API cost for a single file — an UPPER BOUND for a
+    cache-cold run (re-runs hit DocIngest's content-hash cache and cost less;
+    we deliberately ignore that and any provider-side prompt-cache discount,
+    because the safety gate must over- not under-estimate).
 
-    Two cost models, by file shape:
-      * page-based docs (pdf/pptx/docx/...): cost ≈ min(pages, vision.max_pages)
-        × per-call price.
+    Cost models, by file shape:
+      * page-based docs (pdf/pptx/docx/...):
+            calls = min(pages, vision.max_pages)
+                    + min(embedded media, docx max_images_vision)   # docx only
+            cost  = calls × per-call token estimate × litellm's price table
+        Per-call tokens come from safety.est_tokens_per_vision_call —
+        calibrated against a real run (92-page docx, 2026-06-11: avg 42K in /
+        2.9K out per call). litellm's bundled price table tracks official
+        provider pricing per model, so switching models reprices the estimate
+        automatically; models it doesn't know fall back to the legacy
+        vision_price_per_call table.
       * video (no pages, has duration_sec): cost ≈ duration × per-second token
         rate × per-token price — see _estimate_video_cost_usd. Without this a
         video estimated 0.0 (pages=None), which silently defeated the cost
@@ -88,8 +99,41 @@ def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> floa
     cap = int(cap_raw) if cap_raw is not None else int(pages)
     vision_calls = min(int(pages), cap)
 
-    price = _lookup_vision_price(config)
-    return vision_calls * price
+    # Embedded-image Vision (docx figures read at full resolution) — a real
+    # cost term the page count doesn't cover. media_files is reported by
+    # inspect for docx; absent for other formats.
+    media = int(info.get("media_files") or 0)
+    if media and get_nested(config, "parsing.docx.image_extraction.vision_enrich", True):
+        img_cap = int(get_nested(
+            config, "parsing.docx.image_extraction.max_images_vision", 30
+        ))
+        vision_calls += min(media, img_cap)
+
+    return vision_calls * _price_per_vision_call(config)
+
+
+def _price_per_vision_call(config: dict[str, Any]) -> float:
+    """USD per Vision call: per-call token estimate × litellm's price table
+    for the configured model; legacy per-call table when litellm doesn't
+    know the model (or isn't importable)."""
+    in_tok = int(get_nested(config, "safety.est_tokens_per_vision_call.input", 40000))
+    out_tok = int(get_nested(config, "safety.est_tokens_per_vision_call.output", 3000))
+    provider = get_nested(config, "models.vision.primary.provider", "") or ""
+    model = get_nested(config, "models.vision.primary.model", "") or ""
+    if provider and model:
+        try:
+            import litellm
+            from .models.provider import _resolve_model_name
+            pc, cc = litellm.cost_per_token(
+                model=_resolve_model_name(provider, model),
+                prompt_tokens=in_tok,
+                completion_tokens=out_tok,
+            )
+            if pc or cc:
+                return float(pc + cc)
+        except Exception:
+            pass  # unknown model / litellm unavailable → legacy table
+    return _lookup_vision_price(config)
 
 
 # Video formats that go through Vision (native video understanding or frame

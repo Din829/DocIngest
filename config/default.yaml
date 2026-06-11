@@ -1383,10 +1383,27 @@ safety:
     enabled: true
     pdf_sample_pages: 3
 
-  # Rough per-call Vision price table in USD. Used to compute est_cost_usd.
-  # Not a live feed — update after provider pricing changes. Unknown
-  # models fall back to "_default". Prefix match works too, so
+  # Per-Vision-call token estimate — the PRIMARY cost model. est_cost_usd =
+  # calls × these tokens priced via litellm's bundled price table for the
+  # configured vision model (switching models reprices automatically).
+  # Calibrated on a real run (92-page Japanese thesis docx, 2026-06-11):
+  # 122 calls averaged 42K input / 2.9K output tokens each — input is
+  # dominated by the page image plus the full-page text context the prompt
+  # carries. The estimate is a CACHE-COLD UPPER BOUND: re-runs hit the
+  # content-hash cache and cost less; provider-side prompt-cache discounts
+  # are likewise ignored (the safety gate must over- not under-estimate).
+  est_tokens_per_vision_call:
+    input: 40000
+    output: 3000
+
+  # LEGACY FALLBACK per-call price table in USD — used only when litellm's
+  # price table doesn't know the configured model (private deployment, very
+  # new release). Not a live feed — update after provider pricing changes.
+  # Unknown models fall back to "_default". Prefix match works too, so
   # "gemini-3-flash-preview" hits the "gemini-3-flash" entry.
+  # NOTE: these per-call figures predate the token model above and run LOW
+  # for dense documents (calibration doc measured ~$0.03/call vs 0.0002
+  # here); prefer fixing the litellm model name so the primary path applies.
   vision_price_per_call:
     gemini-3-flash-preview: 0.0002
     gemini-3-flash: 0.0002

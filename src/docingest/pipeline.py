@@ -49,6 +49,29 @@ import logging
 _pipeline_logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# External stop channel — thread-safe equivalent of the CLI's Ctrl+C.
+# Hosts that run the pipeline on a worker thread (the GUI) can't deliver
+# SIGINT, so they call request_stop() instead. Semantics mirror the graceful
+# interrupt: between files the run stops and aggregate outputs are written
+# for everything completed; within a file, Vision page calls that haven't
+# started yet are skipped (the page keeps its Docling text) so a large file
+# winds down in seconds instead of minutes. run_pipeline clears the flag on
+# entry, so a stop request only ever applies to the run it was issued for.
+# ---------------------------------------------------------------------------
+_EXTERNAL_STOP = threading.Event()
+
+
+def request_stop() -> None:
+    """Ask the currently running pipeline to stop gracefully (thread-safe)."""
+    _EXTERNAL_STOP.set()
+
+
+def stop_requested() -> bool:
+    """True when an external stop has been requested for the current run."""
+    return _EXTERNAL_STOP.is_set()
+
+
 class VisionSystemicFailure(Exception):
     """Raised by _enrich_with_vision when EVERY Vision page call failed AND the
     failed pages were ones whose content depended on Vision (scanned/garbled).
@@ -1730,6 +1753,11 @@ def _enrich_embedded_images(
     parallel = get_nested(config, "performance.parallel_files", 4)
 
     def _read_figure(img: dict) -> tuple[dict, str | None, Exception | None]:
+        # External stop: not-yet-started figure reads bail out instantly
+        # (asset + marker are already written, only the transcription is
+        # skipped — same degrade as a failed figure, minus the warning).
+        if _EXTERNAL_STOP.is_set():
+            return img, None, None
         try:
             return img, describe_embedded_image_cached(
                 image_path=img["path"],
@@ -2164,6 +2192,11 @@ def _enrich_with_vision(
 
         def _run_one_batch(batch_idx: int) -> tuple[int, str | None, str | None]:
             """Returns (batch_idx, result_text, error_msg). error_msg None on success."""
+            # External stop: skip batches that haven't started (their sheets
+            # keep the openpyxl/Docling render; the batched path's own
+            # fallback already tolerates missing batch results).
+            if _EXTERNAL_STOP.is_set():
+                return batch_idx, None, "stopped by user"
             start = batch_idx * max_batch
             end = min(start + max_batch, n_total)
             batch_imgs = all_image_paths[start:end]
@@ -2326,6 +2359,12 @@ def _enrich_with_vision(
 
         def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
             from .utils.timeout import run_with_timeout
+            # External stop: pages whose worker hasn't started yet bail out
+            # instantly (the page keeps its Docling text); only the few calls
+            # already in flight run to completion. This is what lets a stop
+            # land in seconds on a 90-page file instead of minutes.
+            if _EXTERNAL_STOP.is_set():
+                return idx, None
             try:
                 # page_data.page_no is 1-based and matches the hook's
                 # convention for populating structured_extractions_per_page.
@@ -2507,6 +2546,13 @@ def _enrich_with_vision(
     #                    count, so a clean text PDF whose Vision happens to fail
     #                    stays successful.
     # ------------------------------------------------------------------
+    # External stop exemption: a user stop makes every not-yet-started page
+    # "fail" by design — that is an interrupt, not a systemic API failure.
+    # Without this, stopping a scanned document would raise a bogus
+    # VisionSystemicFailure on top of the stop.
+    if _EXTERNAL_STOP.is_set():
+        failed_page_texts = []
+
     sysf_cfg = get_nested(config, "parsing.vision.systemic_failure", {}) or {}
     if not isinstance(sysf_cfg, dict):
         sysf_cfg = {}
@@ -3691,6 +3737,9 @@ def run_pipeline(
     """
     t_start = time.monotonic()
 
+    # A stop requested for a PREVIOUS run must not kill this one.
+    _EXTERNAL_STOP.clear()
+
     # Resolve output directory
     output_dir = Path(get_nested(config, "output.dir", "./knowledge"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3983,7 +4032,9 @@ def run_pipeline(
 
     try:
         for _idx, (file_path, prior_meta, cache_reason) in enumerate(to_process):
-            if _stop_requested["flag"]:
+            # Two stop sources, same semantics: SIGINT (CLI) or request_stop()
+            # (GUI / library host on a worker thread).
+            if _stop_requested["flag"] or _EXTERNAL_STOP.is_set():
                 remaining_paths = [t[0] for t in to_process[_idx:]]
                 _pipeline_logger.warning(
                     f"Stopping early due to interrupt; "

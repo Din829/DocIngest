@@ -90,6 +90,14 @@
   color: var(--ink-2);
 }
 
+/* Unsupported-format note under the dropzone (filled by __onFilesRejected;
+   listed, never silently dropped). */
+.file-reject-note {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  color: var(--alert);
+}
+
 /* UrlInput (pen: padding [$sp-3,$sp-4], radius 10, panel fill). The URL text
    is a static hint in the pen (announces the capability), not a live field. */
 .url-input {
@@ -946,6 +954,13 @@
 }
 .ct-label { font-size: 13px; font-weight: 600; color: var(--ink); }
 .ct-value { font-size: 18px; font-weight: 600; color: var(--ink); }
+
+/* Cache hint under the cost total — the figure is a cache-cold upper bound */
+.ct-hint {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--ink-3);
+}
 
 /* Over-budget notice (pen WarnNote: alert color, icon + text) */
 .warn-note { width: 100%; }

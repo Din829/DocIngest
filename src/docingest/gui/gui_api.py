@@ -41,18 +41,31 @@ class Api:
         """Pre-flight: {files, totals, run_violations} for the cost dialog."""
         return gui_logic.inspect_paths(list(paths))
 
-    def pick_files(self) -> list[str]:
-        """Open the native multi-select file dialog and return chosen paths
-        (empty list on cancel). pywebview 6.x uses webview.FileDialog.OPEN;
-        the dialog returns a tuple of paths or None."""
+    def pick_files(self) -> dict[str, list[str]]:
+        """Open the native multi-select file dialog and return
+        ``{"accepted": [...], "rejected": [...]}`` (both empty on cancel).
+        pywebview 6.x uses webview.FileDialog.OPEN; the dialog returns a
+        tuple of paths or None.
+
+        Only processable formats are offered (file_types from the core's own
+        extension catalog), with a Python-side split as backstop — the
+        Windows dialog accepts hand-typed ``*.*`` patterns. Rejected picks
+        ride the return value (NOT an evaluate_js push): the frontend must
+        add accepted files BEFORE showing the rejection note, because adding
+        clears the note — a push would render first and be wiped."""
         import webview
 
         if self._window is None:
-            return []
+            return {"accepted": [], "rejected": []}
+        patterns = ";".join(f"*{e}" for e in gui_logic.supported_extensions())
         result = self._window.create_file_dialog(
-            webview.FileDialog.OPEN, allow_multiple=True
+            webview.FileDialog.OPEN,
+            allow_multiple=True,
+            file_types=(f"対応フォーマット ({patterns})",),
         )
-        return list(result) if result else []
+        if not result:
+            return {"accepted": [], "rejected": []}
+        return gui_logic.split_supported(list(result))
 
     def list_libraries(self) -> list[dict[str, Any]]:
         return gui_logic.list_libraries()
@@ -170,6 +183,16 @@ class Api:
 
         threading.Thread(target=_worker, daemon=True).start()
         return {"started": True}
+
+    def stop_ingest(self) -> dict[str, Any]:
+        """Request a graceful stop of the running ingest (thread-safe, returns
+        immediately). The pipeline finishes in-flight Vision calls, skips
+        everything not yet started, writes aggregate outputs for completed
+        files, and then __onIngestDone fires with summary.interrupted=True —
+        the frontend keeps its normal completion flow."""
+        from ..pipeline import request_stop
+        request_stop()
+        return {"stopping": True}
 
     def doctor(self) -> dict[str, Any]:
         return gui_logic.doctor()

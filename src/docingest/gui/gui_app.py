@@ -9,6 +9,7 @@ Run:  python -m docingest.gui
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -35,9 +36,21 @@ def _install_drop_handler(window: Any) -> None:
         try:
             files = (event.get("dataTransfer") or {}).get("files") or []
             paths = [f.get("pywebviewFullPath") for f in files if f.get("pywebviewFullPath")]
-            if paths:
+            if not paths:
+                return
+            # Format gate: only processable files join the selection;
+            # directories pass through (expanded recursively later). Push
+            # accepted FIRST — addInputs clears the rejection note, so the
+            # reverse order would wipe the note we are about to show.
+            from . import gui_logic
+            split = gui_logic.split_supported(paths)
+            if split["accepted"]:
                 window.evaluate_js(
-                    f"window.__onFilesDropped({json.dumps(paths, ensure_ascii=False)})"
+                    f"window.__onFilesDropped({json.dumps(split['accepted'], ensure_ascii=False)})"
+                )
+            if split["rejected"]:
+                window.evaluate_js(
+                    f"window.__onFilesRejected({json.dumps(split['rejected'], ensure_ascii=False)})"
                 )
         except Exception:
             pass  # drop is best-effort; never crash the UI
@@ -64,9 +77,25 @@ def main() -> None:
     # ._sync_api_keys_to_environ).
     try:
         from dotenv import load_dotenv
+        # Packaged exe: a .env placed NEXT TO DocIngest.exe is the supported
+        # way to configure API keys without the GUI settings screen. dotenv's
+        # own frozen fallback uses cwd, which matches the exe dir on a plain
+        # double-click but drifts when launched via a shortcut / another tool
+        # — so resolve the exe-side path explicitly first. load_dotenv() then
+        # still runs for the cwd/.env dev behaviour (it never overrides vars
+        # the first call already set).
+        if getattr(sys, "frozen", False):
+            load_dotenv(Path(sys.executable).parent / ".env")
         load_dotenv()
     except ImportError:
         pass
+    # Bundled binaries / models (packaged exe): point SOFFICE_PATH / FFMPEG_PATH
+    # / FFPROBE_PATH / DOCLING_ARTIFACTS_PATH at what ships inside the bundle.
+    # Same call the CLI and MCP entry points make — the GUI needs it too or a
+    # packaged GUI silently loses LibreOffice / ffmpeg / offline models. After
+    # load_dotenv (a .env-supplied path wins); no-op when running from source.
+    from ..utils.bundled_binaries import ensure_bundled_binaries
+    ensure_bundled_binaries()
     from . import gui_logic
     gui_logic.hydrate_environ_from_settings()
 
@@ -82,7 +111,27 @@ def main() -> None:
     )
     api.bind_window(window)
     _install_drop_handler(window)
-    webview.start()
+    try:
+        webview.start()
+    except Exception as e:
+        # On Windows the most likely startup failure is a missing Edge
+        # WebView2 Runtime (rare — Win10/11 normally ship it, but stripped
+        # enterprise images exist). A console traceback is invisible in a
+        # windowed (console=False) exe, so surface a native message box with
+        # the actionable fix. Other platforms / causes: re-raise as before.
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "ウィンドウエンジンを起動できませんでした。\n\n"
+                "多くの場合 Microsoft Edge WebView2 Runtime が未インストール"
+                "であることが原因です。以下からインストールして再起動して"
+                "ください：\nhttps://developer.microsoft.com/microsoft-edge/webview2/\n\n"
+                f"詳細: {e}",
+                "DocIngest — 起動エラー",
+                0x10,  # MB_ICONERROR
+            )
+        raise
 
 
 if __name__ == "__main__":
