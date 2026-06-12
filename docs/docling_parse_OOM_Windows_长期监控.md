@@ -332,6 +332,26 @@ errors.json: {"error":"Parse timed out: timed out after 300s","error_type":"time
 - **判断**：分批兜底已让问题不阻塞使用，这条**不紧急**。**不再是"越早删越干净"**——主动分批
   和被动兜底都已升级为长期架构（待办 6），IBM 修好后只是调阈值，不是删代码。
 
+**【2026-06-12 定期检查记录】未修复；"换 threaded backend"线索已实测否决**
+
+- **上游状态**：issue #227 已于 **6-01 被官方关闭**（completed）——但这是基于 @ed197676
+  一句"升 2.96 后好了"关的，随后 @simonschoe（6-05，2.96.1 仍复现）、@AldrigGittan（6-07）
+  反驳问题仍在。维护者 6-12 被催后承诺"两周内回复"（注意：承诺的是回复，不是修复；此前
+  5-21"本周末出"已跳票过）。**教训：issue closed ≠ 修好，监控别只看状态。**
+  PyPI 无新版（docling-parse 仍 6.2.0，5-28 发布）。
+- **threaded backend 线索（来自 @simonschoe 6-08）实测否决**：他称显式用
+  `ThreadedDoclingParseDocumentBackend` 不复现 bad_alloc。本机实测（docling 2.96.1，
+  WEO PDF 75 页，关 ocr/页图，子进程隔离 + 4GB RSS 熔断）：
+  - threaded 默认 options → **PARTIAL_SUCCESS**，仅 ~44/75 页，RSS 峰值 2.55GB，92s
+  - threaded + `release_native_memory_every_n_pages=16`（PR#274 修剪开关激进档，
+    默认 128 在 75 页内不触发）→ **同样 PARTIAL_SUCCESS**，~44/75 页，无改善
+  - **结论：换 backend 不能替代分批绕过。三层防护维持原样，`above_pages=50` 不动。**
+    丢页量级与默认 backend 的间歇崩同病（RSS ~2.5GB 量级也吻合），他复现不了多半是
+    文件/流程差异，不是 backend 真免疫。
+- **测试安全教训**：默认 backend 的 75 页复现测试会把进程内存吃到拖垮整机（MemoryError
+  型症状），跑复现测试**必须**子进程隔离 + RSS 熔断，别裸跑。
+- **下次复查**：6 月底（PeterStaar 承诺期之后），看 #227 的回复 + 有无新 release。
+
 ### 待办 5【2026-06-07 ✅ 已实现：大文件主动分批（= 待办6 的第2层）】
 
 > **状态翻转**：本条 2026-06-07 上午一度"决定暂不实现"，当天下午**用户拍板实现**，
