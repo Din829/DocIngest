@@ -584,6 +584,22 @@ parsing:
       # pictures (logos) deliberately don't count as a signal. Any signal,
       # or a failed scan → full current behaviour. false = always render+send.
       skip_text_only: true
+      # Per-page ground-truth slicing (docx variant of the xlsx switch).
+      # The supplement page pass needs an "already captured" reference per
+      # call; the full markdown repeated per page is the dominant input-token
+      # share (measured: 92 pages x ~102k tokens = 9.4M on one thesis). docx
+      # has no sheet map, but the SAME LibreOffice render that produced the
+      # page images produced a PDF whose text layer is the page→content map:
+      # each call gets its own page's text + that page's embedded-figure
+      # transcriptions (anchored via the nearest body line above each image
+      # marker; ambiguous anchors join no page). A/B verified: re-runs of an
+      # already-captured table page answer "(no additional visual content)",
+      # and the correction-style supplement (fixing [unreadable] in figure
+      # transcriptions) survives. Any failure (no pymupdf, render failed)
+      # falls back to the full markdown per page — the pre-slicing
+      # behaviour. Scanned pages have an empty text layer; an empty ground
+      # truth correctly triggers the full-transcription escape.
+      ground_truth_slice: true
       # max_response_tokens: 32768
       # image_dpi: 200
       # model: { provider: ..., model: ... }

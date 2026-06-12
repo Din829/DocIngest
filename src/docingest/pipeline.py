@@ -1003,6 +1003,30 @@ def _generate_page_images_via_libreoffice(
                     if sheet_map:
                         parse_result.metadata["xlsx_sheet_page_map"] = sheet_map
 
+            # Step 1.5b: Word-only — extract each PDF page's text layer.
+            # LibreOffice already decided the pagination, so the text layer
+            # IS the page→content map docx otherwise lacks (its body text is
+            # flow, not paged — §9.4). Consumed downstream as the per-page
+            # Vision ground truth (sliced "already captured" reference) and
+            # for anchoring embedded figures to pages. Same pattern as the
+            # xlsx sheet map above: cheap (one pymupdf open, no rendering),
+            # any failure leaves the metadata absent and downstream falls
+            # back to the full-markdown ground truth (pre-slicing behaviour).
+            if format_label == "Word":
+                try:
+                    import fitz  # type: ignore[import-not-found]
+                    with fitz.open(str(pdf_files[0])) as _pdf:
+                        page_texts = {
+                            i + 1: _pdf[i].get_text() for i in range(len(_pdf))
+                        }
+                    if page_texts:
+                        parse_result.metadata["docx_page_texts"] = page_texts
+                except Exception as e:
+                    _pipeline_logger.debug(
+                        f"docx page-text extraction skipped ({e}) — per-page "
+                        f"ground truth falls back to the full markdown"
+                    )
+
             # Step 2: PDF → page images
             # Resolve target DPI from config (unified across all render paths)
             image_dpi = get_nested(config, "parsing.vision.image_dpi", 180)
@@ -1746,6 +1770,126 @@ def _xlsx_per_page_ground_truth(
     return out
 
 
+def _gt_norm(s: str) -> str:
+    """NFKC + whitespace-stripped normalisation for ground-truth text matching
+    (PDF text layer line-wraps and markdown decoration must not break it)."""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", s)
+    return re.sub(r"\s+", "", s)
+
+
+def _docx_per_page_ground_truth(
+    markdown: str,
+    page_texts: dict[int, str] | None,
+    page_nos: list[int],
+) -> dict[int, str]:
+    """Per-page ground-truth slices for docx: PDF page text + that page's
+    already-transcribed embedded figures.
+
+    docx has no sheet→page map, but the LibreOffice render that produced the
+    page images also produced a PDF whose text layer IS the page→content map
+    (extracted in Step 1.5b as ``docx_page_texts``). Two parts per page:
+
+    - The page's own PDF text — what the body extraction already captured,
+      so the supplement prompt knows not to re-transcribe body text.
+      Measured: ~0.8k tokens/page vs ~102k for the full markdown (A/B
+      verified: a page whose table was already captured answered "(no
+      additional visual content)" instead of re-transcribing it).
+    - The page's embedded-figure transcriptions — without them Vision
+      re-transcribes figures it can SEE on the page image but that were
+      already read at full resolution (A/B verified both ways: present →
+      correction-style supplement preserved; absent → re-transcription).
+      Figures are attributed to pages by anchoring: the nearest body line
+      above each ``<!-- image: f -->`` marker, located in exactly ONE
+      page's text (measured 63/71 unique on a 92-page thesis). A figure
+      whose anchor is ambiguous or missing joins NO page — worst case it
+      is re-transcribed by its page's call (content never lost), same
+      fail-open posture as the xlsx slicer.
+
+    Returns {} when page texts are absent (LibreOffice/pymupdf failed, or
+    not a docx) — caller falls back to the full markdown, the pre-slicing
+    behaviour. An empty string for a page is meaningful, not a failure:
+    a scanned page has no text layer, and an empty ground truth correctly
+    triggers the supplement prompt's full-transcription escape."""
+    if not (isinstance(page_texts, dict) and page_texts):
+        return {}
+    norm_pages = {p: _gt_norm(t) for p, t in page_texts.items()}
+
+    lines = markdown.split("\n")
+
+    def _anchor_page(i: int, direction: int) -> int | None:
+        """Nearest body line above (direction=-1) / below (+1) the marker
+        that is long enough to anchor, located in exactly ONE page's text.
+        Below catches the figure-caption convention (図N.N right under the
+        image) when the text above is another marker or a short heading."""
+        rng = (
+            range(i - 1, max(-1, i - 16), -1) if direction < 0
+            else range(i + 1, min(len(lines), i + 16))
+        )
+        for j in rng:
+            if lines[j].lstrip().startswith("<!--"):
+                continue
+            cand = _gt_norm(re.sub(r"[*_`#>|]", "", lines[j]))
+            if len(cand) < 20:
+                continue
+            anchor = cand[-30:] if direction < 0 else cand[:30]
+            hits = [p for p, pn in norm_pages.items() if anchor in pn]
+            return hits[0] if len(hits) == 1 else None
+        return None
+
+    # 1) Anchor each image marker to a page (above first, caption below as
+    #    fallback — measured 63/71 → 65/71 unique on a 92-page thesis).
+    fig_page: dict[str, int] = {}
+    for i, line in enumerate(lines):
+        m = re.search(r"<!-- image: (.+?) -->", line)
+        if not m:
+            continue
+        page = _anchor_page(i, -1)
+        if page is None:
+            page = _anchor_page(i, +1)
+        if page is not None:
+            fig_page[m.group(1)] = page
+
+    # 2) Collect each figure's transcription block (marker line up to the
+    #    next comment marker).
+    fig_block: dict[str, str] = {}
+    cur_name: str | None = None
+    cur_buf: list[str] = []
+    for line in lines:
+        m = re.search(r"<!-- vision-enriched image=(.+?) -->", line)
+        if m:
+            if cur_name is not None:
+                fig_block[cur_name] = "\n".join(cur_buf).strip()
+            cur_name, cur_buf = m.group(1), []
+            continue
+        if cur_name is not None:
+            if line.lstrip().startswith("<!--"):
+                fig_block[cur_name] = "\n".join(cur_buf).strip()
+                cur_name, cur_buf = None, []
+            else:
+                cur_buf.append(line)
+    if cur_name is not None:
+        fig_block[cur_name] = "\n".join(cur_buf).strip()
+
+    # 3) Assemble per-page ground truth.
+    out: dict[int, str] = {}
+    for p in page_nos:
+        if p not in page_texts:
+            continue
+        gt = page_texts[p].strip()
+        figs = [
+            fig_block[f] for f, pg in fig_page.items()
+            if pg == p and fig_block.get(f)
+        ]
+        if figs:
+            gt += (
+                "\n\n[Embedded figures on this page, already transcribed]:\n\n"
+                + "\n\n".join(figs)
+            )
+        out[p] = gt
+    return out
+
+
 def _inject_after_marker(markdown: str, filename: str, block: str) -> str:
     """Insert ``block`` on its own lines after the `<!-- image: file -->` marker.
 
@@ -2447,16 +2591,29 @@ def _enrich_with_vision(
         # (the pre-slicing behaviour). Same config switch as batched —
         # batched/per-page is an implementation detail, not a user concern.
         _pp_gt_by_page: dict[int, str] = {}
-        if _pp_ground is not None and get_nested(
-            config, "parsing.xlsx.vision.ground_truth_slice", True
-        ):
-            _pp_gt_by_page = _xlsx_per_page_ground_truth(
-                _pp_ground,
-                parse_result.metadata.get("xlsx_visible_sheet_names"),
-                parse_result.metadata.get("xlsx_sheet_page_map"),
-                [pd.page_no for _, pd in vision_tasks],
-                len(parse_result.pages),
-            )
+        if _pp_ground is not None:
+            if get_nested(
+                config, "parsing.xlsx.vision.ground_truth_slice", True
+            ):
+                _pp_gt_by_page = _xlsx_per_page_ground_truth(
+                    _pp_ground,
+                    parse_result.metadata.get("xlsx_visible_sheet_names"),
+                    parse_result.metadata.get("xlsx_sheet_page_map"),
+                    [pd.page_no for _, pd in vision_tasks],
+                    len(parse_result.pages),
+                )
+            # docx variant: slices via the LibreOffice PDF text layer
+            # (Step 1.5b) instead of a sheet map. Detection-ordered, not
+            # format-branched: xlsx has no docx_page_texts and docx has no
+            # sheet map, so exactly one (or neither) arms.
+            if not _pp_gt_by_page and get_nested(
+                config, "parsing.docx.vision.ground_truth_slice", True
+            ):
+                _pp_gt_by_page = _docx_per_page_ground_truth(
+                    _pp_ground,
+                    parse_result.metadata.get("docx_page_texts"),
+                    [pd.page_no for _, pd in vision_tasks],
+                )
             if _pp_gt_by_page:
                 logger.debug(
                     f"per-page ground truth sliced for "
@@ -3476,6 +3633,11 @@ def process_single_file(
             "xlsx_sheet_page_map",
             "xlsx_visible_sheet_names",
             "xlsx_visible_sheet_count",
+            # Word counterpart of the xlsx map above: full PDF text layer
+            # keyed by page number (~100 KB on a 92-page thesis), consumed
+            # only by the per-page Vision ground-truth slicing during the
+            # run. Zero retrieval value per chunk.
+            "docx_page_texts",
         })
         parse_meta_for_chunks = {
             k: v for k, v in parse_result.metadata.items()
