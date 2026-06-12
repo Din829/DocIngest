@@ -625,11 +625,19 @@ parsing:
       vision_enrich: true        # send above-threshold pictures to Vision at full
                                  # resolution (the fix for shrunk-figure [unreadable]).
                                  # false = extract + mark only, zero extra API cost.
-      max_images_vision: 30      # per-file cap on embedded-image Vision calls. On
-                                 # trip: warn + skip the rest (NOT silent) — the
-                                 # extracted assets and markers are still written, so
-                                 # nothing is lost, only the extra Vision read is
-                                 # deferred. Raise for figure-dense docs.
+      max_images_vision: null    # null (default) = no per-file cap on embedded-image
+                                 # Vision calls. Cost control belongs to `safety:`
+                                 # (pre-flight, user-approved) — inspect counts the
+                                 # embedded media, the estimate prices every read, and
+                                 # a figure-dense doc trips the strict gate for the
+                                 # user to decide. The old 30-cap was the same silent
+                                 # post-hoc truncation removed from max_page_images
+                                 # above: it skipped 41/71 figures of a real thesis
+                                 # unannounced (the page pass happened to re-read them
+                                 # at lower resolution — coverage by accident, not
+                                 # design). Set an int only when a workload genuinely
+                                 # needs a tighter local limit; on trip: warn + skip
+                                 # the rest, assets and markers still written.
 
   # ZIP archive expansion
   # Users often hand DocIngest a .zip full of mixed documents. When this
@@ -1422,14 +1430,18 @@ safety:
   # Per-Vision-call token estimate — the PRIMARY cost model. est_cost_usd =
   # calls × these tokens priced via litellm's bundled price table for the
   # configured vision model (switching models reprices automatically).
-  # Calibrated on a real run (92-page Japanese thesis docx, 2026-06-11):
-  # 122 calls averaged 42K input / 2.9K output tokens each — input is
-  # dominated by the page image plus the full-page text context the prompt
-  # carries. The estimate is a CACHE-COLD UPPER BOUND: re-runs hit the
-  # content-hash cache and cost less; provider-side prompt-cache discounts
-  # are likewise ignored (the safety gate must over- not under-estimate).
+  # Calibrated on a real run (92-page Japanese thesis docx, 2026-06-12,
+  # AFTER ground-truth slicing landed): 92 cache-cold calls averaged 2.9K
+  # input / 3.1K output tokens each — input is the page image plus the
+  # SLICED per-page ground truth (the pre-slicing whole-book context that
+  # once pushed this to 42K/call is gone; see parsing.<fmt>.vision.
+  # ground_truth_slice). 8000 keeps a ~2.7x margin as the CACHE-COLD UPPER
+  # BOUND: slicing falls back to the full markdown on attribution doubt,
+  # re-runs hit the content-hash cache and cost less, and provider-side
+  # prompt-cache discounts are ignored (the safety gate must over- not
+  # under-estimate).
   est_tokens_per_vision_call:
-    input: 40000
+    input: 8000
     output: 3000
 
   # LEGACY FALLBACK per-call price table in USD — used only when litellm's

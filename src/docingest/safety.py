@@ -104,9 +104,12 @@ def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> floa
     # inspect for docx; absent for other formats.
     media = int(info.get("media_files") or 0)
     if media and get_nested(config, "parsing.docx.image_extraction.vision_enrich", True):
-        img_cap = int(get_nested(
-            config, "parsing.docx.image_extraction.max_images_vision", 30
-        ))
+        # null cap (default) = every figure is read, so every figure is
+        # priced — the estimate is the cost control, not the cap.
+        img_cap_raw = get_nested(
+            config, "parsing.docx.image_extraction.max_images_vision", None
+        )
+        img_cap = int(img_cap_raw) if img_cap_raw is not None else media
         vision_calls += min(media, img_cap)
 
     return vision_calls * _price_per_vision_call(config)

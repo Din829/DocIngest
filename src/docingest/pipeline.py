@@ -1958,7 +1958,11 @@ def _enrich_embedded_images(
         return
 
     cap_key = f"parsing.{(doc_format or '').lower()}.image_extraction.max_images_vision"
-    max_n = int(get_nested(config, cap_key, 30))
+    # null (default) = read every qualifying figure; cost control lives in
+    # the Phase-0 safety estimate, which prices the full count (same
+    # anti-truncation stance as max_page_images / vision.max_pages).
+    cap_raw = get_nested(config, cap_key, None)
+    max_n = int(cap_raw) if cap_raw is not None else len(to_send)
     if len(to_send) > max_n:
         logger.warning(
             f"Embedded-image Vision: {len(to_send)} figure(s) qualify but cap is "
