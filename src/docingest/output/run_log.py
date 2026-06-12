@@ -321,7 +321,12 @@ def _format_llm_summary(token_usage: dict) -> str:
         return ""
     total = token_usage.get("total_tokens", 0)
     call_word = "call" if calls == 1 else "calls"
-    return f"LLM: {calls} {call_word} / {total:,} tok"
+    line = f"LLM: {calls} {call_word} / {total:,} tok"
+    # Non-zero detail buckets only — the common case stays byte-identical.
+    audio_sec = token_usage.get("total_audio_seconds", 0)
+    if audio_sec:
+        line += f" / {audio_sec:,.0f}s audio"
+    return line
 
 
 def _format_vision_triage(vt: dict) -> str:

@@ -117,6 +117,19 @@ class OpenAIEmbedding(EmbeddingProvider):
             model=self.model,
             input=texts,
         )
+
+        # Embedding tokens are a real (if small) spend the run report
+        # otherwise misses — record verbatim from the response (OpenAI's
+        # embeddings API reliably reports usage; if it ever doesn't, the
+        # call itself is still an exact fact worth a ledger line).
+        from ..models.token_tracker import token_tracker
+        usage = getattr(resp, "usage", None)
+        token_tracker.record(
+            model=f"openai/{self.model}",
+            prompt=getattr(usage, "prompt_tokens", 0) or 0,
+            total_reported=getattr(usage, "total_tokens", 0) or 0,
+        )
+
         return np.array([item.embedding for item in resp.data], dtype=np.float32)
 
 
@@ -182,6 +195,18 @@ class GeminiEmbedding(EmbeddingProvider):
                 f"google-genai embed_content returned no embeddings for "
                 f"{len(texts)} input(s); response={response!r}"
             )
+
+        # Probed live (2026-06-12): the google-genai SDK's
+        # EmbedContentResponse carries NO usage fields on the API-key
+        # channel — top level is just embeddings/metadata, and both
+        # metadata and per-embedding statistics come back None (the REST
+        # docs' usageMetadata is only populated for Vertex callers). With
+        # no reported figure there is nothing accurate to record, so we
+        # record the CALL itself (an exact fact) with zero tokens — the
+        # ledger shows "N embedding calls, unmetered" instead of nothing.
+        from ..models.token_tracker import token_tracker
+        token_tracker.record(model=f"gemini/{model_name}")
+
         return np.array([emb.values for emb in embeddings], dtype=np.float32)
 
 

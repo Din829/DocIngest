@@ -540,12 +540,25 @@ def _print_results(result) -> None:
         completion = usage.get("total_completion_tokens", 0)
         calls = usage.get("total_calls", 0)
         hits = usage.get("total_cache_hits", 0)
+        # Detail buckets — shown only when non-zero so the common case
+        # prints exactly what it always did.
+        reasoning = usage.get("total_reasoning_tokens", 0)
+        cached = usage.get("total_cached_prompt_tokens", 0)
+        audio_sec = usage.get("total_audio_seconds", 0)
+        details = []
+        if reasoning:
+            details.append(f"incl. {reasoning:,} thinking")
+        if cached:
+            details.append(f"{cached:,} prompt-cached")
+        if audio_sec:
+            details.append(f"{audio_sec:,.0f}s audio")
         console.print(
             f"\n[bold]LLM usage:[/bold] "
             f"{total:,} tokens "
             f"([dim]{prompt:,} in + {completion:,} out[/dim])"
             f" — {calls} API call{'s' if calls != 1 else ''}"
             + (f", {hits} cache hit{'s' if hits != 1 else ''}" if hits else "")
+            + (f" [dim]({'; '.join(details)})[/dim]" if details else "")
         )
 
     console.print()

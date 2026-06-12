@@ -112,14 +112,26 @@ def _extract_finish_reason(response) -> str:
 
 
 def _record_usage(response, model_name: str) -> None:
-    """Extract usage from litellm response and record to tracker."""
+    """Extract usage from a litellm response and record it VERBATIM.
+
+    Field semantics probed live (2026-06-12, gemini-3-flash-preview):
+    litellm's completion_tokens already INCLUDES reasoning (measured
+    854 = 442 reasoning + 412 text), and total_tokens = prompt +
+    completion. So the detail fields below are breakdowns, not additions —
+    we store them as reported and never derive or correct anything."""
     usage = getattr(response, "usage", None)
-    if usage is not None:
-        token_tracker.record(
-            model=model_name,
-            prompt=getattr(usage, "prompt_tokens", 0) or 0,
-            completion=getattr(usage, "completion_tokens", 0) or 0,
-        )
+    if usage is None:
+        return
+    ctd = getattr(usage, "completion_tokens_details", None)
+    ptd = getattr(usage, "prompt_tokens_details", None)
+    token_tracker.record(
+        model=model_name,
+        prompt=getattr(usage, "prompt_tokens", 0) or 0,
+        completion=getattr(usage, "completion_tokens", 0) or 0,
+        reasoning=getattr(ctd, "reasoning_tokens", 0) or 0,
+        cached_prompt=getattr(ptd, "cached_tokens", 0) or 0,
+        total_reported=getattr(usage, "total_tokens", 0) or 0,
+    )
 
 
 def _resolve_model_name(provider: str, model: str) -> str:
@@ -655,12 +667,22 @@ def _describe_video_gemini(
         )
 
         # Record usage so the run's token report includes native-video cost.
+        # Native usage_metadata splits thinking OUT of candidates (probed
+        # live: total = prompt + candidates + thoughts), unlike litellm
+        # whose completion already includes it — fold thoughts back into
+        # completion here so both paths report the same semantics, and keep
+        # the reasoning breakdown.
         um = getattr(response, "usage_metadata", None)
         if um is not None:
+            _thoughts = getattr(um, "thoughts_token_count", 0) or 0
             token_tracker.record(
                 model=f"gemini/{model}",
                 prompt=getattr(um, "prompt_token_count", 0) or 0,
-                completion=getattr(um, "candidates_token_count", 0) or 0,
+                completion=(getattr(um, "candidates_token_count", 0) or 0)
+                + _thoughts,
+                reasoning=_thoughts,
+                cached_prompt=getattr(um, "cached_content_token_count", 0) or 0,
+                total_reported=getattr(um, "total_token_count", 0) or 0,
             )
 
         text = response.text or ""

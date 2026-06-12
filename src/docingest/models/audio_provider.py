@@ -173,6 +173,29 @@ def _transcribe_dashscope(
                 f"DashScope API error: {response.code} - {response.message}"
             )
 
+        # Record usage verbatim (ASR bills on BOTH tokens and audio seconds
+        # — dashscope reports `usage.seconds` alongside the token counts;
+        # the usage object may be dict- or attr-style depending on SDK
+        # version, so read defensively: this is an external API boundary).
+        from .token_tracker import token_tracker
+
+        def _uget(obj: Any, key: str) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        usage = _uget(response, "usage")
+        if usage is not None:
+            token_tracker.record(
+                model=f"dashscope/{model}",
+                prompt=int(_uget(usage, "input_tokens") or 0),
+                completion=int(_uget(usage, "output_tokens") or 0),
+                total_reported=int(_uget(usage, "total_tokens") or 0),
+                audio_seconds=float(_uget(usage, "seconds") or 0),
+            )
+
         # Extract text from response
         message = response.output.choices[0].message
         text = message.content[0]["text"]
@@ -232,6 +255,16 @@ def _transcribe_litellm(
 
         # litellm returns an OpenAI-compatible TranscriptionResponse
         text = response.text if hasattr(response, "text") else str(response)
+
+        # Whisper-class APIs bill per minute, not per token — record the
+        # call with its audio duration when the response carries one
+        # (verbose_json formats do; plain json reports none → 0, the call
+        # count still lands in the ledger).
+        from .token_tracker import token_tracker
+        token_tracker.record(
+            model=f"{provider}/{model}",
+            audio_seconds=float(getattr(response, "duration", 0) or 0),
+        )
 
         # litellm doesn't return segments by default (need response_format=verbose_json)
         # Keep it simple for now — no segments.
