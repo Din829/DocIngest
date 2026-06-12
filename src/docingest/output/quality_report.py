@@ -31,6 +31,11 @@ from typing import Any
 # (case-insensitive) so all current and reasonable future variants match.
 _QUESTION_RE = re.compile(r"\[\?\]")
 _UNREADABLE_RE = re.compile(r"\[unreadable\b[^\]]*\]", re.IGNORECASE)
+# Pages whose Vision call failed outright (timeout / API error after retries).
+# The pipeline writes `<!-- vision-failed page=N -->` into the page's section
+# so the artefact records its own gaps — the page keeps its Docling text, only
+# the Vision enrichment is missing.
+_VISION_FAILED_RE = re.compile(r"<!-- vision-failed page=(\d+)[^>]*-->")
 
 
 def scan_file(md_path: Path) -> dict[str, Any]:
@@ -51,11 +56,13 @@ def scan_file(md_path: Path) -> dict[str, Any]:
             "error": f"read failed: {e}",
             "question_count": 0,
             "unreadable_count": 0,
+            "vision_failed_pages": [],
             "samples": [],
         }
 
     q_matches = _QUESTION_RE.findall(text)
     u_matches = _UNREADABLE_RE.findall(text)
+    vision_failed_pages = sorted({int(p) for p in _VISION_FAILED_RE.findall(text)})
 
     # Collect a few sample lines (context) for the first few markers
     samples: list[dict[str, Any]] = []
@@ -74,6 +81,7 @@ def scan_file(md_path: Path) -> dict[str, Any]:
         "file": str(md_path),
         "question_count": len(q_matches),
         "unreadable_count": len(u_matches),
+        "vision_failed_pages": vision_failed_pages,
         "samples": samples,
     }
 
@@ -120,13 +128,19 @@ def generate_report(
     files_with_issues: list[dict[str, Any]] = []
     total_questions = 0
     total_unreadable = 0
+    total_vision_failed = 0
 
     for md in md_files:
         result = scan_file(md)
         all_files.append(result)
         total_questions += result["question_count"]
         total_unreadable += result["unreadable_count"]
-        if result["question_count"] > 0 or result["unreadable_count"] > 0:
+        total_vision_failed += len(result["vision_failed_pages"])
+        if (
+            result["question_count"] > 0
+            or result["unreadable_count"] > 0
+            or result["vision_failed_pages"]
+        ):
             files_with_issues.append(result)
 
     # Quality score: simple heuristic based on markers per file.
@@ -147,6 +161,11 @@ def generate_report(
         "files_with_issues": len(files_with_issues),
         "total_questions": total_questions,
         "total_unreadable": total_unreadable,
+        # Pages whose Vision call failed outright (kept Docling text, no
+        # enrichment) — distinct from the marker counts above: those are
+        # honest "source is illegible" flags, this is "the call didn't run".
+        # Not folded into quality_score (a different failure dimension).
+        "total_vision_failed_pages": total_vision_failed,
         "quality_score": round(score, 3),
         # Inline disclaimer so anyone reading this JSON later (a human or an
         # agent) gets the same context the CLI prints at run time, without
@@ -190,13 +209,25 @@ def format_summary(report: dict[str, Any]) -> str:
     issues = report.get("files_with_issues", 0)
     q = report.get("total_questions", 0)
     u = report.get("total_unreadable", 0)
+    vf = report.get("total_vision_failed_pages", 0)
     score = report.get("quality_score", 1.0)
 
     if total == 0:
         return "No files scanned"
 
+    # Failed Vision pages are a call-level outage, not an honesty marker —
+    # always worth a line of their own when present.
+    vf_note = (
+        f"; {vf} page(s) failed Vision outright (kept text, no enrichment "
+        f"— see vision_failed_pages in quality_report.json)"
+        if vf else ""
+    )
+
     if q == 0 and u == 0:
-        return f"Quality: clean ({total} files, zero uncertainty markers)"
+        return (
+            f"Quality: clean ({total} files, zero uncertainty markers)"
+            f"{vf_note}"
+        )
 
     pct = issues * 100 // max(total, 1)
     return (
@@ -205,4 +236,5 @@ def format_summary(report: dict[str, Any]) -> str:
         f"(score: {score:.2f}; informational only — a marker count, not a "
         f"parse-failure signal: a low score is often the source itself being "
         f"unreadable, which Vision honestly flagged rather than guessing)"
+        f"{vf_note}"
     )

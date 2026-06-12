@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """Unit tests for _xlsx_batch_ground_truth_slice — the per-batch ground-truth
-slicer. Pure function: page→sheet attribution via anchored ranges, with a
-None (= caller sends full markdown) on every uncertainty path."""
+slicer — and _xlsx_per_page_ground_truth, its per-page wrapper. Pure
+functions: page→sheet attribution via anchored ranges, with a None / missing
+dict entry (= caller sends full markdown) on every uncertainty path."""
 
 from docingest.parsers.base import PAGEBREAK_MARKER
-from docingest.pipeline import _xlsx_batch_ground_truth_slice
+from docingest.pipeline import (
+    _xlsx_batch_ground_truth_slice,
+    _xlsx_per_page_ground_truth,
+)
 
 VIS = ["A", "B", "C"]
 SECS = ["secA", "secB", "secC"]
@@ -57,3 +61,38 @@ def test_non_monotonic_anchors_return_none():
 
 def test_empty_page_map_returns_none():
     assert _xlsx_batch_ground_truth_slice(SECS, VIS, {}, [1], 10) is None
+
+
+# --- _xlsx_per_page_ground_truth (per-page wrapper) ---
+
+# Bare-marker join so split() round-trips to SECS exactly; the real markdown
+# carries newlines around the marker, which ride along harmlessly.
+MD = PAGEBREAK_MARKER.join(SECS)
+
+
+def test_per_page_normal_slicing():
+    pm = {"A": 1, "B": 5, "C": 8}
+    out = _xlsx_per_page_ground_truth(MD, VIS, pm, [1, 5, 9], 10)
+    assert out == {1: "secA", 5: "secB", 9: "secC"}
+
+
+def test_per_page_doubt_drops_only_that_page():
+    # B unmapped: pages in A's apparent range are doubtful, C's are sound.
+    pm = {"A": 1, "C": 8}
+    out = _xlsx_per_page_ground_truth(MD, VIS, pm, [3, 9], 10)
+    assert out == {9: "secC"}
+
+
+def test_per_page_section_count_mismatch_returns_empty():
+    # A hook reshaped the markdown: 2 sections vs 3 visible sheets.
+    pm = {"A": 1, "B": 5, "C": 8}
+    out = _xlsx_per_page_ground_truth(f"secA{SEP}secB", VIS, pm, [1], 10)
+    assert out == {}
+
+
+def test_per_page_missing_metadata_returns_empty():
+    # docx case: no sheet metadata at all → caller keeps the full markdown.
+    pm = {"A": 1, "B": 5, "C": 8}
+    assert _xlsx_per_page_ground_truth(MD, None, pm, [1], 10) == {}
+    assert _xlsx_per_page_ground_truth(MD, VIS, None, [1], 10) == {}
+    assert _xlsx_per_page_ground_truth(MD, [], {}, [1], 10) == {}

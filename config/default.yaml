@@ -903,19 +903,22 @@ parsing:
       # Oracle-tested: skipped sheets' supplements were empty or pure
       # template furniture. false = always send everything.
       sheet_triage: true
-      # Batched ground-truth slicing: each ≤20-page batch gets only ITS
-      # sheets' text as the "already captured, don't re-transcribe"
-      # reference instead of the whole workbook (which repeated the full
-      # markdown once per batch — measured 5×192k chars on a 159-page
-      # workbook, the dominant input-token share; local simulation: 50%
-      # saved even with conservative fallbacks). Attribution reuses the
-      # sheet_triage anchored-range rule; ANY doubt (unmapped neighbour
-      # sheet, page outside anchors, section/sheet count mismatch) sends
-      # the full markdown for that batch. A wrong slice would not lose
-      # data — the prompt treats mismatched ground truth as a failed
-      # extraction and re-transcribes in full (the saving inverts, the
-      # content stays) — but the conservative fallbacks keep even that
-      # from happening. false = always send the full markdown per batch.
+      # Ground-truth slicing, BOTH Vision paths: each batched call (and
+      # each per-page call when the file doesn't qualify for batching)
+      # gets only ITS sheets' text as the "already captured, don't
+      # re-transcribe" reference instead of the whole workbook (which
+      # repeated the full markdown once per call — measured 5×192k chars
+      # batched on a 159-page workbook, and 16×~19k tokens per-page on a
+      # 28-sheet workbook; the dominant input-token share either way).
+      # Attribution reuses the sheet_triage anchored-range rule; ANY doubt
+      # (unmapped neighbour sheet, page outside anchors, section/sheet
+      # count mismatch) sends the full markdown for that call. A wrong
+      # slice would not lose data — the prompt treats mismatched ground
+      # truth as a failed extraction and re-transcribes in full (the
+      # saving inverts, the content stays) — but the conservative
+      # fallbacks keep even that from happening. Formats without a
+      # sheet→page map (docx) detect as unsliceable and keep the full
+      # markdown. false = always send the full markdown per call.
       ground_truth_slice: true
 
     # Embedded-image full-res Vision (same mechanism + keys as

@@ -1708,6 +1708,44 @@ def _xlsx_batch_ground_truth_slice(
     return f"\n{PAGEBREAK_MARKER}\n".join(sections[i] for i in sorted(covered))
 
 
+def _xlsx_per_page_ground_truth(
+    markdown: str,
+    visible: list[str] | None,
+    page_map: dict[str, int] | None,
+    page_nos: list[int],
+    total_pages: int,
+) -> dict[int, str]:
+    """Per-page ground-truth slices for the per-page Vision path.
+
+    The per-page supplement path feeds ``parse_result.markdown`` (the whole
+    workbook) to EVERY page call — N pages repeat the full markdown N times
+    (measured: 16 calls × ~19k tokens on a 28-sheet workbook where each
+    page's own sheet is ~0.7k). This mirrors the batched path's slicing with
+    identical attribution + fallback semantics: each page is attributed via
+    ``_xlsx_batch_ground_truth_slice`` as a single-page batch; any doubt for
+    a page leaves it OUT of the dict (the caller falls back to the full
+    markdown for that page). Returns ``{}`` when slicing can't arm at all
+    (missing metadata, section/sheet count mismatch — e.g. docx has no sheet
+    map, a hook reshaped the markdown) — caller behaviour is then byte-
+    identical to before this function existed."""
+    if not (
+        isinstance(visible, list) and visible
+        and isinstance(page_map, dict) and page_map
+    ):
+        return {}
+    sections = markdown.split(PAGEBREAK_MARKER)
+    if len(sections) != len(visible):
+        return {}
+    out: dict[int, str] = {}
+    for p in page_nos:
+        sliced = _xlsx_batch_ground_truth_slice(
+            sections, visible, page_map, [p], total_pages
+        )
+        if sliced is not None:
+            out[p] = sliced
+    return out
+
+
 def _inject_after_marker(markdown: str, filename: str, block: str) -> str:
     """Insert ``block`` on its own lines after the `<!-- image: file -->` marker.
 
@@ -2090,6 +2128,11 @@ def _enrich_with_vision(
     # actually cost content (scanned/garbled pages) or just a visual supplement.
     # Only populated on the failure path; success path never touches it.
     failed_page_texts: list[str] = []
+    # Section indexes of pages that FAILED Vision — each gets a
+    # `<!-- vision-failed page=N -->` marker written into the markdown at
+    # injection time, so the failure is auditable in the artefact itself
+    # (quality_report scans for it; nothing else changes for the page).
+    failed_idxs: list[int] = []
     # First real error string seen on any failed page — surfaced in the
     # systemic-failure message so the user sees "API key invalid" etc. rather
     # than just a count. A 1-element list so the nested _call_vision closure can
@@ -2397,6 +2440,28 @@ def _enrich_with_vision(
         from .parsers.vision import resolve_supplement_only
         _pp_supplement = resolve_supplement_only(config, doc_format)
         _pp_ground = parse_result.markdown if _pp_supplement else None
+        # Per-page ground-truth slicing — same cost fix as the batched path
+        # (each call gets its own sheet's text, not the whole workbook).
+        # Arms on detection, not format: docx has no sheet→page map, so the
+        # helper returns {} and every page falls back to the full markdown
+        # (the pre-slicing behaviour). Same config switch as batched —
+        # batched/per-page is an implementation detail, not a user concern.
+        _pp_gt_by_page: dict[int, str] = {}
+        if _pp_ground is not None and get_nested(
+            config, "parsing.xlsx.vision.ground_truth_slice", True
+        ):
+            _pp_gt_by_page = _xlsx_per_page_ground_truth(
+                _pp_ground,
+                parse_result.metadata.get("xlsx_visible_sheet_names"),
+                parse_result.metadata.get("xlsx_sheet_page_map"),
+                [pd.page_no for _, pd in vision_tasks],
+                len(parse_result.pages),
+            )
+            if _pp_gt_by_page:
+                logger.debug(
+                    f"per-page ground truth sliced for "
+                    f"{len(_pp_gt_by_page)}/{len(vision_tasks)} page(s)"
+                )
 
         def _call_vision(idx: int, page_data) -> tuple[int, str | None]:
             from .utils.timeout import run_with_timeout
@@ -2410,7 +2475,12 @@ def _enrich_with_vision(
                 # page_data.page_no is 1-based and matches the hook's
                 # convention for populating structured_extractions_per_page.
                 struct_data = structured_per_page.get(page_data.page_no)
-                pg_text = _pp_ground if _pp_ground is not None else page_data.text
+                _g = _pp_ground  # local rebind so the narrow holds inside the closure
+                pg_text = (
+                    _pp_gt_by_page.get(int(page_data.page_no), _g)
+                    if _g is not None
+                    else page_data.text
+                )
                 with _vision_permit():
                     return idx, run_with_timeout(
                         lambda: describe_page_cached(
@@ -2470,6 +2540,7 @@ def _enrich_with_vision(
                     # check. Does NOT alter the fallback — the page still keeps
                     # its Docling text as before; we only remember it failed.
                     failed_page_texts.append(_idx_to_text.get(idx, ""))
+                    failed_idxs.append(idx)
                 # Sub-progress: one page done (success or fail both count — the
                 # bar tracks Vision *completion*, not success rate).
                 _report_vision_progress(1)
@@ -2517,6 +2588,15 @@ def _enrich_with_vision(
                 f"If precise per-sheet attribution matters for your RAG, filter "
                 f"by the '(overflow)' marker in chunk text rather than title_path."
             )
+        # Failed pages: a machine-scannable marker in the page's own section
+        # (overflow indexes land in the last section, same rule as results).
+        # Same philosophy as [unreadable]: the artefact records its own gaps,
+        # quality_report stays a pure disk scanner.
+        for idx in sorted(failed_idxs):
+            sec = idx if idx < len(sections) else -1
+            sections[sec] = (
+                sections[sec].rstrip() + f"\n\n<!-- vision-failed page={idx + 1} -->\n"
+            )
         # Batched response (when batched mode succeeded): append to the
         # last section. The block already carries its own `(batched, pages=X-Y)`
         # marker so downstream consumers can identify and filter it.
@@ -2542,6 +2622,16 @@ def _enrich_with_vision(
                 + "\n\n"
                 + appended
                 + "\n"
+            )
+        if failed_idxs:
+            # Failed pages, Mode B: trailing markers in page order — same
+            # auditability as Mode A, same place the page results would land.
+            fail_lines = "\n".join(
+                f"<!-- vision-failed page={idx + 1} -->"
+                for idx in sorted(failed_idxs)
+            )
+            parse_result.markdown = (
+                parse_result.markdown.rstrip() + "\n\n" + fail_lines + "\n"
             )
 
     if cache_enabled:

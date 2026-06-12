@@ -159,6 +159,10 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.pptx.vision",                 # entire subtree, since model/dpi/
     "parsing.docx.vision",                 # max_tokens any change → re-run
     "parsing.xlsx.vision",
+    "parsing.docx.image_extraction",       # embedded-figure full-res Vision —
+    "parsing.xlsx.image_extraction",       # min_dimension / vision_enrich /
+                                           # max_images_vision all change which
+                                           # figures get transcribed blocks
     "parsing.xlsx.use_openpyxl_renderer",  # switches xlsx parser engine —
                                            # flipping it changes the markdown
                                            # produced for the same file
