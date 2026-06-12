@@ -139,6 +139,8 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.xlsx.denoising",
     "parsing.xlsx.extract_connector_data",  # hook: xlsx connector → Vision ground truth
     "parsing.vision.batched_call",          # batched multi-image Vision toggle + thresholds
+    "parsing.vision.supplement_demote_headings",  # heading demotion changes
+                                                  # sources/*.md structure + title_path
     "chunking.enabled",
     "chunking.strategy",
     "chunking.max_tokens",

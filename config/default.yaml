@@ -197,6 +197,17 @@ parsing:
   # The AI decides what to do (no code-level thresholds or filtering).
   vision:
     enabled: true             # true | false — master switch
+    # Demote markdown headings inside SUPPLEMENT-mode outputs and
+    # embedded-figure transcriptions to bold lines. Vision writes `###` for
+    # chart titles / axis legends; in full mode (PDF/PPT) those headings ARE
+    # the page's structure and stay, but in supplement/figure blocks they
+    # are figure-internal labels that otherwise enter the document's heading
+    # hierarchy — measured: a thesis whose own chapters were bold paragraphs
+    # ended up with 118/325 chunks carrying a chart's name as title_path,
+    # and the bogus headings tricked the auto-chunker's structure scoring.
+    # Every word is kept (chunk text / grep / RAG recall unchanged); only
+    # the structural claim is removed. false = inject blocks verbatim.
+    supplement_demote_headings: true
     supplement_only: false    # GLOBAL DEFAULT = false (full whole-page Vision).
                               # Per-format override below flips xlsx to true.
                               # WHY format-split (measured, not guessed):

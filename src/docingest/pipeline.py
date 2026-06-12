@@ -1770,6 +1770,30 @@ def _xlsx_per_page_ground_truth(
     return out
 
 
+def _demote_headings(text: str) -> str:
+    """Markdown headings in a Vision SUPPLEMENT/figure block → bold lines.
+
+    Vision transcriptions emit `#`/`###` for chart titles and axis legends.
+    For full-mode pages (PDF/PPT) those headings ARE the page's structure —
+    they must stay. For supplement blocks and embedded-figure transcriptions
+    they are *figure-internal* labels, yet they enter the document's heading
+    hierarchy: on a thesis whose own chapters were bold paragraphs (no Word
+    heading styles), figure titles became the ONLY headings and 118/325
+    chunks carried a chart's name as their title_path. Demoting to bold
+    keeps every word (chunk text, grep, RAG recall unchanged) and removes
+    only the structural claim. Fenced code blocks are left untouched."""
+    out: list[str] = []
+    in_code = False
+    for line in text.split("\n"):
+        if line.lstrip().startswith("```"):
+            in_code = not in_code
+            out.append(line)
+            continue
+        m = None if in_code else re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        out.append(f"**{m.group(2)}**" if m else line)
+    return "\n".join(out)
+
+
 def _gt_norm(s: str) -> str:
     """NFKC + whitespace-stripped normalisation for ground-truth text matching
     (PDF text layer line-wraps and markdown decoration must not break it)."""
@@ -2009,6 +2033,12 @@ def _enrich_embedded_images(
                     f"Embedded-image Vision failed for {img['filename']}: {err}"
                 )
             elif desc and desc.strip():
+                # Figure-internal chart titles must not enter the document's
+                # heading hierarchy (see _demote_headings).
+                if get_nested(
+                    config, "parsing.vision.supplement_demote_headings", True
+                ):
+                    desc = _demote_headings(desc)
                 descs[img["filename"]] = desc
 
     # Inject in REVERSE figure order: when several markers sit inside the same
@@ -2705,6 +2735,19 @@ def _enrich_with_vision(
                 # Sub-progress: one page done (success or fail both count — the
                 # bar tracks Vision *completion*, not success rate).
                 _report_vision_progress(1)
+
+    # Supplement-mode outputs carry figure-internal headings (chart titles,
+    # axis legends) that must not enter the document's heading hierarchy —
+    # demote to bold before injection (see _demote_headings). Full-mode
+    # pages (PDF/PPT) keep their headings: there Vision's structure IS the
+    # page's structure (it reconstructs what Docling fragmented).
+    from .parsers.vision import resolve_supplement_only as _rso
+    if _rso(config, doc_format) and get_nested(
+        config, "parsing.vision.supplement_demote_headings", True
+    ):
+        results = {idx: _demote_headings(t) for idx, t in results.items()}
+        if batched_block:
+            batched_block = _demote_headings(batched_block)
 
     # Inject results into markdown sections.
     # Two modes depending on whether the source has pagebreak markers:
