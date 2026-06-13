@@ -229,6 +229,23 @@ parsing:
                               # full-mode duplication measured at only 1-9% of
                               # the document, almost all of it xlsx tables that
                               # the xlsx-supplement override then removes.
+    # Text-layer character authority (FULL mode only). Each PDF page's raw
+    # EMBEDDED TEXT LAYER (pymupdf get_text — character-exact, never OCR) is
+    # read alongside Docling's layout output. When that layer is healthy
+    # (non-empty, no glyph< CMap damage, U+FFFD ratio <= 5%), it REPLACES the
+    # reference text fed to Vision and the prompt upgrades it to
+    # authoritative: when a visually-read character CONFLICTS with it
+    # (stamps, seals, blur, occlusion, small print), the text layer wins;
+    # Vision's job is layout/structure and visual-only content. Why not feed
+    # Docling's output as the authority: its layout pass can DROP text
+    # overlapped by pictures (measured: signature line under a seal).
+    # Unhealthy pages (scans → empty layer, CMap-damaged → garbled) keep the
+    # old low-trust wording and Docling reference — behaviour unchanged.
+    # Real case: a red corporate seal over 「良」 made Vision confidently read
+    # 「典」 while the text layer held the correct character (退職証明書).
+    # supplement mode is unaffected (its ground truth is already authoritative).
+    text_authority:
+      enabled: true           # false = always use the old wording (rollback)
     max_pages: null           # Global cap on Vision API calls per file. null
                               # (default) defers to the `safety:` section for
                               # cost control — safety.mode=warn/strict runs a

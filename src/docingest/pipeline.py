@@ -2687,6 +2687,11 @@ def _enrich_with_vision(
                             cache=cache,
                             structured_data=struct_data,
                             doc_format=doc_format,
+                            # Raw embedded-text-layer read (PDF only, "" else).
+                            # text_authority judges/feeds THIS, not the layout
+                            # text above — Docling can drop text overlapped by
+                            # pictures (seal-over-signature); the layer cannot.
+                            text_layer=getattr(page_data, "text_layer", ""),
                         ),
                         vision_timeout,
                     )

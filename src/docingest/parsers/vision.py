@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 _PAGE_PROMPT = """\
 You are a document preprocessing specialist. You receive one page image from a \
 document (PDF / PPT / Excel / Word / etc.), plus text that was pre-extracted \
-by an OCR/parsing engine (may be incomplete, garbled, or empty).
+from the document (its trust level is stated in the section header below).
 
 Your job: produce the most accurate Markdown representation of this ONE page.
 Accuracy is more important than completeness. A hallucinated value is worse
@@ -144,7 +144,7 @@ reason from the closed set above):
 - Start directly with page content. No preamble.
 - No explanation. No "Here is the Markdown:". No quality commentary.
 
-## Pre-extracted text (may be incomplete or garbled)
+{page_text_notice}
 
 ---
 {page_text}
@@ -179,6 +179,34 @@ Now examine the page image and produce the accurate Markdown for this page. \
 Read aggressively; mark uncertainty explicitly; never invent content. \
 Trust the structured data block — focus your effort on everything the block \
 cannot see."""
+
+
+# Two trust levels for the {page_text_notice} slot in _PAGE_PROMPT (full mode).
+#
+# Default wording — pre-extracted text of unknown health (scans where it is
+# empty, CMap-damaged PDFs where it is garbled). Vision must rely on its eyes.
+_TEXT_NOTICE_DEFAULT = """\
+## Pre-extracted text (may be incomplete or garbled)"""
+
+# Authoritative wording — the page's text was extracted programmatically from
+# the document's EMBEDDED TEXT LAYER (OCR is off), so every character in it is
+# exact. Vision's eyes can be fooled by stamps/blur/occlusion; the text layer
+# cannot. Real case: a red corporate seal over 「良」 made Vision read 「典」
+# while the text layer held the correct character.
+_TEXT_NOTICE_AUTHORITATIVE = """\
+## Pre-extracted text (AUTHORITATIVE — document's embedded text layer)
+
+This block was extracted programmatically from the document's embedded text \
+layer — it is character-exact, NOT OCR output. Rules:
+
+1. If a character you read visually CONFLICTS with this block (typical under \
+stamps, seals, blur, occlusion, or small print), TRUST THIS BLOCK — occlusion \
+fools eyes; the text layer cannot be fooled.
+2. Your value-add is everything this block cannot carry: layout and table \
+structure, reading order, and visual-only content (stamps, seals, \
+handwriting, figures, charts).
+3. Text rendered inside images does NOT appear in this block — transcribe it \
+from the image per the normal uncertainty rules."""
 
 
 # Supplement mode (parsing.vision.supplement_only: true, the default). Same
@@ -333,6 +361,29 @@ def resolve_supplement_only(config: dict[str, Any], doc_format: str | None) -> b
     return bool(get_nested(config, "parsing.vision.supplement_only", False))
 
 
+def _is_authoritative_text(text_layer: str, config: dict[str, Any]) -> bool:
+    """Is this page's raw embedded-text-layer read healthy (= character-exact
+    truth)?
+
+    ``text_layer`` is pymupdf's get_text() for the page — it can ONLY come
+    from the document's embedded text layer, never OCR. Non-empty and free of
+    the known damage signatures means every character in it is verbatim
+    truth, and the full-mode prompt upgrades the reference to AUTHORITATIVE
+    wording (visual/text character conflicts resolve in its favour). Any
+    check failing → default wording + Docling reference, behaviour identical
+    to before this feature.
+    """
+    if not get_nested(config, "parsing.vision.text_authority.enabled", True):
+        return False
+    t = (text_layer or "").strip()
+    if not t:                                   # scans: text layer is empty
+        return False
+    if "glyph<" in t or "glyph&lt;" in t:       # CMap damage (Phase 1.1 case)
+        return False
+    # Replacement-char ratio — same 5% line the triage layer uses.
+    return t.count("�") / len(t) <= 0.05
+
+
 def describe_page(
     image_path: str | Path,
     page_text: str,
@@ -340,6 +391,7 @@ def describe_page(
     structured_data: str | None = None,
     max_tokens: int = 32768,
     supplement_only: bool = True,
+    authoritative_text: bool = False,
 ) -> str:
     """
     Send a page image + extracted text to Vision AI.
@@ -359,16 +411,30 @@ def describe_page(
             and Vision behaves as it did before this feature.
         max_tokens: Output cap forwarded to litellm. Set explicitly to
             bypass litellm's silent 4096 default for Gemini/Claude.
+        authoritative_text: Full mode only. True → the page_text section
+            carries the AUTHORITATIVE wording (embedded text layer wins
+            character conflicts). Caller decides via _is_authoritative_text.
+            Ignored in supplement mode (its ground truth is already
+            authoritative by design).
     """
     image_path = Path(image_path)
     if not image_path.exists():
         raise FileNotFoundError(f"Page image not found: {image_path}")
 
-    template = _PAGE_PROMPT_SUPPLEMENT if supplement_only else _PAGE_PROMPT
-    prompt = template.format(
-        page_text=page_text if page_text.strip() else "(empty — no text extracted)",
-        structured_data=structured_data if structured_data and structured_data.strip() else "(none)",
-    )
+    if supplement_only:
+        prompt = _PAGE_PROMPT_SUPPLEMENT.format(
+            page_text=page_text if page_text.strip() else "(empty — no text extracted)",
+            structured_data=structured_data if structured_data and structured_data.strip() else "(none)",
+        )
+    else:
+        prompt = _PAGE_PROMPT.format(
+            page_text=page_text if page_text.strip() else "(empty — no text extracted)",
+            page_text_notice=(
+                _TEXT_NOTICE_AUTHORITATIVE if authoritative_text
+                else _TEXT_NOTICE_DEFAULT
+            ),
+            structured_data=structured_data if structured_data and structured_data.strip() else "(none)",
+        )
 
     return describe_image(image_path, prompt, model_config, max_tokens=max_tokens)
 
@@ -402,6 +468,7 @@ def describe_page_cached(
     cache: AICache | None = None,
     structured_data: str | None = None,
     doc_format: str | None = None,
+    text_layer: str = "",
 ) -> str:
     """
     Per-page Vision with caching.
@@ -429,14 +496,38 @@ def describe_page_cached(
     # so flipping it (or the prompt) invalidates stale entries instead of
     # serving results produced by the other prompt.
     supplement_only = resolve_supplement_only(config, doc_format)
+    # Full mode: decide the trust level of the page_text section. Judged on
+    # the RAW text layer (pymupdf), not Docling's layout output — Docling can
+    # drop text overlapped by pictures (seal-over-signature case), so when the
+    # layer is healthy it also REPLACES the reference fed to the prompt
+    # (character superset; reading order doesn't matter, structure comes from
+    # the image). The notice text lives in a {page_text_notice} slot, so
+    # _prompt_hash(template) alone cannot see which wording was used — fold
+    # the flag into the tag explicitly.
+    authoritative_text = (
+        not supplement_only and _is_authoritative_text(text_layer, config)
+    )
+    ref_text = text_layer if authoritative_text else page_text
     # The flag alone isn't enough — editing the prompt TEXT must also bust the
     # cache, so fold in a hash of the actual template body that will be used.
     template = _PAGE_PROMPT_SUPPLEMENT if supplement_only else _PAGE_PROMPT
-    prompt_tag = ("supplement" if supplement_only else "full") + "-" + _prompt_hash(template)
+    prompt_tag = (
+        ("supplement" if supplement_only else "full")
+        + ("-auth" if authoritative_text else "")
+        + "-" + _prompt_hash(template)
+    )
     # In supplement mode page_text IS the ground truth (openpyxl table text) →
-    # changing it must bust the cache. In full mode page_text is tied to the
-    # image (already covered by the image content hash), so tag "nopt".
-    pt_tag = _structured_data_cache_tag(page_text) if supplement_only else "nopt"
+    # changing it must bust the cache. Full-authoritative mode swaps the
+    # reference to the raw text layer — that text shapes the prompt, so it
+    # must be in the key too (same page image + different reference source
+    # must NOT share an entry). Plain full mode: page_text is tied to the
+    # image (covered by the image content hash), so tag "nopt".
+    if supplement_only:
+        pt_tag = _structured_data_cache_tag(page_text)
+    elif authoritative_text:
+        pt_tag = _structured_data_cache_tag(ref_text)
+    else:
+        pt_tag = "nopt"
 
     if cache:
         img_hash = content_hash_file(image_path)
@@ -444,15 +535,17 @@ def describe_page_cached(
             model_name=model_name,
             content_hash=img_hash,
             call_fn=lambda: describe_page(
-                image_path, page_text, vision_model_config, structured_data,
+                image_path, ref_text, vision_model_config, structured_data,
                 max_tokens=max_tokens, supplement_only=supplement_only,
+                authoritative_text=authoritative_text,
             ),
             extra_key=f"page_vision|{prompt_tag}|{pt_tag}|{_structured_data_cache_tag(structured_data)}",
         )
     else:
         return describe_page(
-            image_path, page_text, vision_model_config, structured_data,
+            image_path, ref_text, vision_model_config, structured_data,
             max_tokens=max_tokens, supplement_only=supplement_only,
+            authoritative_text=authoritative_text,
         )
 
 

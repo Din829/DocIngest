@@ -40,6 +40,14 @@ class PageData:
                            # exempt a page whose ONLY visuals are furniture —
                            # never exceeds num_pictures (a furniture pic is a
                            # picture). Default 0 (no furniture detected / off).
+    text_layer: str = ""   # (PDF only) raw embedded-text-layer read for this
+                           # page via pymupdf get_text() — the character-exact
+                           # superset that Docling's layout pass may DROP
+                           # (measured: a signature line under a corporate seal
+                           # vanished from `text` but was present here). Fed to
+                           # full-mode Vision as the AUTHORITATIVE reference
+                           # when healthy (parsing.vision.text_authority).
+                           # Empty for scans and non-PDF formats.
 
 
 @dataclass

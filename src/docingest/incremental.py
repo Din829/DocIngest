@@ -116,6 +116,9 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.vision.triage",            # triage thresholds affect which pages
                                         # get Vision enrichment → cached output
                                         # changes when any triage knob changes
+    "parsing.vision.text_authority",    # full-mode prompt trust level for the
+                                        # embedded text layer — flipping it
+                                        # changes Vision output wording/content
     "parsing.docx.vision_page_images",
     "parsing.docx.max_page_images",
     "parsing.docx.max_image_pixels",

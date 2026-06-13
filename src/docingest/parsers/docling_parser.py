@@ -1116,6 +1116,13 @@ class DoclingParser(BaseParser):
             if _prov:
                 _pn = _prov[0].page_no
                 pic_per_page[_pn] = pic_per_page.get(_pn, 0) + 1
+        # (PDF) raw embedded-text-layer per page. Character-exact superset of
+        # Docling's layout output — Docling can DROP text overlapped by
+        # pictures (measured: signature line under a corporate seal). Vision's
+        # text_authority feature feeds this to the prompt as the authoritative
+        # character reference; reading order doesn't matter there (structure
+        # comes from the page image), characters do.
+        text_layer_per_page: dict[int, str] = {}
         if file_path.suffix.lower() == ".pdf":
             # file_path is always the real PDF here — no pre-parse hook rewrites
             # PDFs (the OMML hook targets DOCX), so reading it directly matches
@@ -1127,6 +1134,7 @@ class DoclingParser(BaseParser):
                     _n = len(_pg.get_images())
                     if _n:
                         pic_per_page[_i] = max(pic_per_page.get(_i, 0), _n)
+                    text_layer_per_page[_i] = _pg.get_text()
                 _fdoc.close()
             except Exception as e:
                 logger.debug(f"fitz per-page image count failed: {e}")
@@ -1178,6 +1186,7 @@ class DoclingParser(BaseParser):
                 image_path=image_path,
                 num_pictures=pic_per_page.get(page_no, 0),
                 furniture_pic_count=furniture_per_page.get(page_no, 0),
+                text_layer=text_layer_per_page.get(page_no, ""),
             ))
 
         # Extract embedded images from xlsx zip (xl/media/)
