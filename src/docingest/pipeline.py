@@ -1022,9 +1022,15 @@ def _generate_page_images_via_libreoffice(
                     if page_texts:
                         parse_result.metadata["docx_page_texts"] = page_texts
                 except Exception as e:
-                    _pipeline_logger.debug(
-                        f"docx page-text extraction skipped ({e}) — per-page "
-                        f"ground truth falls back to the full markdown"
+                    # warning, not debug: the content outcome is unchanged
+                    # (full-markdown ground truth, the pre-slicing behaviour)
+                    # but the COST saving silently dies with it — on a big
+                    # docx that's the difference between ~3K and ~100K input
+                    # tokens per page call, worth a visible line.
+                    _pipeline_logger.warning(
+                        f"docx page-text extraction failed ({e}) — per-page "
+                        f"ground truth falls back to the full markdown "
+                        f"(content unaffected; Vision input cost rises)"
                     )
 
             # Step 2: PDF → page images

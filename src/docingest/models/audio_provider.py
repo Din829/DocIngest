@@ -173,27 +173,21 @@ def _transcribe_dashscope(
                 f"DashScope API error: {response.code} - {response.message}"
             )
 
-        # Record usage verbatim (ASR bills on BOTH tokens and audio seconds
-        # — dashscope reports `usage.seconds` alongside the token counts;
-        # the usage object may be dict- or attr-style depending on SDK
-        # version, so read defensively: this is an external API boundary).
+        # Record usage verbatim — ASR bills on BOTH tokens and audio
+        # seconds (probed live 2026-06-13: usage = {'input_tokens': 75,
+        # 'audio_tokens': 75, 'seconds': 3, 'total_tokens': 75, ...}).
+        # Both response and usage are dict subclasses in the dashscope
+        # SDK (DictMixin), so plain .get() is the whole story.
         from .token_tracker import token_tracker
 
-        def _uget(obj: Any, key: str) -> Any:
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                return obj.get(key)
-            return getattr(obj, key, None)
-
-        usage = _uget(response, "usage")
-        if usage is not None:
+        usage = response.get("usage") or {}
+        if usage:
             token_tracker.record(
                 model=f"dashscope/{model}",
-                prompt=int(_uget(usage, "input_tokens") or 0),
-                completion=int(_uget(usage, "output_tokens") or 0),
-                total_reported=int(_uget(usage, "total_tokens") or 0),
-                audio_seconds=float(_uget(usage, "seconds") or 0),
+                prompt=int(usage.get("input_tokens") or 0),
+                completion=int(usage.get("output_tokens") or 0),
+                total_reported=int(usage.get("total_tokens") or 0),
+                audio_seconds=float(usage.get("seconds") or 0),
             )
 
         # Extract text from response
