@@ -14,7 +14,7 @@ DocIngest is a moving target. Treat the recipes here as starting points, not con
 | **Python library** | `import docingest; docingest.ingest(...)` | Embedded in another Python app — RAG pipelines, web backends, batch workers | `on_progress` callback | In-process (sync) |
 | **MCP server** | `python -m docingest.mcp_server` | LLM agents (Claude Desktop / Code, Cursor, VS Code Copilot) calling DocIngest as a tool | Single response per call | Separate process, stdio/SSE transport |
 
-Public Python API surface is exactly what `docingest/__init__.py` re-exports — `ingest`, `inspect`, `refine`, `IngestResult`, `build_config`, and the Provider classes. Everything else (`docingest.pipeline`, `docingest.parsers`, `docingest.chunkers`, ...) is internal and may change without notice.
+Public Python API surface is exactly what `docingest/__init__.py` re-exports — `ingest`, `inspect`, `refine`, `list_knowledge`, `get_summary`, `IngestResult`, `build_config`, and the Provider classes. Everything else (`docingest.pipeline`, `docingest.parsers`, `docingest.chunkers`, ...) is internal and may change without notice.
 
 **Optional graph layer** — `docingest.graph` is a separately-versioned subpackage exposing `build` / `query` / `status` for an opt-in GraphRAG layer on top of the main pipeline's outputs. It is NOT auto-imported and requires `pip install -e ".[graph]"`. Import explicitly: `import docingest.graph`. See README.md "GraphRAG (optional)" and ARCHITECTURE.md §10 for details.
 
@@ -208,7 +208,7 @@ Claude / Cursor / Copilot agents talking to DocIngest as a tool.
 }
 ```
 
-Stdio is the default transport. For browser-side / web clients, run `python -m docingest.mcp_server --transport sse` and connect over SSE instead.
+Stdio is the default transport. For browser-side / web clients, run `python -m docingest.mcp_server --transport http` (Streamable HTTP) or `--transport sse` (SSE, legacy in fastmcp v3) instead.
 
 **Other clients:**
 
@@ -239,7 +239,7 @@ Browsing / searching / reading the produced knowledge base is **deliberately NOT
 
 The recommended agent flow for any non-trivial input: **`inspect` → review cost → `run` → native Read on `knowledge_search.SKILL.md` → native Grep / Read on `sources/*.md`**. See `mcp_server.py`'s top-level `FastMCP(instructions=...)` block for the full pattern surfaced to agents at session start.
 
-### 6. Refine for human-readable output
+### 5. Refine for human-readable output
 
 Refine is a separate, optional pass that uses an LLM to clean up `sources/*.md` for human consumption. It is **not** part of the RAG path — chunks come from the original sources, not from refined output.
 
@@ -247,9 +247,9 @@ Refine is a separate, optional pass that uses an LLM to clean up `sources/*.md` 
 docingest.refine(["./kb/sources/spec.md"], skill="refine_faithful")
 ```
 
-Two skills ship today: `refine_default` (allows light rewriting) and `refine_faithful` (preserves original wording — only dedup + format). Pick `refine_faithful` for legal / regulated content where exact wording matters.
+Three skills ship today: `refine_default` (allows light rewriting), `refine_faithful` (preserves original wording — only dedup + format), and `refine_html` (HTML-flavoured layout output). Pick `refine_faithful` for legal / regulated content where exact wording matters. `docingest skills list` enumerates them with summaries.
 
-### 5. CLI in shell pipelines
+### 6. CLI in shell pipelines
 
 Language-agnostic callers (Node, Go, Bash) shelling out to DocIngest.
 
@@ -349,7 +349,7 @@ for e in result.stats["errors"]:
         case _:             log_unknown(e)        # forward-compatible default
 ```
 
-Currently emitted: `""` (success), `timeout`, `parse_error`, `io_error`. Additional values (`chunk_error`, `interrupted`, `unknown`) are reserved for future use — match defensively with a default arm so new types don't break your code. Always branch on this field rather than grepping the `error` string.
+Currently emitted: `""` (success), `timeout`, `parse_error`, `io_error`, `encrypted` (password-protected file detected after a parse failure — see `utils/encryption.py`). Additional values (`chunk_error`, `interrupted`, `unknown`) are reserved for future use — match defensively with a default arm so new types don't break your code. Always branch on this field rather than grepping the `error` string.
 
 `io_error` entries coming from `discover_files` (missing path, failed URL, URL disabled — see [Cross-container handoff](#cross-container--cross-process-file-handoff)) additionally carry a stable `reason` token (`"not_found"` / `"url_failed"` / `"url_disabled"`). `io_error` entries thrown by the parser itself (e.g. file disappeared mid-run) don't have a `reason` — branch on its presence with `e.get("reason")` rather than `e["reason"]`.
 
