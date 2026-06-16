@@ -1358,6 +1358,17 @@ metadata:
 quality_report:
   enabled: true                       # scan after pipeline completes
   output_file: "quality_report.json"  # full report path (relative to output.dir)
+  max_samples: 50                     # per-file cap on the `samples` list (the
+                                      # example marker lines shown for a quick
+                                      # eyeball). Display only — total_questions
+                                      # / total_unreadable are always the exact
+                                      # full counts, independent of this. A
+                                      # scanned page rarely has more than a few
+                                      # markers, so 50 shows everything for any
+                                      # normal doc while capping a pathological
+                                      # scan from bloating the JSON with lines
+                                      # already present in sources/*.md. Set 0
+                                      # to list every marker line (no cap).
 
 # =============================================================================
 # Run log (append-only pipeline timeline)

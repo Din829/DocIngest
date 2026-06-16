@@ -55,12 +55,15 @@ layout 模型，和 DocIngest 同源，**功能上「差不多」是真的**：
 
 | | Azure | AWS Bedrock KB | GCP |
 |---|---|---|---|
-| 解析+切块 | Content Understanding（2026-04 GA） | Bedrock Data Automation | Layout Parser v1.6（2026-01） |
-| 图理解 | GenAI Prompt skill（Vision） | Claude / Nova 多模态 | Gemini layout parser |
-| 音视频 | ❌ 要另接服务 | ✅ Nova（原生支持） | ❌ |
+| 解析+切块 | Content Understanding skill（2026-04 GA） | Bedrock Data Automation | Layout Parser v1.6（2026-01） |
+| 图理解 | Content Understanding skill 内置 AI 图描述（2026-05 预览，配 GPT-4.1） | Claude / Nova 多模态 | Gemini layout parser |
+| 音视频（进 ingest 的可用性） | 🔶 CU 本体支持音视频，但接入 AI Search 的 skill 暂不吃（blob indexer 遇音频默认跳过）* | ✅ Nova（原生支持） | ❌ |
 | 检索 | Knowledge bases | KB 原生 | Vertex AI Search |
 
 （来源：各家官方 learn/docs 站，2026-06）
+
+> \* **音视频这格要看清**：Azure 的 Content Understanding 工具**本体**能处理 documents/images/**videos/audio**（官方原文），但**接进 Azure AI Search ingest 流水线的那个 CU skill 目前只吃文档类**，blob indexer 遇到音频文件默认报错跳过。所以——音视频是 DocIngest 对**本地竞品**的附加优势（§3 成立），但对**云厂商不是结构性优势**：Azure 生态能做，只是还没接进 Search 的 ingest 这一段。这与本文「音视频只是附加项、不押定位」的立场一致。
+> （来源：learn.microsoft.com，Content Understanding skill / Azure Blob indexer，2026-06）
 
 ### 2.2 云上打不赢，但这不是问题——那不是 DocIngest 的用户
 

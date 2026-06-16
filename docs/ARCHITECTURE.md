@@ -904,6 +904,10 @@ frontmatter 输出受 `output.markdown.frontmatter_fields` **白名单**控制�
 - **隐藏内容检测**（`parsing.*` hidden content，默认开）：经 Docling ContentLayer 检出隐藏/不可见元素。
 - **知识库管理 API**（`utils/library.py` → `api.list_knowledge` / `get_summary`，公开导出）：列出 / 摘要已建知识库（一个 output dir = 一个 library），给 GUI / 前端 / 未来 web agent 用，纯文件读取。
 - **打包支撑**（`utils/resources.py` + `bundled_binaries.py` + `packaging/`）：PyInstaller exe 的资源根定位与随包二进制（ffmpeg 等）注入，dev 环境零感知。
+- **Prompt 缓存（implicit，provider 自动，零配置）**：Gemini 2.5+ 默认开 implicit prompt caching，DocIngest 不写任何 `cache_control`、不建 explicit 缓存——能命中就白捡折扣，命不中也不报错。命中规律 = **长且稳定的公共前缀**（provider 阈值约 2-4K token）。实测（2026-06-16，gemini-3-flash-preview，litellm + 原生 google-genai 双印证）：
+  - **Vision（扫描件 / PDF / PPT）吃不到**：调用结构是 `[~1790t 文本 prompt] + [每页不同的图]`，公共前缀只有 prompt 文本、低于阈值，且每页图立刻打断更长前缀 → 实测 `cached_tokens=0`。所以 `safety.py` 成本估算忽略缓存折扣对 Vision 是**精确**的，不是保守。
+  - **纯文本 + 长固定 system 的路径吃得到**：典型是 `docingest.graph` 的实体抽取（每 chunk 一次调用、几 K 的固定 system 指令）→ 实测从第 2 次起 `cached_tokens≈2028/次`（约 70% prompt）。`knowledge_map`（整库仅 1 次调用）无重复前缀、不受益。
+  - **不上 explicit 缓存**：它按 token-小时计存储费，只对"同一大块反复查"划算，而 DocIngest 每 chunk / 每页都不同，没这模式。坐享 implicit 免费命中即最优，无需开发动作。
 
 ---
 

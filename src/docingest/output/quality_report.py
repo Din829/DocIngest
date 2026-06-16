@@ -38,12 +38,15 @@ _UNREADABLE_RE = re.compile(r"\[unreadable\b[^\]]*\]", re.IGNORECASE)
 _VISION_FAILED_RE = re.compile(r"<!-- vision-failed page=(\d+)[^>]*-->")
 
 
-def scan_file(md_path: Path) -> dict[str, Any]:
+def scan_file(md_path: Path, max_samples: int = 50) -> dict[str, Any]:
     """
     Count uncertainty markers in a single Markdown file.
 
     Args:
         md_path: Path to a sources/*.md file.
+        max_samples: Cap on how many marker lines to include in `samples`
+            (display only — the full counts in question_count / unreadable_count
+            are always exact). <= 0 means no cap (every marker line is sampled).
 
     Returns:
         Dict with counts and context lines. Empty counts if file is clean.
@@ -64,7 +67,9 @@ def scan_file(md_path: Path) -> dict[str, Any]:
     u_matches = _UNREADABLE_RE.findall(text)
     vision_failed_pages = sorted({int(p) for p in _VISION_FAILED_RE.findall(text)})
 
-    # Collect a few sample lines (context) for the first few markers
+    # Collect sample lines (context) for the markers, up to max_samples.
+    # These are display aids only — the exact totals live in question_count /
+    # unreadable_count above (full findall). max_samples <= 0 disables the cap.
     samples: list[dict[str, Any]] = []
     if q_matches or u_matches:
         lines = text.split("\n")
@@ -74,7 +79,7 @@ def scan_file(md_path: Path) -> dict[str, Any]:
                     "line": line_no,
                     "text": line.strip()[:200],
                 })
-                if len(samples) >= 5:
+                if max_samples > 0 and len(samples) >= max_samples:
                     break
 
     return {
@@ -89,6 +94,7 @@ def scan_file(md_path: Path) -> dict[str, Any]:
 def generate_report(
     sources_dir: Path,
     output_path: Path | None = None,
+    max_samples: int = 50,
 ) -> dict[str, Any]:
     """
     Scan all Markdown files under sources_dir and build an aggregate report.
@@ -96,6 +102,9 @@ def generate_report(
     Args:
         sources_dir: Directory containing sources/*.md files (the knowledge/sources/).
         output_path: If provided, write the full report as JSON here.
+        max_samples: Per-file cap on `samples` entries (display only; the
+            total_questions / total_unreadable counts stay exact regardless).
+            <= 0 means list every marker line. Default 50.
 
     Returns:
         Aggregate summary dict with keys:
@@ -131,7 +140,7 @@ def generate_report(
     total_vision_failed = 0
 
     for md in md_files:
-        result = scan_file(md)
+        result = scan_file(md, max_samples=max_samples)
         all_files.append(result)
         total_questions += result["question_count"]
         total_unreadable += result["unreadable_count"]

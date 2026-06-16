@@ -4713,9 +4713,11 @@ def run_pipeline(
             report_filename = get_nested(
                 config, "quality_report.output_file", "quality_report.json"
             )
+            max_samples = get_nested(config, "quality_report.max_samples", 50)
             pipeline_result.quality = generate_report(
                 sources_dir=sources_dir,
                 output_path=output_dir / report_filename,
+                max_samples=max_samples,
             )
         except Exception as e:
             _pipeline_logger.warning(f"Quality report generation failed: {e}")

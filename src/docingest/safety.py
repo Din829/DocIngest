@@ -83,6 +83,31 @@ def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> floa
     Returns 0.0 when Vision is disabled or the file has neither pages nor a
     video duration (audio-only / text / unknown formats). Safe on missing
     fields.
+
+    Why ignoring the prompt-cache discount is not just conservative but
+    CORRECT for Vision (measured 2026-06-16, gemini-3-flash-preview, both
+    litellm and native google-genai usage_metadata agreeing):
+      * Gemini "implicit" prompt caching is on by the provider's default for
+        2.5+ models — no DocIngest code enables or configures it. It hits
+        automatically when a request shares a LONG, STABLE prefix with a
+        recent prior request (provider min ~2-4K tokens).
+      * The per-page Vision call is [text prompt ~1790t] + [a DIFFERENT image
+        every page]. The only shared prefix is the prompt text, which sits
+        below the hit threshold, and the per-page image immediately breaks any
+        longer common prefix. Measured: cached_tokens = 0 across a real scan —
+        Vision gets NO cache discount, so the cost estimate omitting it is
+        exact, not pessimistic.
+      * Where the discount DOES land (and silently lowers real cost below this
+        estimate) is the pure-text path with a long fixed system prompt and
+        varying user content — i.e. GraphRAG entity extraction (one call per
+        chunk, identical multi-K system instruction). Measured there:
+        cached_tokens ~2028/call (~70% of prompt) from the 2nd call on. That
+        path is in docingest.graph, not this main-ingest cost gate, so it
+        doesn't affect the upper bound computed here.
+      * Explicit (manually-managed) caching is deliberately NOT used anywhere:
+        it bills storage per token-hour and only pays off for "same large
+        block queried repeatedly", a pattern DocIngest never has (every chunk
+        / page differs). Riding the free implicit hit is the right call.
     """
     if not get_nested(config, "parsing.vision.enabled", True):
         return 0.0
