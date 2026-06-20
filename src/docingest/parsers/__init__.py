@@ -38,6 +38,25 @@ _PIPELINE_LEVEL_EXTENSIONS: list[tuple[str, str]] = [
 ]
 
 
+# Docling-only BINARY formats: when Docling fails on one of these, falling
+# through to TextParser is wrong — TextParser decodes arbitrary bytes (it only
+# rejects null-byte binaries) and turns a real parse failure into a bogus
+# "success" full of garbage (e.g. a corrupt PDF's raw `%PDF-1.4 …%%EOF` bytes
+# read as document text, reported successful, silently polluting the KB).
+# These formats are either parseable by Docling or genuinely broken — there is
+# no "read it as plain text" that yields real content. So Docling failure here
+# is a hard failure, NOT a fallback case. Mirrors the same guard MediaParser
+# already applies to audio/video (see parse() below). Plain-text / unknown
+# extensions (.txt/.md/.csv/.dat/…) are deliberately NOT listed: for those,
+# TextParser fallback is legitimate.
+_DOCLING_BINARY_FORMATS: frozenset[str] = frozenset({
+    ".pdf",
+    ".docx", ".pptx", ".xlsx",
+    ".html", ".htm",
+    ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp", ".gif",
+})
+
+
 def supported_input_extensions(config: dict[str, Any]) -> set[str]:
     """Every file extension the pipeline can process under this config.
 
@@ -143,6 +162,16 @@ class _DoclingWithFallback(BaseParser):
         # hook produced a replacement stream, e.g. DOCX OMML preprocessing).
         result = self._docling.parse(file_path, override_stream=override_stream)
         if result.success:
+            return result
+
+        # Binary-format guard: a failed Docling parse on a binary format
+        # (PDF/Office/image/html) must NOT fall through to TextParser. Those
+        # files are either parseable or genuinely broken; reading their raw
+        # bytes as text yields garbage that TextParser reports as "success",
+        # silently polluting the KB (fail-loud > fail-safe). Same rationale as
+        # the MediaParser guard above. Plain-text / unknown extensions are not
+        # in the set, so their legitimate TextParser fallback is unaffected.
+        if file_path.suffix.lower() in _DOCLING_BINARY_FORMATS:
             return result
 
         # Priority 3: TextParser fallback. Reads raw bytes from disk, so

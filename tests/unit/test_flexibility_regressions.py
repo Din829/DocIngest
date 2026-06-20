@@ -78,6 +78,64 @@ class FlexibilityRegressionTests(unittest.TestCase):
         self.assertEqual(result.error, "media boom")
         self.assertIsNone(result.metadata.get("parser_fallback"))
 
+    def test_binary_format_failure_does_not_text_fallback_to_garbage_success(self) -> None:
+        """A failed Docling parse on a BINARY format (PDF/Office/image) must NOT
+        fall through to TextParser — that would decode the raw bytes as text and
+        report a bogus "success" full of garbage (e.g. a corrupt PDF's
+        `%PDF-1.4 …%%EOF` read as document content), silently polluting the KB.
+        Mirrors the MediaParser guard above. Plain-text extensions are exempt
+        (covered by the separate case below)."""
+        class FakeDocling:
+            def parse(self, file_path: Path, *, override_stream=None) -> ParseResult:
+                return ParseResult(markdown="", success=False, error="docling boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # A "PDF" that is really plain-text garbage — TextParser COULD decode
+            # it (no null bytes), which is exactly the bogus-success trap.
+            pdf = Path(tmp) / "corrupt.pdf"
+            pdf.write_text("%PDF-1.4\nnot a real pdf\n%%EOF", encoding="utf-8")
+
+            parser = object.__new__(_DoclingWithFallback)
+            parser.config = {}
+            parser._docling = FakeDocling()
+            parser._fallback = TextParser({})
+            parser._media = None
+            parser._get_media_parser = lambda: None
+
+            result = parser.parse(pdf)
+
+        # Guard fired: Docling's failure is returned as-is, NOT a TextParser
+        # success. No parser_fallback, no garbage markdown.
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "docling boom")
+        self.assertIsNone(result.metadata.get("parser_fallback"))
+
+    def test_text_format_failure_still_falls_back_to_textparser(self) -> None:
+        """Counterpart to the guard: a NON-binary extension (.txt) whose Docling
+        parse fails MUST still fall through to TextParser — the guard only
+        covers binary formats, so legitimate text fallback is unaffected."""
+        class FakeDocling:
+            def parse(self, file_path: Path, *, override_stream=None) -> ParseResult:
+                return ParseResult(markdown="", success=False, error="docling boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            txt = Path(tmp) / "notes.txt"
+            txt.write_text("real text content", encoding="utf-8")
+
+            parser = object.__new__(_DoclingWithFallback)
+            parser.config = {}
+            parser._docling = FakeDocling()
+            parser._fallback = TextParser({})
+            parser._media = None
+            parser._get_media_parser = lambda: None
+
+            result = parser.parse(txt)
+
+        # .txt is not a binary format → TextParser fallback fires as before.
+        self.assertTrue(result.success)
+        self.assertTrue(result.metadata.get("parser_fallback"))
+        self.assertIn("real text content", result.markdown)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
