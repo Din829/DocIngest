@@ -4684,6 +4684,22 @@ def run_pipeline(
         except Exception as e:
             _pipeline_logger.warning(f"Tags enrichment failed: {e}")
 
+        # Related-links enrichment: add a `related` frontmatter list (top-N
+        # Jaccard-similar files) to each sources/*.md. Default-off, zero-cost
+        # (set arithmetic over already-extracted keywords; no LLM). Reuses the
+        # same knowledge_map; independent try block so it can't break tags above.
+        try:
+            from .output.related_enrichment import enrich_sources_with_related
+            km_path = output_dir / get_nested(
+                config, "knowledge_map.output_file", "knowledge_map.yaml"
+            )
+            if km_path.exists():
+                km_data = yaml.safe_load(km_path.read_text(encoding="utf-8"))
+                if isinstance(km_data, dict):
+                    enrich_sources_with_related(km_data, output_dir, config)
+        except Exception as e:
+            _pipeline_logger.warning(f"Related-links enrichment failed: {e}")
+
     # Write errors.json if any failures, OR remove a stale one from a prior
     # failing run when this run succeeded. errors.json is a per-run snapshot
     # (run_log.py docstring); leaving last run's failures behind makes a

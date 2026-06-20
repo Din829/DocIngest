@@ -87,6 +87,7 @@ def _yaml_escape(value: Any) -> str:
 # list via config or rely on the nested exif: block below for overflow.
 _DEFAULT_FRONTMATTER_FIELDS: list[str] = [
     # Core identity (always present)
+    "type",        # semantic kind (Document/Spreadsheet/Transcript…) — OKF-aligned
     "format",
     "title",
     "language",
@@ -97,6 +98,9 @@ _DEFAULT_FRONTMATTER_FIELDS: list[str] = [
     # Exiftool enrichment (populated when metadata.exiftool.enabled)
     "author",
     "created_at",
+    # Related-links enrichment (populated post-run when
+    # output.derived_metadata.related.enabled) — Jaccard-similar files.
+    "related",
 ]
 
 

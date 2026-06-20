@@ -1042,6 +1042,8 @@ output:
     # the value to parse_result.metadata.
     frontmatter_fields:
       # Core identity
+      - type            # semantic kind (Document/Spreadsheet/Transcript…),
+                        #   OKF-aligned; see output.derived_metadata.type
       - format
       - title
       - language
@@ -1062,11 +1064,26 @@ output:
       - created_source
       - aliases
       - tags
+      - related          # Jaccard-similar files (populated when
+                         #   output.derived_metadata.related.enabled)
 
   # Derived metadata — fields synthesised from data already extracted by
   # parsers / hooks. Independent of any external tool. Disabling these
   # only suppresses the field; the underlying source data is unaffected.
   derived_metadata:
+    # Semantic concept type (Document / Spreadsheet / Transcript / …) derived
+    # from the file format. Distinct from `format` (the extension): agents use
+    # `type` for routing/filtering, and it is the Open Knowledge Format (OKF)
+    # required field. Mapping is fully overridable — add/replace entries to fit
+    # your domain (e.g. map "xlsx" → "Spec" for spec-sheet workflows). A format
+    # absent from the mapping falls back to `fallback` (a real generic type,
+    # not an error). Leave mapping empty/unset to use the built-in defaults in
+    # hooks/derive_type.py.
+    type:
+      enabled: true
+      fallback: "Document"        # type for formats not in the mapping
+      mapping: {}                 # {} → use built-in defaults; populate to override.
+                                  #   e.g.  mapping: {pdf: Document, xlsx: Spec, m4a: Transcript}
     created:
       enabled: true               # write `created` + `created_source`
                                   # (false → leave both absent)
@@ -1108,6 +1125,27 @@ output:
       # to keep tags as just format/lang.
       enrich_from_knowledge_map: true
       max_keyword_tags: 5         # per-file cap on kw/<word> additions
+    # Related-links: add a `related` frontmatter list of the top-N files most
+    # similar to each file, by Jaccard similarity over their (already
+    # TF-IDF-filtered) keyword sets. Zero-cost cross-file association — the
+    # cheap, no-LLM alternative to the GraphRAG layer. Links use OKF-compatible
+    # bundle-relative form. This is a SUGGESTION field (a lead, not an answer);
+    # an occasional miss or extra is harmless.
+    #
+    # Lexical, not semantic — and the limit is bigger than just synonyms:
+    # two files on the SAME topic that happen to use DIFFERENT words won't be
+    # linked at all. (Verified: two government specs — one about a learning
+    # system's features, one about Excel-ifying spec layouts — share almost no
+    # keywords and score ~0, even with body text added.) Lexical Jaccard can
+    # only catch files with overlapping wording (e.g. the same document set);
+    # for true topic/semantic association use the GraphRAG layer instead.
+    related:
+      enabled: false              # default OFF — opt-in (backward compatible)
+      max_links: 3                # per-file cap on related links
+      min_similarity: 0.15        # Jaccard threshold (0~1); below → no link
+                                  #   (don't manufacture weak associations)
+      algorithm: jaccard          # only 'jaccard' implemented; seam for future
+                                  #   metrics (overlap / cosine) without breaking
 
 # =============================================================================
 # Phase 3: Chunking
