@@ -246,6 +246,15 @@ def _register_default_hooks() -> None:
     except ImportError as e:
         logger.debug(f"derive_tags hook not available: {e}")
 
+    # Derived semantic type — format → "Document"/"Spreadsheet"/"Transcript"…
+    # Distinct from `format`; agents use it for routing/filtering and it is
+    # OKF's only required frontmatter field. Config-driven mapping.
+    try:
+        from .derive_type import derive_type_hook
+        _register_post("pre_write", ["*"], derive_type_hook)
+    except ImportError as e:
+        logger.debug(f"derive_type hook not available: {e}")
+
     # Sensitive data sanitization (default OFF, must opt-in via config)
     try:
         from .sanitize import sanitize_hook
