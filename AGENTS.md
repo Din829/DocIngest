@@ -13,7 +13,7 @@ Per-flag detail: `docingest <cmd> --help`.
 
 | Command | What it does | Key flags |
 |---|---|---|
-| `run` | Docs -> Markdown + chunks + index | `-o/--output`; `--purpose markdown\|rag\|agentic\|full`; `--outputs md,chunks,index,...`; `--no-chunks`; `--strategy auto\|heading\|recursive\|slide\|sheet\|timestamp\|whole`; `--max-pages N`; `--parallel N`; `--parallel-files N`; `--force`; `-y/--yes`; `--json`; `--verbose/-v`; `-c/--config` |
+| `run` | Docs -> Markdown + chunks + index | `-o/--output`; `--purpose markdown\|rag\|agentic\|full`; `--outputs md,chunks,index,...`; `--no-chunks`; `--engine docling\|vision_only\|azure_di`; `--strategy auto\|heading\|recursive\|slide\|sheet\|timestamp\|whole`; `--max-pages N`; `--parallel N`; `--parallel-files N`; `--force`; `-y/--yes`; `--json`; `--verbose/-v`; `-c/--config` |
 | `inspect` | Estimate size/pages/cost without parsing | `--json` |
 | `refine` | Markdown -> human-readable copy | `--skill refine_default\|refine_faithful\|refine_html`; `-o` |
 | `doctor` | Check env / deps / API keys | none |

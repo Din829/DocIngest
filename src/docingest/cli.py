@@ -167,6 +167,17 @@ def main(
         "--strategy",
         help="Override chunking strategy: auto, heading, recursive, slide, sheet, timestamp, whole.",
     ),
+    engine: Optional[str] = typer.Option(
+        None,
+        "--engine",
+        help=(
+            "Parsing engine: docling (default, local) | vision_only (skip docling "
+            "on PDF/image, render + full-page Vision — OOM-immune, higher Vision "
+            "cost) | azure_di (cloud parse via Azure Document Intelligence, needs "
+            "[azure] extra + credentials). Non-PDF/image formats auto-delegate to "
+            "docling under vision_only."
+        ),
+    ),
     max_pages: Optional[int] = typer.Option(
         None,
         "--max-pages",
@@ -318,6 +329,9 @@ def main(
 
     if strategy:
         cli_overrides.setdefault("chunking", {})["strategy"] = strategy
+
+    if engine:
+        cli_overrides.setdefault("parsing", {})["engine"] = engine
 
     if max_pages is not None:
         cli_overrides.setdefault("parsing", {})["max_pages"] = max_pages

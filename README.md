@@ -159,6 +159,11 @@ Options:
 ```
 -o, --output PATH    Output directory (default: ./knowledge/<input-name>/ for single input, ./knowledge/ for mixed)
 -c, --config PATH    Project config YAML
+--engine TEXT        Parsing engine: docling (default, local) | vision_only
+                     (skip docling on PDF/image — render + full-page Vision,
+                     OOM-immune, higher Vision cost; other formats auto-delegate
+                     to docling) | azure_di (cloud parse via Azure Document
+                     Intelligence, needs [azure] extra + credentials)
 --strategy TEXT      Override chunking strategy: auto | heading | recursive | slide | sheet | timestamp | whole
                      (auto picks heading/recursive/slide/sheet/timestamp/whole by file format)
 --max-pages INTEGER  Parse only the first N pages of paged inputs (PDF/PPTX/DOCX).
