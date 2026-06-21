@@ -885,6 +885,89 @@ def text_completion(
     raise RuntimeError(f"Text completion failed. Last error: {last_error}")
 
 
+def text_completion_structured(
+    prompt: str,
+    response_schema: type,
+    system_prompt: str = "",
+    model_config: dict[str, Any] | None = None,
+    max_tokens: int | None = None,
+):
+    """
+    Like text_completion, but force the model to return data matching a
+    Pydantic schema (structured output) instead of free text.
+
+    Used by the optional postprocess layer (template-driven extraction). Kept
+    next to text_completion so both share the same model-chain / api-key /
+    usage-recording machinery — the ONLY difference is passing
+    ``response_format=response_schema`` to litellm and validating the JSON
+    back into the schema. litellm translates the Pydantic model into the
+    provider's native JSON-schema constraint (Gemini / OpenAI / Anthropic
+    all support it).
+
+    Args:
+        prompt: The user prompt (the document / chunk to extract from).
+        response_schema: A pydantic.BaseModel subclass describing the target
+            shape. The returned object is an instance of this class.
+        system_prompt: Optional system instruction (extraction rules).
+        model_config: Same shape as text_completion (primary / fallback /
+            max_response_tokens / max_retries / _defaults).
+        max_tokens: Explicit output cap; None → resolve_max_tokens().
+
+    Returns:
+        An instance of ``response_schema`` validated from the model's JSON.
+
+    Raises:
+        RuntimeError: if every model in the chain failed (network error,
+            provider rejection, or JSON that won't validate against the
+            schema). The caller (postprocess Runner) catches this per-unit so
+            one bad chunk never aborts the whole run — same error-isolation
+            contract as the rest of the pipeline.
+    """
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+
+    effective_max_tokens = resolve_max_tokens(model_config, max_tokens)
+    effective_num_retries = resolve_max_retries(model_config)
+    models_to_try = _build_model_chain(model_config)
+    last_error = None
+
+    for model_entry in models_to_try:
+        _set_api_key(model_entry)
+        model_name = _resolve_model_name(
+            model_entry["provider"],
+            model_entry["model"],
+        )
+        try:
+            response = litellm.completion(
+                model=model_name,
+                messages=messages,
+                max_tokens=effective_max_tokens,
+                num_retries=effective_num_retries,
+                response_format=response_schema,
+                **_resolve_extra_params(model_entry),
+            )
+            _record_usage(response, model_name)
+            content = response.choices[0].message.content
+            if not content:
+                # Provider returned an empty body — treat as a failure of THIS
+                # model so the chain falls through to the fallback rather than
+                # raising a confusing validation error on "".
+                raise ValueError("structured completion returned empty content")
+            # Validate JSON → schema instance. A truncated / malformed body
+            # raises pydantic.ValidationError, caught below and recorded as
+            # this model's failure so the fallback model gets a chance.
+            return response_schema.model_validate_json(content)
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise RuntimeError(
+        f"Structured completion failed. Last error: {last_error}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

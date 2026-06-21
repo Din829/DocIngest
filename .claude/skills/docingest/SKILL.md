@@ -35,6 +35,7 @@ for the refine styles) — when in doubt, run those rather than trusting this co
 | `doctor` | Check environment: packages, external tools, API keys | After install, or when something fails unexpectedly. | (none) |
 | `visualize` | Draw parse bounding boxes onto rendered page images | QA/debugging for parsed layouts when bounding boxes are enabled. | `--pages`; `--labels`; `--numbers` |
 | `export` | Push knowledge base chunks → a vector store (Azure AI Search) | After `run`, when the user wants chunks loaded into Azure AI Search. Opt-in `[azure]` extra; bring-your-own embedding. | `--to azure-search`; `--endpoint`; `--index`; `--search-key`; `--embed-provider azure-openai\|openai`; `--embed-model`; `--embed-dim`; `--embed-endpoint`; `--vector-field` |
+| `extract` | Fill a YAML-declared schema from each document → strongly-typed records (`extracted/<template>.jsonl`) | After `run`, when the user wants a STRUCTURED table (fixed fields) out of a batch of similar docs — not free text. Template-driven (`postprocess_templates/*.yaml`); long docs auto-split + parallel + merged. | `-t/--template doc_summary\|<name>\|<path.yaml>`; `-o/--output`; `--input sources\|chunks`; `--parallel N`; `--json`; `-c/--config` |
 | `skills list` | List the refine SKILLs `refine --skill` can use | When unsure which refine style fits; `--json` for programmatic discovery. | `--json` |
 
 ## graph subcommands (`docingest graph <cmd>`) — opt-in

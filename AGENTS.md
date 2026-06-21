@@ -19,6 +19,7 @@ Per-flag detail: `docingest <cmd> --help`.
 | `doctor` | Check env / deps / API keys | none |
 | `visualize` | Draw parse bounding boxes onto page images | `--pages`; `--labels`; `--numbers` |
 | `export` | Knowledge base chunks -> vector store (opt-in `[azure]`) | `--to azure-search`; `--endpoint`; `--index`; `--search-key`; `--embed-provider azure-openai\|openai`; `--embed-model`; `--embed-dim`; `--embed-endpoint`; `--vector-field` |
+| `extract` | Docs -> strongly-typed records via a YAML template (`extracted/<template>.jsonl`) | `-t/--template`; `-o/--output`; `--input sources\|chunks`; `--parallel N`; `--json` |
 
 **Graph** (`docingest graph <cmd>`, requires `[graph]`)
 

@@ -123,6 +123,16 @@ bundle = [
     # or its absence degrades gracefully (no duration_sec, no crash).
     "imageio-ffmpeg>=0.5",
 ]
+postprocess = [
+    # Optional post-processing layer (docingest.postprocess): template-driven
+    # structured extraction (`docingest extract`). It needs NO third-party
+    # packages beyond the core install — litellm (structured output via
+    # response_format), pydantic (schema), and pyyaml (templates) are already
+    # core dependencies. This extra exists as a self-documenting marker of the
+    # feature; `pip install -e ".[postprocess]"` resolves to a no-op. The
+    # `docingest extract` command is therefore available out of the box, but
+    # like `graph` the main `docingest run` pipeline never touches it.
+]
 graph = [
     # Optional GraphRAG layer (docingest.graph). Loads only when explicitly
     # imported via `import docingest.graph`; main `docingest run` works

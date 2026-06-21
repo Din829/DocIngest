@@ -61,6 +61,16 @@ try:
 except ImportError:
     pass
 
+# Optional structured-extraction command — registered only when the
+# docingest.postprocess subpackage imports cleanly ([postprocess] extra).
+# Same conditional-mount pattern as graph above: silent when absent, never
+# blocks the rest of the CLI.
+try:
+    from .postprocess.cli import extract_cmd
+    app.command("extract")(extract_cmd)
+except ImportError:
+    pass
+
 # `docingest skills list` — the machine-readable counterpart to the refine
 # `--skill` flag's help text. Lets any consumer (agent / system integration)
 # discover the available refine styles without reading the prompt bodies.

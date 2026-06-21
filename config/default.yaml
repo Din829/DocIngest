@@ -1927,3 +1927,43 @@ graph:
     text_template: "[关键实体: {entities}]"
     entity_separator: "; "             # between consecutive entities
     name_desc_separator: " — "         # between entity name and its description
+
+
+# ---------------------------------------------------------------------------
+# Post-processing (optional, opt-in) — docingest.postprocess
+# ---------------------------------------------------------------------------
+# Second-pass LLM processing over a knowledge base's PRODUCED artefacts
+# (sources/*.md or chunks.jsonl), never the original documents. The first
+# (and currently only) processor is template-driven structured extraction:
+# `docingest extract <kb> --template <name>` fills a YAML-declared schema
+# from each document and writes <kb>/extracted/<template>.jsonl.
+#
+# Like `graph`, the main `docingest run` pipeline NEVER touches this — nothing
+# happens until you invoke `docingest extract` or docingest.postprocess.run().
+postprocess:
+  input: "sources"                # what to process: sources (whole md files,
+                                  # default — best for per-document records)
+                                  # | chunks (chunks.jsonl lines, fine-grained)
+  output_subdir: "extracted"      # results land in {output.dir}/extracted/
+  parallel: 8                     # parallel LLM calls when ONE document is too
+                                  # big for the context window and gets split
+  piece_char_limit: 30000         # max chars per LLM call; a document longer
+                                  # than this is split into multiple pieces,
+                                  # processed in parallel, then merged. ~30K
+                                  # chars stays well under the model window
+                                  # (≈10K tokens CJK / 7.5K Latin).
+  piece_overlap: 1500             # overlap (chars) between split pieces so a
+                                  # fact straddling a boundary isn't lost
+  min_chunk_tokens: 0             # (input=chunks only) skip chunks shorter
+                                  # than this — 0 = keep all
+  # LLM for extraction. INHERITED from models.defaults unless a
+  # models.extraction block is added (same one-model-to-rule convention as
+  # every other task). To use a cheaper model just for extraction, add a
+  # models.extraction.primary block.
+  extract:
+    template_dir: "postprocess_templates"  # project-local template dir (CWD);
+                                           # falls back to the package-bundled
+                                           # postprocess_templates/ for built-ins
+    max_list_items: 30            # cap list-type fields after cross-piece merge
+                                  # so a many-piece document doesn't produce an
+                                  # unbounded list (the POC's observed issue)

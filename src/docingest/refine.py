@@ -13,13 +13,12 @@ Usage:
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 from .config import get_nested
 from .models.provider import text_completion
-from .chunkers.base import BaseChunker, find_protected_spans
+from .chunkers.base import BaseChunker
 from .utils.resources import resource_root
 
 logger = logging.getLogger(__name__)
@@ -104,39 +103,15 @@ def _split_for_refine(content: str, target_tokens: int) -> list[str]:
     """
     Split markdown into heading-aligned pieces of roughly ``target_tokens`` each.
 
-    Greedy: accumulate lines until the running token count reaches the target,
-    then close the piece at the NEXT heading boundary. A heading inside a
-    protected span (table/code block, per ``find_protected_spans``) is not a
-    valid cut point, so a table is never split across pieces. Falls back to a
-    single piece when the document has no usable heading boundaries.
+    Thin wrapper over the shared ``postprocess.base.split_on_headings`` — the
+    heading-aligned, protected-span-aware splitter was lifted there verbatim so
+    refine and the postprocess extract layer share ONE splitter instead of two
+    copies. Behaviour is byte-identical to the previous in-module
+    implementation (same greedy accumulation, same protected-span guard, same
+    single-piece fallback when there's no usable heading boundary).
     """
-    lines = content.split("\n")
-
-    protected: set[int] = set()
-    for start, end in find_protected_spans(lines):
-        protected.update(range(start, end + 1))
-
-    def is_heading(idx: int) -> bool:
-        if idx == 0 or idx in protected:
-            return False
-        stripped = lines[idx].lstrip()
-        return stripped.startswith("#") and " " in stripped
-
-    pieces: list[str] = []
-    seg_start = 0
-    acc = 0
-    for idx in range(len(lines)):
-        acc += BaseChunker.estimate_tokens(lines[idx])
-        if is_heading(idx) and acc >= target_tokens:
-            piece = "\n".join(lines[seg_start:idx]).strip()
-            if piece:
-                pieces.append(piece)
-            seg_start = idx
-            acc = 0
-    tail = "\n".join(lines[seg_start:]).strip()
-    if tail:
-        pieces.append(tail)
-    return pieces
+    from .postprocess.base import split_on_headings
+    return split_on_headings(content, target_tokens)
 
 
 def _refine_pieces(
@@ -167,11 +142,10 @@ def _refine_pieces(
             return piece, False
         return refined, finish == "length"
 
-    if parallel and len(pieces) > 1:
-        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
-            outs = list(ex.map(_one, pieces))
-    else:
-        outs = [_one(p) for p in pieces]
+    # Shared fan-out helper (postprocess.base) — same ordered ex.map idiom,
+    # one copy. Order is preserved, which the stitch below depends on.
+    from .postprocess.base import run_pieces_parallel
+    outs = run_pieces_parallel(_one, pieces, max_workers, parallel=parallel)
 
     stitched = "\n\n".join(o[0] for o in outs)
     any_trunc = any(o[1] for o in outs)

@@ -1,0 +1,38 @@
+# Built-in template: a generic "document summary card".
+# Works across document types (novel, technical report, contract, ...),
+# demonstrating that one template generalises. Copy this file into your
+# project's ./postprocess_templates/ and edit the fields to define your own
+# extraction — no code changes needed.
+#
+# Field types: str | int | float | bool | list[str]
+# required: false  → the LLM may leave it null instead of inventing a value.
+
+name: doc_summary
+description: 从任意长文档抽取一张通用摘要卡
+
+fields:
+  - name: title
+    type: str
+    description: 文档的正式标题或主标题
+  - name: doc_type
+    type: str
+    description: 文档类型（如：小说/技术报告/合同/新闻/说明书等）
+  - name: main_topic
+    type: str
+    description: 文档的核心主题，一句话概括讲的是什么
+  - name: key_entities
+    type: list[str]
+    description: 文档中反复出现的关键实体（人物/组织/地点/产品/专有名词），最多15个
+  - name: key_points
+    type: list[str]
+    description: 文档的核心要点或主要结论，最多10条
+  - name: language
+    type: str
+    description: 文档的主要语言（中文/英文/日文等）
+    required: false
+
+rules:
+  - 这是从一份长文档的某个片段中抽取，请基于该片段尽力抽取，找不到的字段留空。
+  - key_entities 和 key_points 只列该片段中真实出现的，不要编造。
+  - 实体名称和要点保持与原文一致的语言，不要翻译。
+  - title / doc_type / main_topic 如果该片段看不出来，留空（null），后续会从其他片段合并。
