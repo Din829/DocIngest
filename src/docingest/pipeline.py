@@ -2961,9 +2961,15 @@ def _apply_vision_keep(markdown: str, config: dict[str, Any], doc_format: str | 
     guessing, which silently overwrote the wrong side in the old dedup).
 
     output.vision_keep:
-      both    → return markdown unchanged (DEFAULT, zero content loss)
+      both    → return markdown unchanged (zero content loss)
       vision  → drop the Docling half (before the marker), keep the marker + Vision
       docling → drop the marker + Vision half, keep the Docling half
+      auto    → decide PER PAGE which half to keep, using on-page signals
+                (see _page_prefers_vision): Vision riddled with [unreadable]/[?]
+                → keep Docling; Docling half looks table-collapsed → keep Vision;
+                otherwise keep Vision (same default bias as `vision`). Only
+                whole-page (`page=N`) markers participate; `image=` supplement
+                markers are left untouched on every page.
 
     SAFETY — page-aligned, full-mode formats only:
       - Supplement-mode formats (xlsx): Vision only supplements visuals; the
@@ -2981,7 +2987,7 @@ def _apply_vision_keep(markdown: str, config: dict[str, Any], doc_format: str | 
     Sections without a vision marker are returned untouched.
     """
     keep = str(get_nested(config, "output.vision_keep", "both")).lower()
-    if keep == "both" or keep not in ("vision", "docling"):
+    if keep == "both" or keep not in ("vision", "docling", "auto"):
         return markdown
 
     pagebreak = PAGEBREAK_MARKER
@@ -3019,16 +3025,101 @@ def _apply_vision_keep(markdown: str, config: dict[str, Any], doc_format: str | 
                 out.append(section)
                 continue
 
-        if keep == "vision":
+        # Resolve the per-section decision. For "vision"/"docling" it's fixed;
+        # for "auto" it's decided from on-page signals — but ONLY for whole-page
+        # markers. A supplement (`image=`) marker means Vision ADDED a figure
+        # description to an otherwise-Docling page; there is no "Docling half" to
+        # drop, so auto must leave it intact (treat as "both" for this section).
+        decision = keep
+        if keep == "auto":
+            marker_text = m.group(0)
+            if "page=" not in marker_text:
+                out.append(section)        # image= supplement → untouched
+                continue
+            docling_half = body[:m.start()]
+            vision_half = body[m.start():]
+            decision = "vision" if _page_prefers_vision(docling_half, vision_half) else "docling"
+
+        if decision == "vision":
             # Keep the marker + everything after it (Vision); drop Docling before.
             kept = body[m.start():]
             out.append(frontmatter + "\n\n" + kept if frontmatter else kept)
-        else:  # keep == "docling"
+        else:  # decision == "docling"
             # Keep everything before the marker (Docling); drop marker + Vision.
             kept = body[:m.start()].rstrip()
             out.append(frontmatter + kept if frontmatter else kept)
 
     return pagebreak.join(out)
+
+
+# Signals used by vision_keep="auto" to pick a half per page. Tuned to be
+# conservative: only override the default "keep Vision" bias when there is clear
+# evidence Vision failed on this page, or clear evidence Docling's table is sound.
+_UNREADABLE_RE = re.compile(r"\[unreadable")
+_PARTIAL_RE = re.compile(r"\[\?\]")
+# A "collapsed" Docling table row: a pipe-table row whose cells are (almost) all
+# single tokens / bare numbers with no multi-word cells — the year↔value pairing
+# is gone. We detect the symptom cheaply, not perfectly (it's a tie-breaker, not
+# a gate): used only to PREFER Vision when Docling looks collapsed.
+
+
+def _page_prefers_vision(docling_half: str, vision_half: str) -> bool:
+    """Per-page choice for vision_keep="auto": True → keep Vision, False → Docling.
+
+    Decision order (first hit wins):
+      1. Vision half is riddled with uncertainty markers ([unreadable]/[?]) far
+         beyond what Docling has → Vision didn't see this page well → keep Docling.
+      2. Docling half has a table that looks collapsed (rows of bare single-token
+         cells) while Vision's doesn't → keep Vision (the whole point of auto).
+      3. Default → keep Vision (same bias as the plain "vision" mode — Vision is
+         usually the superset on full-mode pages).
+
+    Cheap string heuristics only; no model calls. A tie-breaker, deliberately
+    biased to the historical default (Vision), so "auto" never does worse than
+    "vision" on a page where the signals are silent.
+    """
+    v_unreadable = len(_UNREADABLE_RE.findall(vision_half)) + len(_PARTIAL_RE.findall(vision_half))
+    d_unreadable = len(_UNREADABLE_RE.findall(docling_half)) + len(_PARTIAL_RE.findall(docling_half))
+
+    # 1. Vision clearly failed this page (3+ markers, and meaningfully more than
+    #    Docling) → trust Docling's plain extraction instead.
+    if v_unreadable >= 3 and v_unreadable > d_unreadable + 1:
+        return False
+
+    # 2. Docling table collapsed but Vision has a real table → keep Vision.
+    if _looks_table_collapsed(docling_half) and not _looks_table_collapsed(vision_half):
+        return True
+
+    # 3. Default bias: keep Vision.
+    return True
+
+
+def _looks_table_collapsed(text: str) -> bool:
+    """Heuristic: does this half contain a Markdown table whose data rows are
+    mostly bare single-token cells (year↔value pairing lost)?
+
+    Looks at pipe-table data rows (lines with >=2 `|`, excluding the header
+    separator `|---|`). A row is "collapsed-ish" when most of its non-empty
+    cells are a single token (no spaces) — e.g. `| 2024 | 5000 | 30 |` strung
+    out with no labels. Requires several such rows to fire, so a legitimately
+    numeric table (which Vision would also render numerically) doesn't trip it
+    on its own — this only matters as the tie-breaker in clause 2 above, paired
+    with Vision NOT looking collapsed.
+    """
+    collapsed_rows = 0
+    for line in text.splitlines():
+        if line.count("|") < 2:
+            continue
+        if set(line.strip()) <= set("|-: "):     # header separator row
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        cells = [c for c in cells if c]
+        if len(cells) < 2:
+            continue
+        single_token = sum(1 for c in cells if " " not in c)
+        if single_token >= max(2, len(cells) - 1):
+            collapsed_rows += 1
+    return collapsed_rows >= 3
 
 
 # ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ for the refine styles) — when in doubt, run those rather than trusting this co
 | `refine` | Rewrite a Markdown file into a human-readable version | ONLY when the user wants a readable/published version. **NOT** a RAG step — RAG consumes the raw `sources/*.md`. | `--skill refine_default\|refine_faithful\|refine_html`; `-o/--output`; `-c/--config` |
 | `doctor` | Check environment: packages, external tools, API keys | After install, or when something fails unexpectedly. | (none) |
 | `visualize` | Draw parse bounding boxes onto rendered page images | QA/debugging for parsed layouts when bounding boxes are enabled. | `--pages`; `--labels`; `--numbers` |
+| `export` | Push knowledge base chunks → a vector store (Azure AI Search) | After `run`, when the user wants chunks loaded into Azure AI Search. Opt-in `[azure]` extra; bring-your-own embedding. | `--to azure-search`; `--endpoint`; `--index`; `--search-key`; `--embed-provider azure-openai\|openai`; `--embed-model`; `--embed-dim`; `--embed-endpoint`; `--vector-field` |
 | `skills list` | List the refine SKILLs `refine --skill` can use | When unsure which refine style fits; `--json` for programmatic discovery. | `--json` |
 
 ## graph subcommands (`docingest graph <cmd>`) — opt-in

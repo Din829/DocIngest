@@ -105,6 +105,9 @@ def compute_cache_key(file_path: Path, sample_size: int = 8192) -> str:
 # Changing output.dir or performance.parallel_files does NOT invalidate cache.
 _RELEVANT_CONFIG_PATHS = [
     "parsing.engine",
+    "parsing.azure_di.model_id",           # azure_di backend: DI model id affects
+                                           # parse output (endpoint/api_key don't, so
+                                           # they're deliberately NOT here)
     "parsing.markdown.dedup_table_rows",   # generic table-row dedup toggle
     "parsing.ocr.engine",
     "parsing.ocr.languages",

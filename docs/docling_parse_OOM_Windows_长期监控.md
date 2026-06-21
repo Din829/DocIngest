@@ -529,6 +529,22 @@ docling 把整本页对象/模型中间态攒在内存的**架构行为，与崩
   - 跑完记得 `taskkill` 残留 python 进程（会占内存影响下次测试）。
   - 中文路径：`cd` 进中文目录会乱码，用绝对路径。
 
+- **⚠️ Vision 缓存污染对比测试（2026-06-21 踩过，血泪）**：DocIngest 的 Vision 结果
+  缓存在 `.docingest_cache/cache.db`（diskcache，按**页图内容哈希**键）。跑 A/B 路对比时，
+  **A 先跑会把结果写进缓存，B 跑同样页图直接命中 → calls/token/耗时全是假数据**（实测 B
+  独立跑 8 calls，紧跟 A 后跑只剩 4 calls，差异 100% 来自缓存）。`config_overrides={"force":True}`
+  **只清增量缓存（meta.json），不清 Vision diskcache**——所以 force 也救不了。
+  铁律：**每路对比前 `rm -rf .docingest_cache`，且读 `stats.token_usage.total_cache_hits`
+  确认 ==0 才算干净数据**。否则就是典型"事实(calls=4)≠结论(走了batched)"的假绿灯。
+  （另：vision_only 的页图是 pymupdf 渲的，docling 的是 docling 渲的，两者**哈希不同→缓存
+  互不命中**，这也是为什么 vision_only 那路没被 docling 的缓存污染。）
+
+- **⚠️ batched Vision 只对 xlsx/xls，PDF 永远 per-page（别看 calls 低就以为有 batched）**：
+  `pipeline.py` 的 `use_batched` 条件含 `doc_format in ("xlsx","xls")`——**PDF/PPT 走 per-page，
+  N 页 = N 次 litellm.completion**。所以 PDF 8 页就是 8 calls，这是**正确行为不是浪费**。
+  2026-06-21 一度从"docling 8 页只 4 calls"误推"PDF 也有 batched / vision_only 没用 batched
+  是 bug"——实为缓存污染（见上条）。**PDF 想省 Vision 调用靠 triage 跳页，不靠 batched。**
+
 ---
 
 ## 6. 改动文件清单（已落地代码 —— ⚠️ 不再"整体删"：修好后按待办 4/6 调阈值 + 保留兜底）

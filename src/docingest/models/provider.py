@@ -134,6 +134,28 @@ def _record_usage(response, model_name: str) -> None:
     )
 
 
+def _resolve_extra_params(model_entry: dict[str, Any]) -> dict[str, Any]:
+    """Per-model passthrough kwargs for litellm.completion.
+
+    A model entry MAY carry an ``extra_params`` dict whose keys are forwarded
+    verbatim to litellm.completion — the escape hatch for provider-specific
+    knobs DocIngest doesn't model explicitly (e.g. Gemini 3's
+    ``reasoning_effort`` / thinking level, ``temperature``, ``top_p``). We do
+    NOT translate or validate keys: the caller writes whatever litellm accepts
+    for that provider, and litellm owns the contract. Empty / missing → {}.
+
+    Example (config/default.yaml or config_overrides):
+        models:
+          vision:
+            primary:
+              provider: google
+              model: gemini-3.1-flash-lite
+              extra_params: { reasoning_effort: "minimal" }
+    """
+    extra = model_entry.get("extra_params")
+    return dict(extra) if isinstance(extra, dict) else {}
+
+
 def _resolve_model_name(provider: str, model: str) -> str:
     """
     Convert (provider, model) to litellm's model string format.
@@ -333,6 +355,7 @@ def describe_image(
                 messages=messages,
                 max_tokens=effective_max_tokens,
                 num_retries=effective_num_retries,
+                **_resolve_extra_params(model_entry),
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content
@@ -443,6 +466,7 @@ def describe_images_batched(
                 messages=messages,
                 max_tokens=effective_max_tokens,
                 num_retries=effective_num_retries,
+                **_resolve_extra_params(model_entry),
             )
             _record_usage(response, model_name)
             content_out = response.choices[0].message.content
@@ -814,6 +838,7 @@ def text_completion(
                 messages=messages,
                 max_tokens=effective_max_tokens,
                 num_retries=effective_num_retries,
+                **_resolve_extra_params(model_entry),
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content

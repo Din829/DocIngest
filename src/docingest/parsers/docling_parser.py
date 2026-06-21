@@ -222,9 +222,15 @@ class DoclingParser(BaseParser):
             self.config, "parsing.pdf.image_extraction", True
         )
 
-        # Page-level image generation (for per-page Vision)
+        # Page-level image generation (for per-page Vision).
+        # Docling's own page renderer is slow (measured ~470x slower than a
+        # direct PyMuPDF render on the same PDF). When the renderer is "pymupdf"
+        # (default), we render page images ourselves in _build_page_data and do
+        # NOT ask Docling to render them — saving that cost on every PDF. Only
+        # the "docling" renderer keeps the old generate_page_images path.
         vision_enabled = get_nested(self.config, "parsing.vision.enabled", True)
-        if vision_enabled:
+        renderer = get_nested(self.config, "parsing.pdf.page_image_renderer", "docling")
+        if vision_enabled and renderer == "docling":
             pipeline_options.generate_page_images = True
             # Docling's images_scale is a multiplier of the PDF's native 72 DPI.
             # 180 DPI → scale 2.5 → 1488×2105 for A4, ~3.1 Mpx (under 4MP cap).
@@ -1154,6 +1160,23 @@ class DoclingParser(BaseParser):
                 min_doc_pages=int(furn_cfg.get("min_doc_pages", 3)),
             )
 
+        # Fast path: render all page images in one PyMuPDF pass (PDF only, when
+        # the renderer is "pymupdf" and Vision is on). Returns {page_no: path}.
+        # Docling's own page render was disabled in _get_converter for this
+        # renderer, so page.image will be None below and we use this map instead.
+        pymupdf_page_images: dict[int, str] = {}
+        renderer = get_nested(self.config, "parsing.pdf.page_image_renderer", "docling")
+        vision_enabled = get_nested(self.config, "parsing.vision.enabled", True)
+        if (
+            renderer == "pymupdf"
+            and vision_enabled
+            and file_path.suffix.lower() == ".pdf"
+        ):
+            image_dpi = int(get_nested(self.config, "parsing.vision.image_dpi", 180))
+            pymupdf_page_images = self._render_pdf_pages_pymupdf(
+                file_path, assets_dir, image_dpi
+            )
+
         for page_no, page in doc.pages.items():
             # Extract per-page text via Docling
             page_text = ""
@@ -1162,9 +1185,10 @@ class DoclingParser(BaseParser):
             except Exception:
                 pass
 
-            # Save page image (if available)
-            image_path = ""
-            if page.image is not None:
+            # Save page image. Prefer the PyMuPDF render (fast path); fall back to
+            # Docling's page.image (docling renderer, or non-PDF formats).
+            image_path = pymupdf_page_images.get(page_no, "")
+            if not image_path and page.image is not None:
                 pil_img = None
                 if hasattr(page.image, "pil_image") and page.image.pil_image:
                     pil_img = page.image.pil_image
@@ -1212,6 +1236,65 @@ class DoclingParser(BaseParser):
             self._try_external_page_images(file_path, assets_dir, pages_data)
 
         return pages_data
+
+    @staticmethod
+    def _render_pdf_pages_pymupdf(
+        file_path: Path, assets_dir: Path, image_dpi: int
+    ) -> dict[int, str]:
+        """Render every PDF page to a PNG with PyMuPDF — the fast page-image path.
+
+        Returns {page_no (1-based): saved_png_path}. On any failure returns an
+        empty dict so the caller falls back to Docling's page.image render
+        (fail soft is correct HERE: page images only feed Vision, and the
+        Docling fallback still produces them — losing speed, not correctness).
+
+        Output matches the Docling path's contract: same filename pattern
+        ({stem}-page-{NNN}.png), same target DPI, and a 4 MP cap (Vision models
+        reject oversized images) applied at render time via the zoom factor —
+        no second resize pass.
+        """
+        import math
+
+        out: dict[int, str] = {}
+        # 4 MP ceiling — matches the max_image_pixels default used elsewhere for
+        # page images. We cap by lowering the render zoom, so we never render
+        # huge then downscale (one pass, less memory).
+        MAX_PIXELS = 4_000_000
+        try:
+            import pymupdf
+        except ImportError:
+            try:
+                import fitz as pymupdf  # older package name
+            except ImportError:
+                logger.debug("PyMuPDF unavailable — falling back to Docling page render.")
+                return out
+
+        try:
+            with pymupdf.open(str(file_path)) as doc:
+                for i in range(doc.page_count):
+                    page = doc.load_page(i)
+                    zoom = image_dpi / 72.0
+                    rect = page.rect
+                    # Predicted pixel count at this zoom; lower zoom if over cap.
+                    # get_pixmap rounds page_w*zoom UP to whole pixels, so a zoom
+                    # sized to land exactly on the cap can round just over it. Use
+                    # a 0.99 safety factor so the rounded result stays under MAX.
+                    px = (rect.width * zoom) * (rect.height * zoom)
+                    if px > MAX_PIXELS and px > 0:
+                        zoom *= math.sqrt(MAX_PIXELS / px) * 0.99
+                    matrix = pymupdf.Matrix(zoom, zoom)
+                    pix = page.get_pixmap(matrix=matrix, alpha=False)
+                    page_no = i + 1
+                    asset_name = f"{file_path.stem}-page-{page_no:03d}.png"
+                    output_path = assets_dir / asset_name
+                    pix.save(str(output_path))
+                    out[page_no] = str(output_path)
+        except Exception as e:
+            # Partial renders are fine to keep (each saved page is independent);
+            # the caller uses whatever pages succeeded and Docling-renders the
+            # rest via page.image. Surface as debug — not an error path.
+            logger.debug(f"PyMuPDF page render failed ({type(e).__name__}: {e}).")
+        return out
 
     @staticmethod
     def _extract_xlsx_images(file_path: Path, assets_dir: Path) -> list[str]:

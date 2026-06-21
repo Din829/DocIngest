@@ -193,6 +193,21 @@ gui = [
                               # future major. We use the stable surface
                               # (create_window / js_api / evaluate_js / start).
 ]
+azure = [
+    # Opt-in Azure plugin (docingest.azure) — two independent capabilities:
+    #   1. Parsing backend (parsing.engine=azure_di): parse in Azure DI's cloud
+    #      instead of local docling — sidesteps the docling-parse Windows
+    #      std::bad_alloc bug.
+    #   2. Export (docingest export --to azure-search): embed chunks + push them
+    #      into an Azure AI Search vector index (manual vectorization).
+    # Core `docingest run` never imports any of this; each SDK loads only when
+    # its capability actually runs (deferred imports throughout the plugin).
+    "azure-ai-documentintelligence>=1.0,<2",  # parse: DocumentIntelligenceClient +
+                                              # begin_analyze_document(output_content_format=MARKDOWN)
+    "azure-search-documents>=11.4,<12",       # export: SearchClient.upload_documents +
+                                              # SearchIndexClient (vector field schema)
+    "openai>=1.0,<3",                         # export: embeddings via OpenAI / AzureOpenAI client
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

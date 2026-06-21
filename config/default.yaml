@@ -101,7 +101,32 @@ models:
 # Phase 1: Document Parsing
 # =============================================================================
 parsing:
-  engine: "docling"           # docling | docling_with_fallback
+  engine: "docling"           # docling | docling_with_fallback | azure_di | vision_only
+                              # azure_di = OPT-IN plugin (docingest.azure): parse in
+                              # Azure Document Intelligence's cloud instead of local
+                              # docling. Sidesteps the docling-parse Windows OOM bug
+                              # (cloud parse = no local C++ memory pressure). Needs the
+                              # [azure] extra + credentials (see parsing.azure_di below).
+                              #
+                              # vision_only = skip Docling parsing on PAGE-IMAGE formats
+                              # (PDF / png / jpg / ...): render each page (PyMuPDF, fast,
+                              # no OOM) and let per-page Vision read the WHOLE page. Other
+                              # formats auto-delegate to the docling path (xlsx stays
+                              # openpyxl, docx/pptx stay docling, text stays text, audio
+                              # stays ASR). Trade-off — HONEST: every page is transcribed
+                              # by the Vision model (no Docling text → no triage skip), so
+                              # LLM token cost is HIGHER; in return you get OOM-immunity
+                              # and better fidelity on dense data-table pages Docling
+                              # collapses. Wall-clock mitigated by the Vision concurrency
+                              # pool (parsing.parallel). Choose deliberately.
+
+  # Azure Document Intelligence backend config (only read when engine=azure_di).
+  # Credentials resolve: DocIntelligenceProvider > these values > env
+  # (AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT / _KEY). Leave null to use env.
+  azure_di:
+    endpoint: null            # https://<resource>.cognitiveservices.azure.com/
+    api_key: null             # resource key (prefer env / provider over committing here)
+    model_id: "prebuilt-layout"   # DI model; prebuilt-layout = generic doc → markdown
 
   # Global page cap — parse only the FIRST N pages of each paged document
   # (PDF / PPTX / DOCX — anything Docling counts in pages). null = no cap
@@ -453,6 +478,22 @@ parsing:
 
   # PDF-specific
   pdf:
+    # Who renders PDF page images for per-page Vision.
+    #   docling (default): use Docling's built-in page render (generate_page_images).
+    #                      On the normal path Docling parses the PDF anyway, and
+    #                      its page render rides along nearly for free — MEASURED
+    #                      increment ~2.5s for 40 pages, same as PyMuPDF (no win
+    #                      from switching). So the default stays Docling.
+    #   pymupdf:           render with PyMuPDF directly; Docling's page render is
+    #                      then disabled. Only worth it if you ever run a path that
+    #                      does NOT need Docling's parse (e.g. a vision-only mode) —
+    #                      there, paying Docling's full parse just to get page
+    #                      images is wasteful (and can hit the Windows OOM bug),
+    #                      and a standalone PyMuPDF render is the right tool.
+    # Either way the images feed Vision identically (same DPI, 4 MP cap). PyMuPDF
+    # unavailable / a render error → auto-falls back to Docling's render (fail
+    # soft: page images only feed Vision, never affect text).
+    page_image_renderer: docling
     table_extraction: true
     # How Docling assigns text to recognised table cells.
     #   true  (default): map structure back to the PDF's own text cells —
@@ -1010,10 +1051,15 @@ output:
   #
   # vision_keep selects which half to keep, by SPLITTING ON THE MARKER (never by
   # length-ratio guessing — the old approach silently overwrote the wrong side):
-  #   both    = keep both halves (DEFAULT, zero content loss, = legacy behaviour)
+  #   both    = keep both halves (zero content loss, = legacy behaviour)
   #   vision  = drop the Docling half, keep Vision (de-dups full-mode pages;
   #             Vision is usually the superset for text PDF/PPT)
   #   docling = drop the Vision half, keep Docling
+  #   auto    = decide PER PAGE: keep Docling on pages where Vision is riddled
+  #             with [unreadable]/[?] (Vision didn't see it well); keep Vision
+  #             where Docling's table looks collapsed; otherwise keep Vision
+  #             (same bias as `vision`, so auto never does worse). Only whole-
+  #             page markers participate; image= supplements stay untouched.
   #
   # SAFETY — only applied to FULL-mode, pagebreak-aligned sections:
   #   - xlsx (supplement mode): Vision only ADDS visuals; the table body lives in
@@ -1023,7 +1069,7 @@ output:
   #     does NOT align page-by-page with the Docling text — the two halves are
   #     different content, not a superset pair. → IGNORED (stays both).
   # So `vision: vision` safely de-dups PDF/PPT while auto-protecting xlsx/docx.
-  vision_keep: vision           # both | vision | docling
+  vision_keep: vision           # both | vision | docling | auto
                                 # DEFAULT = vision: on a full-mode page (PDF/PPT)
                                 # keep only the Vision half (the superset view);
                                 # drop the redundant Docling half. xlsx/docx are
@@ -1280,10 +1326,17 @@ chunking:
 # Performance
 # =============================================================================
 performance:
-  parallel_files: 4           # Worker count shared by Vision per-page calls
+  parallel_files: 16          # Worker count shared by Vision per-page calls
                               # and ASR per-segment transcription (the
                               # WITHIN-file pools). File-level overlap is a
                               # separate knob: file_concurrency below.
+                              # 16 (raised from 4): Vision is I/O-bound (waiting
+                              # on the LLM), so higher concurrency cuts wall-clock
+                              # a lot — measured flash-lite at 32 ran 300 pages in
+                              # 87s with no rate-limiting. 16 is a balanced default
+                              # that most API tiers tolerate; lower it (e.g. 4-8)
+                              # on a shared / tier-1 key that hits RPM limits,
+                              # raise toward 32 on a high-RPM tier.
 
   # File-level pipeline overlap. 1 (default) = process files sequentially —
   # behaviour identical to before this knob existed. 2-3 = file B parses

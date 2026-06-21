@@ -96,6 +96,20 @@ def create_parser(config: dict[str, Any]) -> BaseParser:
 
     if engine in ("docling", "docling_with_fallback"):
         return _DoclingWithFallback(config)
+    elif engine == "azure_di":
+        # Opt-in Azure Document Intelligence backend (cloud parse — sidesteps
+        # the docling-parse Windows OOM bug). Imported here, not at module top,
+        # so the azure plugin and its [azure] extra stay fully optional: an
+        # install without [azure] never touches this import unless selected.
+        from ..azure import AzureDIParser
+        return AzureDIParser(config)
+    elif engine == "vision_only":
+        # Skip Docling parsing on page-image formats (PDF/image): render pages
+        # and let Vision read them. Other formats delegate to the Docling path
+        # (see VisionOnlyParser.parse). Local import keeps the default path from
+        # touching this module at all.
+        from .vision_only_parser import VisionOnlyParser
+        return VisionOnlyParser(config)
     else:
         # Unknown engine → just use text parser
         return TextParser(config)

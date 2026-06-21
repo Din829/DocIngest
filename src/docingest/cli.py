@@ -758,6 +758,123 @@ def visualize_cmd(
     )
 
 
+@app.command("export")
+def export_cmd(
+    knowledge_dir: Path = typer.Argument(
+        ...,
+        help="Processed knowledge dir (containing chunks.jsonl) or a chunks.jsonl path.",
+        exists=True,
+    ),
+    to: str = typer.Option(
+        "azure-search", "--to",
+        help="Destination. Currently: azure-search (more backends may follow).",
+    ),
+    endpoint: str = typer.Option(
+        ..., "--endpoint", help="Azure AI Search endpoint (https://<svc>.search.windows.net).",
+    ),
+    index: str = typer.Option(
+        ..., "--index", help="Target index name (must already exist with a vector field).",
+    ),
+    search_key: Optional[str] = typer.Option(
+        None, "--search-key",
+        help="Azure Search admin key. Falls back to AZURE_SEARCH_API_KEY env, then Entra ID.",
+    ),
+    embed_provider: str = typer.Option(
+        "azure-openai", "--embed-provider",
+        help="Embedding provider: azure-openai | openai.",
+    ),
+    embed_model: str = typer.Option(
+        ..., "--embed-model",
+        help="Embedding model id (openai) or deployment name (azure-openai).",
+    ),
+    embed_dim: int = typer.Option(
+        1536, "--embed-dim",
+        help="Embedding dimension — MUST match both the model and the index vector field.",
+    ),
+    embed_endpoint: Optional[str] = typer.Option(
+        None, "--embed-endpoint",
+        help="Azure OpenAI endpoint (azure-openai only; or AZURE_OPENAI_ENDPOINT env).",
+    ),
+    embed_key: Optional[str] = typer.Option(
+        None, "--embed-key",
+        help="Embedding API key (or OPENAI_API_KEY / AZURE_OPENAI_API_KEY env).",
+    ),
+    vector_field: Optional[str] = typer.Option(
+        None, "--vector-field",
+        help="Index vector field name (default: content_vector). Override to match your index.",
+    ),
+    batch_size: int = typer.Option(
+        100, "--batch-size", help="Chunks embedded + uploaded per round.",
+    ),
+) -> None:
+    """Export a knowledge base's chunks to a vector store (Azure AI Search).
+
+    Embeds chunks with your chosen model and pushes them in. The index must
+    already exist with a matching vector field — use docingest.azure.
+    create_azure_search_index() to make one. Generic: --vector-field maps to
+    your index's field name; nothing is hardwired.
+    """
+    if to != "azure-search":
+        console.print(f"[red]✗[/red] Unknown --to '{to}'. Supported: azure-search.")
+        raise typer.Exit(1)
+
+    # Imported here so the [azure] extra is only needed when export actually runs.
+    try:
+        from .azure import (
+            push_to_azure_search,
+            AzureOpenAIEmbedding,
+            OpenAIEmbedding,
+        )
+    except ImportError as e:
+        console.print(
+            f"[red]✗[/red] Azure export needs the [azure] extra: {e}\n"
+            f"    pip install -e \".[azure]\""
+        )
+        raise typer.Exit(1)
+
+    if embed_provider == "azure-openai":
+        embedding = AzureOpenAIEmbedding(
+            model=embed_model, api_key=embed_key,
+            dimension=embed_dim, endpoint=embed_endpoint,
+        )
+    elif embed_provider == "openai":
+        embedding = OpenAIEmbedding(
+            model=embed_model, api_key=embed_key, dimension=embed_dim,
+        )
+    else:
+        console.print(
+            f"[red]✗[/red] Unknown --embed-provider '{embed_provider}'. "
+            f"Supported: azure-openai | openai."
+        )
+        raise typer.Exit(1)
+
+    field_map = {"vector": vector_field} if vector_field else None
+
+    try:
+        result = push_to_azure_search(
+            knowledge_dir,
+            search_endpoint=endpoint,
+            index_name=index,
+            embedding=embedding,
+            search_key=search_key,
+            field_map=field_map,
+            batch_size=batch_size,
+        )
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        console.print(f"[red]✗[/red] {e}")
+        raise typer.Exit(1)
+
+    console.print(
+        f"\n  Azure Search export → [cyan]{index}[/cyan]: "
+        f"[green]{result.uploaded}[/green] uploaded, "
+        f"{result.failed} failed (of {result.total_chunks} chunks)\n"
+    )
+    if result.failed:
+        for err in result.errors[:5]:
+            console.print(f"    [yellow]·[/yellow] {err}")
+        raise typer.Exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Refine subcommand
 # ---------------------------------------------------------------------------

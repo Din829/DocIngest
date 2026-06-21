@@ -131,12 +131,19 @@ DocIngest/
 │  ├─ incremental.py                 增量缓存（cache_key / config_hash / meta.json）
 │  ├─ parsers/
 │  │  ├─ base.py                     BaseParser + ParseResult + PageData + PAGEBREAK_MARKER
-│  │  ├─ __init__.py                 create_parser + _DoclingWithFallback 路由
-│  │  ├─ docling_parser.py
+│  │  ├─ __init__.py                 create_parser 路由：parsing.engine →
+│  │  │                              docling(_DoclingWithFallback,默认) / vision_only
+│  │  │                              (VisionOnlyParser) / azure_di(azure 插件,条件 import)
+│  │  ├─ docling_parser.py           含 _render_pdf_pages_pymupdf（parsing.pdf.page_image_renderer
+│  │  │                              =pymupdf 时用；默认 docling，实测两者渲图同速）
+│  │  ├─ vision_only_parser.py       engine=vision_only：PDF/image 跳过 docling 解析，
+│  │  │                              pymupdf 渲页→Vision 全量转写（绕 OOM）；非 PDF/image
+│  │  │                              格式自动委托 docling 路（xlsx 仍 openpyxl、文本仍直读）
 │  │  ├─ media_parser.py             音视频：subtitle-first + ASR fallback；视频默认走
 │  │  │                              native_video（整段一次调用，Gemini 原生），不支持则降级抽帧画面理解
 │  │  ├─ text_parser.py              兜底 + 多编码尝试
 │  │  └─ vision.py                   per-page Vision + resolve_vision_config + prompt
+│  │                                 （batched 调用仅 xlsx/xls；PDF/PPT 永远 per-page）
 │  ├─ chunkers/
 │  │  ├─ base.py                     BaseChunker + Chunk + 保护块检测 + CJK token 估算
 │  │  ├─ __init__.py                 AutoChunker + create_chunker 工厂
@@ -187,6 +194,15 @@ DocIngest/
 │  ├─ integrations/                  可选下游框架适配（独立 import，不进主 pipeline）
 │  │  ├─ __init__.py                 包标记（不 import 任何子模块，避免拉可选依赖）
 │  │  └─ langchain.py                chunks.jsonl → LangChain Document（DocIngestLoader，opt-in）
+│  ├─ azure/                         可选 Azure 插件（[azure] extra，独立 import，不进主 pipeline）
+│  │  ├─ __init__.py                 顶层不 import 任何 azure SDK（opt-in，仿 graph）
+│  │  ├─ di_parser.py                AzureDIParser：engine=azure_di 时云端解析（绕 OOM）
+│  │  ├─ converter.py                DI AnalyzeResult → ParseResult（纯函数，无 SDK，可单测）
+│  │  ├─ provider.py                 DocIntelligenceProvider（DI 凭证注入）
+│  │  ├─ embedding.py                SearchEmbeddingProvider + OpenAI/AzureOpenAI（export 用，可注入）
+│  │  ├─ search_export.py            chunks.jsonl → embed → Azure AI Search（docingest export；
+│  │  │                              field_map 全可配、推前校验维度、metadata 通道开放式）
+│  │  └─ search_index.py            可选辅助：建标准向量索引（HNSW + 向量字段）
 │  ├─ graph/                         可选 GraphRAG 子模块（独立 import，不进主 pipeline）
 │  │  ├─ __init__.py                 public API: build / query / status / enrich_chunks / EmbeddingProvider / GraphBackend
 │  │  ├─ api.py                      facade：build / query / status / enrich_chunks + Result dataclass + 配置合并
