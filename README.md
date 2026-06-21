@@ -16,6 +16,7 @@ Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → pa
 | `readable/*.md` | Human-readable version (optional, via `refine`) |
 | `graph/` | Knowledge graph artefacts (optional, via `docingest graph build` — see [GraphRAG](#graphrag-optional)) |
 | `chunks_enriched.jsonl` | Same chunks as `chunks.jsonl` but with graph entity descriptions injected, for traditional vector RAG (optional, via `docingest graph enrich` or `--enrich-chunks`) |
+| `extracted/<template>.jsonl` | One strongly-typed record per document, filled from a YAML template (optional, via `docingest extract` — see [Structured extraction](#structured-extraction-optional)) |
 
 ## Install
 
@@ -102,6 +103,7 @@ pip install -e ".[mcp]"              # MCP Server (FastMCP)
 pip install -e ".[audio]"            # Audio transcription (DashScope Qwen3-ASR)
 pip install -e ".[azure]"            # Azure plugin: azure_di parse engine + export to Azure AI Search
 pip install -e ".[langchain]"        # LangChain loader (chunks.jsonl → Document)
+pip install -e ".[postprocess]"      # Structured extraction (docingest extract) — no extra deps; marker only
 pip install -e ".[graph]"            # Optional GraphRAG layer (LightRAG)
 pip install -e ".[graph-local]"      # Local embedding model — adds ~2GB torch libs
 pip install -e ".[graph-gemini]"     # Gemini embeddings for GraphRAG (google-genai SDK)
@@ -267,6 +269,65 @@ docingest export ./kb/ --to azure-search \
 
 Full usage, credential resolution, library API, and how to create an index live
 in [`src/docingest/azure/README.md`](src/docingest/azure/README.md).
+
+### Structured extraction (optional)
+
+Turn a knowledge base's clean Markdown into **strongly-typed records** — you declare the
+fields you want in a small YAML template, and an LLM fills that schema from each document
+(structured output). Where `docingest run` produces *text* and `graph build` produces a
+*graph*, `extract` produces a *table*: one record per document, fields exactly as you
+defined, ready for a database / spreadsheet / downstream system. It reads the produced
+`sources/*.md` (or `chunks.jsonl`) — never the original documents — and writes
+`extracted/<template>.jsonl`. Opt-in (`docingest.postprocess`); the core `run` pipeline
+never touches it.
+
+```bash
+docingest run ./docs/ -o ./kb/                          # 1. produce the knowledge base
+docingest extract ./kb/ --template doc_summary          # 2. fill the template per document
+docingest extract ./kb/ -t ./my_template.yaml --input chunks --parallel 8
+```
+
+A template is just a field table + extraction rules — change what gets extracted by editing
+YAML, no code. Built-in templates live in `postprocess_templates/`; drop your own there (or
+pass a path) to define a new extraction. Long documents are split, processed in parallel,
+then merged; a per-piece failure is isolated, not fatal.
+
+```yaml
+# postprocess_templates/contract.yaml — extract a contract card
+name: contract
+fields:
+  - name: party_a
+    type: str
+    description: 甲方 / first party
+  - name: amount
+    type: str
+    description: contract amount, keep the original wording
+    required: false
+  - name: obligations
+    type: list[str]
+    description: key obligations, max 10
+rules:
+  - Only extract what the text states; never invent.
+```
+
+Python library:
+
+```python
+import docingest.postprocess               # explicit import — never triggered by `import docingest`
+
+result = docingest.postprocess.run(
+    "./kb/",
+    processor="extract",
+    template="doc_summary",                 # built-in name, project-local name, or a .yaml path
+)
+print(result.units_ok, "/", result.units_total, "documents extracted")
+for r in result.records:
+    print(r["unit_id"], r["record"])        # record matches your template's schema
+```
+
+The LLM is the same one-model-to-rule default as every other task (override with a
+`models.extraction` block, or inject `llm=docingest.GeminiProvider(...)`). All knobs are
+under `postprocess.*` in `config/default.yaml`. Per-flag detail: `docingest extract --help`.
 
 ### Python Library
 
@@ -717,6 +778,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Phase breakdown, design
 - **Sensitive data sanitization** — opt-in PII masking (email, URL, credit card with Luhn validation, IPv4, JP phone). High-precision rules only, no name detection. Default OFF (`sanitize.enabled`).
 - **Incremental cache** — content-addressed, per-file, crash-safe. 100 docs + 1 new → only 1 re-runs.
 - **AI Refine** — standalone `refine` command for human-readable output with Mermaid flowcharts.
+- **Template-driven structured extraction** — opt-in `docingest extract` (`docingest.postprocess`) fills a YAML-declared Pydantic schema from each document via LLM structured output → one strongly-typed record per doc in `extracted/<template>.jsonl`. Change the fields by editing YAML, no code. Long docs are split + processed in parallel + merged; per-piece errors isolated. No extra deps (litellm + pydantic only). The core `run` pipeline never imports it.
 - **Knowledge Map** — auto-generated search guide + keyword reverse index. Optional SudachiPy integration for high-precision Japanese keyword extraction (language-routed: Japanese → SudachiPy, Chinese/Korean/English → regex).
 - **Multi-provider** — Gemini / OpenAI / Anthropic / DashScope with automatic fallback.
 - **Network-level retry** — every LLM call (Vision / text completion / ASR) passes `num_retries` to litellm, which applies exponential backoff on transient errors (rate limits, 5xx, TCP resets). Default 2 retries via `models.defaults.max_retries`; per-task override (e.g. `models.vision.max_retries: 5` for a flaky endpoint). Orthogonal to truncation retry (`retry_on_truncation`) which sits at the application layer.

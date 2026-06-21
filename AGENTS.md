@@ -40,6 +40,10 @@ Tools: `inspect`, `run`, `refine`, `build_graph`, `query_graph`,
 For unknown or large inputs: `inspect` -> review cost -> `run` -> read
 `knowledge_search.SKILL.md` -> search `sources/*.md` or consume `chunks.jsonl`.
 
+Optional second pass, after `run`: `extract` (template -> one strongly-typed
+record per doc in `extracted/*.jsonl`) when the user wants a structured table,
+not free text.
+
 ## Docs
 
 - Embedding DocIngest into another system (decision frame + traps + recipes) -> [docs/INTEGRATION.md](docs/INTEGRATION.md)

@@ -19,6 +19,8 @@ Per-flag detail: `docingest <cmd> --help`.
 | `refine` | Markdown → human-readable copy | Only when user wants a readable version; NOT a RAG step | `--skill refine_default\|refine_faithful\|refine_html`; `-o` |
 | `doctor` | Check env / deps / API keys | After install or on failure | (none) |
 | `visualize` | Draw parse bounding boxes onto page images | QA / debugging parse quality (needs `output.include_bounding_boxes`) | `--pages`; `--labels`; `--numbers` |
+| `export` | Knowledge base chunks → vector store (Azure AI Search) | After `run`, to load chunks into Azure AI Search (opt-in `[azure]`, bring-your-own embedding) | `--to azure-search`; `--endpoint`; `--index`; `--search-key`; `--embed-provider`; `--embed-model`; `--embed-dim`; `--embed-endpoint`; `--vector-field` |
+| `extract` | Docs → strongly-typed records via a YAML template | After `run`, when the user wants a STRUCTURED table (fixed fields) from a batch of similar docs — not free text | `-t/--template`; `-o/--output`; `--input sources\|chunks`; `--parallel N`; `--json` |
 | `skills list` | List the refine SKILLs `refine --skill` can use (name + summary) | When unsure which refine style fits; `--json` for programmatic discovery | `--json` |
 
 **graph** (`docingest graph <cmd>`, needs `[graph]`, pricier than Vision — only for "X↔Y relationships" / corpus-wide themes / multi-hop; for single facts your Grep on `sources/*.md` is cheaper)
