@@ -100,6 +100,8 @@ Add **one** only when you need that feature — there is deliberately no
 pip install -e ".[nlp]"              # Japanese keyword extraction (SudachiPy)
 pip install -e ".[mcp]"              # MCP Server (FastMCP)
 pip install -e ".[audio]"            # Audio transcription (DashScope Qwen3-ASR)
+pip install -e ".[azure]"            # Azure plugin: azure_di parse engine + export to Azure AI Search
+pip install -e ".[langchain]"        # LangChain loader (chunks.jsonl → Document)
 pip install -e ".[graph]"            # Optional GraphRAG layer (LightRAG)
 pip install -e ".[graph-local]"      # Local embedding model — adds ~2GB torch libs
 pip install -e ".[graph-gemini]"     # Gemini embeddings for GraphRAG (google-genai SDK)

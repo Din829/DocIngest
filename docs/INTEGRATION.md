@@ -256,7 +256,13 @@ Language-agnostic callers (Node, Go, Bash) shelling out to DocIngest.
 ```bash
 docingest inspect ./docs/ --json | jq '.[] | select(.est_cost_usd > 1.0)'
 docingest run ./docs/ -o ./kb/ --json > result.json
+docingest run ./docs/ -o ./kb/ --engine vision_only   # PDF/image: skip docling, all-Vision (OOM-immune)
 ```
+
+`--engine` switches the parse backend: `docling` (default, local) | `vision_only`
+(PDF/image → render + full-page Vision, no docling-parse OOM; other formats
+delegate to docling) | `azure_di` (cloud parse, needs `[azure]` extra). Output
+side: `docingest export --to azure-search` pushes chunks into Azure AI Search.
 
 Exit codes carry meaning: `0` success, `1` per-file failures occurred, `2` safety-strict abort, `130` interrupted by SIGINT. JSON goes to stdout; banner / progress / errors to stderr — pipe-friendly.
 

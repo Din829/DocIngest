@@ -292,16 +292,10 @@ errors.json: {"error":"Parse timed out: timed out after 300s","error_type":"time
 > 结论：**只有 PDF（和 image）会爆**。image 是单张、无"多页 OOM"场景，风险可忽略。
 > 用户最初问的"其它格式会不会爆"——答案是不会。
 
-### 待办 3【当前主线】：探 docling-parse 5.0.0~5.3.2 窗口
-方案 A 否决、方案 B 退 4.7.3 堵死后，这是仅剩的活路（见 §3 方案 B 末尾推导）。
-- **第一步（轻量、不污染环境）**：逐个版本只下 wheel 解压看 `pdf_parser.py` 有没有
-  `DoclingThreadedPdfParser`（`pip download docling-parse==X --no-deps` → 解压 grep）。
-  筛出**带这个类的最老版本**（= 兼容 docling 2.96.1 的下限）。
-- **第二步**：对那个下限版（及它附近 1-2 个）做 OOM 实测（75 页 WEO）+ 表格精度对照
-  （449-456 页，对比当前 6.2.0 基线，用 §3 那套裸数字碎片指标）。三件事都要过：
-  ① import 不崩（兼容）② status=SUCCESS（治 OOM）③ 表格精度不比 6.2.0 差。
 ### ~~待办 3：根治方案落地~~ —— ✅ 已落地方案 C 分批兜底（见 §3-C / §6）
-换版本路（A/B）放弃，采用分批兜底，代码已落地 + 实测。**这条完成。**
+换版本路（A/B）都否决（A 毁表格、B 不兼容），"探 5.0.0~5.3.2 版本窗口"也放弃
+（待办 4 的 2026-06-12 复查实测：换 threaded backend 同样丢页，版本路整体不可靠）。
+采用分批兜底，代码已落地 + 实测。**这条完成。**
 
 ### 待办 4【⭐ 当前主线：长期监控官方修复】
 分批兜底是**临时绕过，不是根治**——根子在 docling-parse 上游。官方修好 Windows 后，
@@ -385,7 +379,8 @@ proactive:
   batch_size: 50      # 比被动兜底的 10 大——主动分批非撞墙后，可用接近拐点的大批，少建 converter
 ```
 **已落地代码**（`docling_parser.py`）：
-- `parse()` 在 `_do_convert()` 前加主动分批前置判断（pdf + `_page_range is None` + 超阈值）
+- `parse()` 在 `_do_convert()` 前加主动分批前置判断（pdf + `_page_range is None` +
+  `proactive.enabled=true` + 超阈值；缺 enabled 则跳过主动分批，只留被动兜底）
 - `_parse_pdf_batched` 加 `batch_size` 参数（主动路径传 50，被动路径仍读 config 的 10）
 - 新增 `_probe_pdf_pages()`（PyMuPDF O(1) 探页数，失败返回 None → 回退整本）
 
