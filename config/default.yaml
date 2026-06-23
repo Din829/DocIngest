@@ -1728,6 +1728,33 @@ knowledge_map:
       - "group"                   # Docling internal group name
       - "list"                    # Docling internal group name
       - "slide"                   # Docling internal group name
+      # Common English function words. Headings rarely contain these, but the
+      # body-fallback path (structure-less docs) extracts running prose where
+      # they dominate — without this list a fallback file's top keywords are
+      # "the / and / with". Length>=3 alone can't catch them. Extend per domain.
+      - "the"
+      - "and"
+      - "for"
+      - "with"
+      - "our"
+      - "will"
+      - "that"
+      - "this"
+      - "are"
+      - "was"
+      - "have"
+      - "has"
+      - "from"
+      - "its"
+      - "their"
+      - "all"
+      - "not"
+      - "but"
+      - "you"
+      - "your"
+      - "can"
+      - "img"                     # leftover from "<!-- image: x.png -->" markers
+      - "png"
     max_per_file: 15              # Max keywords per file in knowledge_map
     max_index: 50                 # Max entries in keyword_index reverse map
     # Discrimination filter (TF-IDF document-frequency cut-off): words that
@@ -1738,6 +1765,19 @@ knowledge_map:
     # 1.0 disables the filter; the filter is also skipped for very small
     # corpora (< 3 files) where document frequency is not statistical.
     max_doc_frequency_ratio: 0.7
+    # Body fallback for structure-less documents. Keywords are normally pulled
+    # only from headings / title_paths / sheet names (high quality). A document
+    # with NONE of those (a plain prose note, a scan, a single-section PDF —
+    # any language) would contribute zero keywords and vanish from
+    # keyword_index. When that happens, fall back to extracting from the first
+    # few chunks' body text. Two guards keep body noise out: read at most
+    # fallback_max_chunks, and drop extractions longer than fallback_max_kw_len
+    # (a kana-less CJK run goes through the regex path, which can return a whole
+    # clause as one "word"). Titled documents never hit this path. Set
+    # fallback_to_body: false to restore the headings-only behaviour exactly.
+    fallback_to_body: true
+    fallback_max_chunks: 5        # chunks of body text scanned when falling back
+    fallback_max_kw_len: 12       # drop fallback keywords longer than this (CJK clause guard)
 # =============================================================================
 # Sensitive Data Sanitization (PII masking)
 # =============================================================================

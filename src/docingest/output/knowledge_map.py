@@ -118,6 +118,13 @@ def build_stage1(
     # Docling internal group names that carry no semantic meaning
     _noise_re = re.compile(r"^(group|slide-\d+|list)$", re.IGNORECASE)
 
+    # Body-fallback furniture strippers: the "[来源: ...]" provenance header
+    # chunks carry, and "<!-- image: x.png -->" / other HTML-comment markers.
+    # Used only on the body-fallback path so it can't pollute keywords with
+    # img / png / the source path.
+    _BODY_SOURCE_HEADER_RE = re.compile(r"^\[来源:[^\]]*\]\s*", re.MULTILINE)
+    _HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
     # Pre-index chunks by source path. Before this the per-file loop did
     # `[c for c in chunks if c.metadata.source == path]` inside the loop,
     # giving an O(F × C) scan (100 files × 10k chunks = 1M comparisons).
@@ -157,11 +164,40 @@ def build_stage1(
             and not _noise_re.match(tp)
         ))
 
-        # Extract keywords from headings/title_paths (highest quality source)
+        # Extract keywords from headings/title_paths (highest quality source).
         keyword_sources = sections + title_paths + sheet_names
         raw_keywords: list[str] = []
         for text in keyword_sources:
             raw_keywords.extend(extractor.extract(text))
+
+        # Fallback for structure-less documents (no headings / title_paths /
+        # sheet names — e.g. a plain prose note, a scanned doc, a single-section
+        # PDF): a file with no title source would otherwise contribute ZERO
+        # keywords and go invisible in keyword_index, regardless of language.
+        # Only fires when the title sources produced nothing, so titled docs are
+        # untouched (their high-quality keywords stand alone). The body is
+        # noisier than headings, so two guards keep it honest: cap the chunks
+        # read (cost) and drop over-long extractions (a CJK run with no kana
+        # goes through the regex path, which can return a whole clause as one
+        # "word" — useless as a keyword). Everything still passes the same
+        # df>70% discrimination filter downstream.
+        if not raw_keywords and file_chunks:
+            kw_cfg_local = get_nested(config, "knowledge_map.keywords", {})
+            if kw_cfg_local.get("fallback_to_body", True):
+                max_chunks = int(kw_cfg_local.get("fallback_max_chunks", 5))
+                max_len = int(kw_cfg_local.get("fallback_max_kw_len", 12))
+                for c in file_chunks[:max_chunks]:
+                    body = c.get("text") or c.get("content") or ""
+                    # Body carries pipeline furniture the headings never did:
+                    # the "[来源: ...]" provenance header and "<!-- image: x.png -->"
+                    # markers. Left in, they yield junk keywords (img / png /
+                    # the source path). Strip both before extraction — cheap and
+                    # specific, not a general sanitizer.
+                    body = _BODY_SOURCE_HEADER_RE.sub("", body)
+                    body = _HTML_COMMENT_RE.sub("", body)
+                    for kw in extractor.extract(body):
+                        if len(kw) <= max_len:
+                            raw_keywords.append(kw)
 
         # Count and deduplicate
         kw_counter = Counter(raw_keywords)
