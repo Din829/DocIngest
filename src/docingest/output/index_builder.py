@@ -15,11 +15,23 @@ from __future__ import annotations
 
 import json
 import datetime
+import re
 from pathlib import Path
 from typing import Any
 
 from ..config import get_nested
 from ..parsers.base import ParseResult
+
+
+# A heading is only worth indexing as a "section" if it carries at least one
+# meaningful character — a letter, a digit, or a CJK ideograph/kana/hangul. A
+# heading made entirely of punctuation (e.g. a "## !@#$%^&*" line a parser
+# emitted from a symbols-only source) is pure noise to an agent skimming the
+# index. Matches Latin/Greek/Cyrillic letters, digits, and the CJK ranges.
+_MEANINGFUL_CHAR_RE = re.compile(
+    r"[0-9A-Za-zÀ-ɏͰ-ϿЀ-ӿ"
+    r"぀-ヿ㐀-䶿一-鿿가-힯]"
+)
 
 
 def _extract_sections(markdown: str) -> list[str]:
@@ -62,7 +74,9 @@ def _extract_sections(markdown: str) -> list[str]:
             hashes = len(stripped) - len(stripped.lstrip("#"))
             if 1 <= hashes <= 6 and stripped[hashes:hashes + 1] == " ":
                 title = stripped[hashes:].strip()
-                if title:
+                # Keep only headings with at least one meaningful character —
+                # a pure-punctuation heading is noise, not a section.
+                if title and _MEANINGFUL_CHAR_RE.search(title):
                     headings.append((hashes, title))
 
     if not headings:
