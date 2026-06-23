@@ -117,9 +117,15 @@ class VisionOnlyParser(BaseParser):
                 num_pictures=1,
             ))
 
-        # Markdown is page-delimited placeholders; Phase 1.5 Vision fills each
-        # page section in. PAGEBREAK_MARKER keeps page alignment for chunking and
-        # for vision_keep's per-page logic.
+        # Per-page image SIZES are recorded here (we just rendered them, so the
+        # pixel dimensions are known). The page-image PATHS are NOT set here:
+        # the pipeline collects those uniformly from the assets on disk for
+        # EVERY format (see pipeline._collect_page_images_for_file), so a single
+        # collection point covers vision_only, Docling-rendered docx/pptx/xlsx,
+        # and any future page-rendering format. We only contribute the sizes,
+        # which that scan can't cheaply get without opening each PNG.
+        page_sizes = self._page_image_sizes(page_images)
+
         markdown = f"\n{PAGEBREAK_MARKER}\n".join("" for _ in pages)
         result = ParseResult(
             markdown=markdown,
@@ -128,6 +134,7 @@ class VisionOnlyParser(BaseParser):
                 "title": file_path.stem,
                 "pages": len(pages),
                 "parser_engine": "vision_only",
+                "page_sizes": page_sizes,
             },
             pages=pages,
             success=True,
@@ -160,6 +167,9 @@ class VisionOnlyParser(BaseParser):
             )
 
         pages = [PageData(page_no=1, text="", image_path=image_path, num_pictures=1)]
+        # Only sizes here; page-image paths are collected pipeline-side from the
+        # assets on disk (format-agnostic). See _parse_pdf for the rationale.
+        page_sizes = self._page_image_sizes({1: image_path})
         result = ParseResult(
             markdown="",
             metadata={
@@ -167,6 +177,7 @@ class VisionOnlyParser(BaseParser):
                 "title": file_path.stem,
                 "pages": 1,
                 "parser_engine": "vision_only",
+                "page_sizes": page_sizes,
             },
             pages=pages,
             success=True,
@@ -180,6 +191,23 @@ class VisionOnlyParser(BaseParser):
         )
         assets_dir.mkdir(parents=True, exist_ok=True)
         return assets_dir
+
+    def _page_image_sizes(self, page_images: dict[int, str]) -> dict[str, list[int]]:
+        """{page_no: png_path} → {str(page_no): [width_px, height_px]}.
+
+        Reads the PNG header only (PIL does not decode pixels for .size), so this
+        is cheap even on 500-page renders. A page whose size can't be read is
+        omitted rather than guessed — a missing entry is the honest signal, and
+        downstream treats page_sizes as best-effort (same as the Docling path)."""
+        from PIL import Image
+        sizes: dict[str, list[int]] = {}
+        for page_no, path in page_images.items():
+            try:
+                with Image.open(path) as im:
+                    sizes[str(page_no)] = [im.width, im.height]
+            except Exception:
+                continue
+        return sizes
 
     def supported_extensions(self) -> set[str]:
         # Reports the SAME set as the Docling path: for non-page-image formats it

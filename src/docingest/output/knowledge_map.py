@@ -191,6 +191,11 @@ def build_stage1(
             file_info["sheets"] = sheet_names
         if filtered_keywords:
             file_info["keywords"] = filtered_keywords
+        # Flag whether this file has per-page screenshots registered in the
+        # index (vision_only engine). Drives a one-line pointer in SKILL.md so
+        # an agent knows the page images exist + where to find their paths.
+        if file_entry.get("page_image_paths"):
+            file_info["has_page_images"] = True
 
         files_info.append(file_info)
 
@@ -515,6 +520,21 @@ def write_skill_md(
                 f"| {f.get('language', '')} | {f.get('chunks', 0)} | {sec_str} |"
             )
         lines.append("")
+
+        # One-line pointer: when any file carries per-page screenshots
+        # (vision_only engine), tell the agent they exist and where the paths
+        # live. Only emitted when there ARE such images, so a text-only
+        # knowledge base stays free of irrelevant noise.
+        if any(f.get("has_page_images") for f in files):
+            lines.append(
+                "> 各ページのスクリーンショット画像が `assets/` にあります。"
+                "パス一覧は `index.json` の `page_image_paths`（ページ番号→画像パス）。"
+                "原図の確認や画像ベースの検索が必要なときに利用してください。 "
+                "(Per-page screenshots are in `assets/`; their paths are in "
+                "`index.json` → `page_image_paths`. Use them when you need the "
+                "original image or image-based retrieval.)"
+            )
+            lines.append("")
 
     # Search guide
     search_guide = knowledge_map.get("search_guide", [])

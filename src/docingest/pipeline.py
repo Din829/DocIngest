@@ -184,6 +184,11 @@ class FileResult:
     # rendered page images by true page size instead of an assumed DPI.
     # None when Docling didn't emit any.
     page_sizes: dict[str, Any] | None = None
+    # NOTE: per-page screenshot PATHS are NOT a FileResult field — they're
+    # collected pipeline-side from the assets on disk (format-agnostic, any
+    # engine that rendered page images), see _collect_page_images_for_file.
+    # Only page_sizes rides FileResult, because sizes can't be cheaply derived
+    # from the asset scan without opening each PNG.
     # Lifecycle status for this run — consumed by run_log to render a
     # human-readable timeline. One of: "added" (new file, first time seen),
     # "updated" (cache existed but invalidated), "cached" (hit, reused),
@@ -3717,6 +3722,10 @@ def process_single_file(
             # visualizer / cli, all of which look it up from index.json, never
             # from the chunk. On a 100-page doc it was ~40% of chunks.jsonl.
             "page_sizes",
+            # Per-page screenshot paths (vision_only) — same scope as page_sizes:
+            # inherently per-file, keyed by page number, read only from
+            # index.json (never the chunk). Keep it out of every chunk.
+            "page_image_paths",
             # Internal diagnostic flag set only when the OOM batch-fallback
             # parse path ran (docling_parser). It records HOW the parse was
             # done, not anything about this chunk — run history already lives
@@ -3888,6 +3897,8 @@ def process_single_file(
     ps = parse_result.metadata.get("page_sizes")
     if ps:
         result.page_sizes = ps
+    # (page_image_paths is NOT carried here — collected from disk assets in
+    # _make_index_parse_result so every page-rendering format is covered.)
 
     # Collect non-fatal warnings produced during this file's processing
     # (page caps, OCR fallbacks, etc.) for run_pipeline to aggregate.
@@ -3908,6 +3919,46 @@ def process_single_file(
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
+
+_PAGE_IMAGE_RE = re.compile(r"-page-(\d+)\.(?:png|jpg|jpeg)$", re.IGNORECASE)
+
+
+def _collect_page_images_for_file(
+    stem: str,
+    output_dir: Path,
+    config: dict[str, Any],
+) -> dict[str, str]:
+    """
+    Build {page_no: "assets/<stem>-page-NNN.png"} purely from what's ON DISK.
+
+    Format-agnostic by design: ANY engine/format that rendered per-page images
+    (vision_only PDF/image, the Docling path's LibreOffice render of
+    docx/pptx/xlsx, ...) names them `{stem}-page-NNN.{ext}`, so we just scan the
+    assets dir for that pattern. "Judge by the produced artefact, not by which
+    code path made it" — one place covers every format, and a future format
+    that emits page images is registered automatically with no code change.
+
+    Returns {} when no page images exist for this stem (text-only formats,
+    or a render that didn't happen). Page numbers are strings (JSON keys),
+    zero-padding stripped to the integer value.
+    """
+    assets_dir_name = get_nested(config, "output.assets_dir", "assets")
+    assets_dir = output_dir / assets_dir_name
+    if not assets_dir.exists():
+        return {}
+    prefix = f"{stem}-"
+    out: dict[str, str] = {}
+    for asset in assets_dir.iterdir():
+        if not asset.is_file() or not asset.name.startswith(prefix):
+            continue
+        m = _PAGE_IMAGE_RE.search(asset.name)
+        if not m:
+            continue
+        page_no = str(int(m.group(1)))  # "001" -> "1"
+        out[page_no] = f"{assets_dir_name}/{asset.name}"
+    # Sort by numeric page order for a stable, readable index entry.
+    return {k: out[k] for k in sorted(out, key=int)}
+
 
 def _collect_asset_rels_for_file(
     file_path: Path,
@@ -4071,6 +4122,7 @@ def _parse_frontmatter(markdown: str) -> dict[str, Any]:
 def _make_index_parse_result(
     file_result: FileResult,
     output_dir: Path,
+    config: dict[str, Any],
 ) -> "ParseResult":
     """
     Create a lightweight ParseResult from FileResult for IndexBuilder.
@@ -4103,6 +4155,16 @@ def _make_index_parse_result(
     # element_boxes so the visualizer can scale by true page size.
     if file_result.page_sizes:
         metadata["page_sizes"] = file_result.page_sizes
+    # Per-page screenshot paths — derived from the assets ACTUALLY ON DISK
+    # (any format that rendered page images), not from one engine's metadata.
+    # This is the format-agnostic collection point: vision_only's PDF/image
+    # render and the Docling path's LibreOffice render of docx/pptx/xlsx all
+    # land here. Empty dict (text-only formats) → field omitted by index_builder.
+    page_images = _collect_page_images_for_file(
+        Path(file_result.original_file).stem, output_dir, config
+    )
+    if page_images:
+        metadata["page_image_paths"] = page_images
 
     return ParseResult(
         markdown=markdown,
@@ -4578,7 +4640,7 @@ def run_pipeline(
 
             # Add to index (returns the entry so we can store it in meta.json)
             index_entry = index_builder.add_file(
-                parse_result=_make_index_parse_result(file_result, output_dir),
+                parse_result=_make_index_parse_result(file_result, output_dir, config),
                 original_file=file_path,
                 output_path=output_dir / file_result.output_path,
                 output_dir=output_dir,

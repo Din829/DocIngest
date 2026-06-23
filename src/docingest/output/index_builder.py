@@ -129,6 +129,15 @@ class IndexBuilder:
         # element_boxes for the same reason — it's inherently per-file data.
         if metadata.get("page_sizes"):
             entry["page_sizes"] = metadata["page_sizes"]
+        # Per-page rendered screenshot paths ({page_no: "assets/...-page-NNN.png"}).
+        # Emitted by the vision_only engine (which renders every page) so a
+        # downstream visual / image-RAG consumer can locate each page's image
+        # without re-deriving the filename pattern. The Docling path doesn't set
+        # this (its page images, when present, are an internal Vision input, not
+        # a promised per-page artefact), so the field simply doesn't appear there
+        # — no change to existing index consumers.
+        if metadata.get("page_image_paths"):
+            entry["page_image_paths"] = metadata["page_image_paths"]
 
         self.files.append(entry)
         self.total_chunks += chunks_count
