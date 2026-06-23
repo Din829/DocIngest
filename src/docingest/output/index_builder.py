@@ -24,25 +24,53 @@ from ..parsers.base import ParseResult
 
 def _extract_sections(markdown: str) -> list[str]:
     """
-    Extract top-level section titles from Markdown.
+    Extract the document's main section titles from Markdown — the shallowest
+    heading level that actually appears, in document order.
 
-    Looks for ## headings (H2) as main sections.
-    Falls back to # (H1) if no H2 found.
+    Why "shallowest present level" instead of a fixed H2/H1 rule: a document's
+    main sections do not live at a fixed heading depth. A slide deck headings
+    every slide at H1; a DB spec sheets each table at H2 with no H1; a deeply
+    nested spec may start its real structure at H3. The old "H2, else H1" rule
+    misfired whenever H2 was NOT the main level — e.g. a deck with 11 H1
+    chapters but a single stray H2 returned just that one H2 and dropped all 11
+    chapters. Heading semantics already encode importance (shallower = more
+    top-level), so we take whichever level is the shallowest one present and
+    return all of its titles. Structure-agnostic: no per-format assumption, no
+    magic level number.
+
+    Fenced code blocks are skipped so a ``# comment`` inside ```python ...```
+    is never mistaken for an H1 heading.
+
+    Returns [] for a document with no headings at all (the caller stores no
+    sections, same as before). No truncation here — downstream consumers
+    (knowledge_map / SKILL.md) apply their own caps.
     """
-    sections = []
+    # Pass 1: collect (level, title) for every real heading, skipping fences.
+    headings: list[tuple[int, str]] = []
+    in_fence = False
     for line in markdown.split("\n"):
         stripped = line.strip()
-        if stripped.startswith("## ") and not stripped.startswith("### "):
-            sections.append(stripped[3:].strip())
+        # A fence is ``` or ~~~ (optionally with a language tag). Toggle and
+        # skip the fence line itself.
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        # ATX heading: 1-6 '#' followed by a space. Count the run of '#'.
+        if stripped.startswith("#"):
+            hashes = len(stripped) - len(stripped.lstrip("#"))
+            if 1 <= hashes <= 6 and stripped[hashes:hashes + 1] == " ":
+                title = stripped[hashes:].strip()
+                if title:
+                    headings.append((hashes, title))
 
-    # If no H2 found, try H1
-    if not sections:
-        for line in markdown.split("\n"):
-            stripped = line.strip()
-            if stripped.startswith("# ") and not stripped.startswith("## "):
-                sections.append(stripped[2:].strip())
+    if not headings:
+        return []
 
-    return sections
+    # Pass 2: keep only the shallowest level present, in document order.
+    shallowest = min(level for level, _ in headings)
+    return [title for level, title in headings if level == shallowest]
 
 
 class IndexBuilder:
