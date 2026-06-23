@@ -35,6 +35,15 @@ models:
       provider: "openai"
       model: "gpt-5.4-mini"
       api_key_env: "OPENAI_API_KEY"
+    # Cheaper Vision alternative — gemini-3.1-flash-lite-preview (~half the
+    # token price). We tested it head-to-head on a mixed real doc (CSR report
+    # screenshots + handwriting) and kept Flash as the default: Lite read plain
+    # text and chart NUMBERS just as well, but lost table column structure,
+    # UNDER-marked [unreadable] on genuinely obscured cells (an anti-hallucination
+    # regression — DocIngest's whole point is flagging uncertainty, not hiding
+    # it), transcribed ~17% less, and was actually SLOWER on the current preview
+    # endpoint. If your inputs are text-light and cost is the only constraint,
+    # opt in by setting model above to "gemini-3.1-flash-lite-preview".
 
     # Output budget for every LLM call. Set to 65536 (Gemini 3 Flash /
     # 3.1 Pro hard ceiling per https://ai.google.dev/gemini-api/docs/models).
@@ -1603,6 +1612,12 @@ safety:
   vision_price_per_call:
     gemini-3-flash-preview: 0.0002
     gemini-3-flash: 0.0002
+    gemini-3.1-flash-lite-preview: 0.0001  # ~half flash's token price ($0.25/1M in
+    gemini-3.1-flash-lite: 0.0001          # vs $0.50). Cheaper, but NOT the default —
+                                           # measured weaker on table structure +
+                                           # under-marks [unreadable] (anti-hallucination
+                                           # regression) and was SLOWER on the preview
+                                           # endpoint. Opt in via models.vision.primary.
     gemini-3.1-pro-preview: 0.002       # current Gemini 3 Pro (3-pro-preview deprecated 2026-03-09)
     gemini-3-pro-preview: 0.002         # kept for cache hits on older runs
     gemini-3-pro: 0.002
