@@ -1552,6 +1552,23 @@ class DoclingParser(BaseParser):
             # up in the orphan footer below, so info is never lost).
             anchors_by_sheet = _collect_xlsx_image_anchors(file_path)
 
+            # Filler-placeholder rows config (parsing.xlsx.placeholder_rows):
+            # rows whose every non-empty cell is one of `values` are dropped as
+            # semantically-empty padding (the "200 real rows padded to 1M with
+            # '--'" case). Resolved once here at the config boundary and passed
+            # into the per-sheet renderer; `enabled: false` ⇒ empty set ⇒ the
+            # renderer's check degrades to the old all-empty-only behaviour.
+            ph_cfg = get_nested(self.config, "parsing.xlsx.placeholder_rows", {})
+            if ph_cfg.get("enabled", True):
+                ph_values = ph_cfg.get("values", None)
+                placeholder_values = (
+                    frozenset(str(v) for v in ph_values)
+                    if ph_values is not None
+                    else _DEFAULT_PLACEHOLDER_VALUES
+                )
+            else:
+                placeholder_values = frozenset()
+
             sheet_sections: list[str] = []
             anchored_assets: set[str] = set()
             # Visible sheet names in workbook order. Emitted into metadata
@@ -1593,6 +1610,7 @@ class DoclingParser(BaseParser):
                     # footer instead (further down) — passing None here
                     # avoids listing the same orphan on every sheet.
                     orphan_image_names=None,
+                    placeholder_values=placeholder_values,
                 )
                 if body_lines:
                     sheet_sections.append(
@@ -2230,10 +2248,58 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
     return result
 
 
+# Default "filler placeholder" tokens — cell values that are non-empty
+# strings but semantically empty, used to fill the unused region of a sheet.
+# Real Japanese spec/JD sheets routinely pad a 200-row table out to a nominal
+# max_row of 1M+ with these, which openpyxl reports as real values (not None),
+# so the existing empty-row pruning (which only knows None / "") can't drop
+# them and they flood the Markdown. Matched case-insensitively after strip().
+#
+# Deliberately conservative: a bare "-" is EXCLUDED here because it collides
+# with legitimate single-dash data; users who need it add it via
+# parsing.xlsx.placeholder_rows.values. Overridable per project — visually
+# similar dashes are different codepoints (U+002D / U+2013 / U+2014 / U+2015 /
+# U+2212), so a hardcoded list would always miss some; config is the right home.
+_DEFAULT_PLACEHOLDER_VALUES: frozenset[str] = frozenset({"--", "―", "n/a", "なし"})
+
+
+def _row_has_real_content(
+    cells: list[str],
+    placeholders: frozenset[str],
+) -> bool:
+    """
+    True if a rendered row carries at least one cell of REAL content —
+    i.e. a non-empty cell whose value is not just a filler placeholder.
+
+    This unifies two notions of "empty row" into one decision so the renderer
+    keeps a single concept of "worth emitting":
+      * all-empty rows (every cell "")          → False  (old behaviour)
+      * all-placeholder rows (every non-empty   → False  (new: drops the
+        cell is a filler like "--" / "N/A")              padding region)
+      * any cell with real text                 → True
+
+    Edge cases held deliberately:
+      * A MIXED row like ``["課長", "--", "Section manager"]`` returns True —
+        the "--" is preserved in place. We only ever drop a row when EVERY
+        non-empty cell is a placeholder, so a meaningful "no value for this
+        field" dash is never lost.
+      * An empty ``placeholders`` set degrades to plain ``any(cells)`` —
+        identical to the pre-feature behaviour, so disabling the feature is a
+        true no-op.
+    """
+    non_empty = [c for c in cells if c]
+    if not non_empty:
+        return False
+    if not placeholders:
+        return True
+    return any(c.strip().lower() not in placeholders for c in non_empty)
+
+
 def _render_xlsx_sheet_to_markdown(
     ws,
     image_anchors: dict[int, list[str]] | None = None,
     orphan_image_names: list[str] | None = None,
+    placeholder_values: frozenset[str] | None = None,
 ) -> list[str]:
     """
     Render a single openpyxl Worksheet to Markdown table lines.
@@ -2307,6 +2373,16 @@ def _render_xlsx_sheet_to_markdown(
                 cell_values[(r, c)] = text
                 cols_with_content.add(c)
 
+    # Filler-placeholder set: rows whose every non-empty cell is one of these
+    # (e.g. "--" / "N/A") are dropped as semantically-empty padding. Default
+    # set unless the caller passed an explicit (config-derived) one; values are
+    # normalised to stripped-lowercase so comparison in _row_has_real_content
+    # matches the cell text the same way. Empty set ⇒ feature off (no-op).
+    placeholders = (
+        _DEFAULT_PLACEHOLDER_VALUES if placeholder_values is None
+        else frozenset(v.strip().lower() for v in placeholder_values)
+    )
+
     # An image-only row (no cell text but an anchor sits on it) still
     # deserves a markdown line — without one, the image marker would
     # become orphaned and lose its "where in the sheet" context. So we
@@ -2329,11 +2405,13 @@ def _render_xlsx_sheet_to_markdown(
     emitted: list[tuple[int, list[str] | None]] = []   # (src_row, cells_or_None)
     for r in range(1, max_row + 1):
         row = [cell_values.get((r, c), "") for c in kept_cols] if kept_cols else []
-        if any(row):
+        if _row_has_real_content(row, placeholders):
             emitted.append((r, row))
         elif r in anchor_rows:
-            # Empty row but holds an image anchor → keep a placeholder row
-            # so the marker has a home. ``None`` signals "no cell line".
+            # Row carries no real content (empty OR all-placeholder) but holds
+            # an image anchor → keep a placeholder row so the marker has a home.
+            # Image rows are never dropped by the filler check — the picture is
+            # the content. ``None`` signals "no cell line".
             emitted.append((r, None))
 
     if not emitted:

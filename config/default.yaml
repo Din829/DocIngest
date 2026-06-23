@@ -968,6 +968,24 @@ parsing:
                                   # xlsx workload needs a tighter local cap.
       max_image_pixels: 4000000   # single image pixel cap (≈2000x2000). Larger images are scaled down.
 
+    # Filler-placeholder row dropping (openpyxl renderer only).
+    # Real Japanese spec / JD sheets routinely pad a small data table out to a
+    # nominal max_row of 1M+ by filling the unused region with a placeholder
+    # token like "--". openpyxl reports those as real string values (not None),
+    # so the empty-row pruning above — which only knows None / "" — can't drop
+    # them, and they flood the Markdown (chunks explode, tokens burn, the real
+    # rows drown). This drops a row ONLY when EVERY non-empty cell in it is a
+    # placeholder, so a meaningful single "--" inside a mixed row ("no value for
+    # this field") is always preserved. Image-anchored rows are never dropped.
+    placeholder_rows:
+      enabled: true
+      # Matched case-insensitively after strip(). A bare "-" is intentionally
+      # NOT included by default — it collides with legitimate single-dash data;
+      # add it here if your sheets use it as filler. Visually-similar dashes are
+      # distinct codepoints (- U+002D / – U+2013 / — U+2014 / ― U+2015 /
+      # − U+2212), so list whichever your files actually use.
+      values: ["--", "―", "N/A", "なし"]
+
     # Optional per-format Vision override. See parsing.pdf.vision for usage.
     vision:
       # max_response_tokens: 32768
