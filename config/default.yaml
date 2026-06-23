@@ -1757,6 +1757,26 @@ knowledge_map:
       - "can"
       - "img"                     # leftover from "<!-- image: x.png -->" markers
       - "png"
+      # Interrogatives + slide/layout furniture that surface as headings but
+      # carry no retrieval value ("How", "What", a slide titled "Agenda").
+      # Kept to high-confidence noise only — ambiguous words (rights / process /
+      # part) are NOT listed, since they're often real content; the df>70%
+      # filter handles those across a multi-file corpus.
+      - "how"
+      - "what"
+      - "where"
+      - "when"
+      - "why"
+      - "which"
+      - "who"
+      - "about"
+      - "find"
+      - "using"
+      - "agenda"
+      - "figure"
+      - "table"
+      - "image"
+      - "content"
     max_per_file: 15              # Max keywords per file in knowledge_map
     max_index: 50                 # Max entries in keyword_index reverse map
     # Discrimination filter (TF-IDF document-frequency cut-off): words that

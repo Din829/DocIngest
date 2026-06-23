@@ -87,7 +87,11 @@ class _SudachiExtractor:
 
         self._pos_keep: set[str] = set(kw_cfg.get("pos_keep", ["名詞"]))
         self._latin_min: int = int(kw_cfg.get("latin_min_len", 3))
-        self._stop: set[str] = set(kw_cfg.get("extra_stop_words", []))
+        # Stop words are matched case-insensitively: title-cased words ("The",
+        # "All", "How") are the common form in headings, so a lowercase config
+        # list otherwise never matched them. Lowercase the set once; callers
+        # compare with word.lower(). (CJK words are unaffected by lower().)
+        self._stop: set[str] = {w.lower() for w in kw_cfg.get("extra_stop_words", [])}
 
         # Regex fallback for non-Japanese text
         self._regex_fallback = _RegexExtractor(kw_cfg)
@@ -112,7 +116,7 @@ class _SudachiExtractor:
             # Skip single-char fragments and pure digits
             if len(compound) < 2 or compound.isdigit():
                 return
-            if compound not in self._stop and compound not in seen:
+            if compound.lower() not in self._stop and compound not in seen:
                 keywords.append(compound)
                 seen.add(compound)
 
@@ -128,7 +132,7 @@ class _SudachiExtractor:
 
         # --- Latin words via regex (SudachiPy doesn't tokenize English well) ---
         for word in re.findall(r"[A-Za-z][A-Za-z0-9]{1,}", text):
-            if len(word) >= self._latin_min and word not in self._stop:
+            if len(word) >= self._latin_min and word.lower() not in self._stop:
                 if word not in seen:
                     keywords.append(word)
                     seen.add(word)
@@ -156,7 +160,8 @@ class _RegexExtractor:
         self._latin_min: int = int(kw_cfg.get("latin_min_len", 3))
         self._cjk_min: int = int(kw_cfg.get("cjk_min_len", 3))
         self._cjk_min_after: int = int(kw_cfg.get("cjk_min_after_strip", 2))
-        self._stop: set[str] = set(kw_cfg.get("extra_stop_words", []))
+        # Case-insensitive stop matching (see _SudachiExtractor for why).
+        self._stop: set[str] = {w.lower() for w in kw_cfg.get("extra_stop_words", [])}
 
         # Compile strip patterns once
         raw_patterns: list[str] = kw_cfg.get("cjk_strip_patterns", [
@@ -178,7 +183,7 @@ class _RegexExtractor:
 
         # --- Latin words ---
         for word in re.findall(r"[A-Za-z][A-Za-z0-9]{1,}", text):
-            if len(word) >= self._latin_min and word not in self._stop:
+            if len(word) >= self._latin_min and word.lower() not in self._stop:
                 keywords.append(word)
 
         # --- CJK runs ---
@@ -192,10 +197,10 @@ class _RegexExtractor:
                 cleaned = pat.sub("", cleaned)
 
             # Accept if long enough after stripping
-            if len(cleaned) >= self._cjk_min_after and cleaned not in self._stop:
+            if len(cleaned) >= self._cjk_min_after and cleaned.lower() not in self._stop:
                 keywords.append(cleaned)
             # Also accept original if long enough (preserves compound terms)
-            elif len(run) >= self._cjk_min and run not in self._stop:
+            elif len(run) >= self._cjk_min and run.lower() not in self._stop:
                 keywords.append(run)
 
         return keywords
