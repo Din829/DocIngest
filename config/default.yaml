@@ -1728,6 +1728,8 @@ knowledge_map:
       - "group"                   # Docling internal group name
       - "list"                    # Docling internal group name
       - "slide"                   # Docling internal group name
+      - "transcript"              # media parser's fixed "## Transcript" heading —
+                                  # a placeholder, not content (matched lowercase)
       # Common English function words. Headings rarely contain these, but the
       # body-fallback path (structure-less docs) extracts running prose where
       # they dominate — without this list a fallback file's top keywords are

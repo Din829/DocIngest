@@ -170,20 +170,40 @@ def build_stage1(
         for text in keyword_sources:
             raw_keywords.extend(extractor.extract(text))
 
+        # "No usable title keyword" means the title sources yielded nothing
+        # OR only a structural placeholder. The media parser headings EVERY
+        # audio/video transcript "## Transcript", so its sole section keyword
+        # is the placeholder "Transcript" — non-empty but zero information,
+        # which used to skip the body fallback and leave the AI summary with
+        # no real grounding (it then guessed "meeting" for a fortune-telling
+        # recording). Treat keywords that are all stop/placeholder words the
+        # same as empty. The stop set is the configured extra_stop_words —
+        # one source of truth, no second list.
+        _stop = set(
+            w.lower() for w in get_nested(
+                config, "knowledge_map.keywords.extra_stop_words", []
+            )
+        )
+        _has_real_kw = any(kw.lower() not in _stop for kw in raw_keywords)
+
         # Fallback for structure-less documents (no headings / title_paths /
         # sheet names — e.g. a plain prose note, a scanned doc, a single-section
-        # PDF): a file with no title source would otherwise contribute ZERO
-        # keywords and go invisible in keyword_index, regardless of language.
-        # Only fires when the title sources produced nothing, so titled docs are
-        # untouched (their high-quality keywords stand alone). The body is
-        # noisier than headings, so two guards keep it honest: cap the chunks
-        # read (cost) and drop over-long extractions (a CJK run with no kana
-        # goes through the regex path, which can return a whole clause as one
-        # "word" — useless as a keyword). Everything still passes the same
-        # df>70% discrimination filter downstream.
-        if not raw_keywords and file_chunks:
+        # PDF, an audio transcript whose only heading is "Transcript"): such a
+        # file would otherwise contribute ZERO real keywords and go invisible in
+        # keyword_index, regardless of language. Only fires when the title
+        # sources produced nothing usable, so titled docs are untouched (their
+        # high-quality keywords stand alone). The body is noisier than headings,
+        # so two guards keep it honest: cap the chunks read (cost) and drop
+        # over-long extractions (a CJK run with no kana goes through the regex
+        # path, which can return a whole clause as one "word" — useless as a
+        # keyword). Everything still passes the same df>70% filter downstream.
+        if not _has_real_kw and file_chunks:
             kw_cfg_local = get_nested(config, "knowledge_map.keywords", {})
             if kw_cfg_local.get("fallback_to_body", True):
+                # Drop the placeholder title keyword(s) ("Transcript", case-
+                # insensitive) before appending body keywords, so the final
+                # list is real content words only, not "Transcript" + body.
+                raw_keywords = [kw for kw in raw_keywords if kw.lower() not in _stop]
                 max_chunks = int(kw_cfg_local.get("fallback_max_chunks", 5))
                 max_len = int(kw_cfg_local.get("fallback_max_kw_len", 12))
                 for c in file_chunks[:max_chunks]:
@@ -196,7 +216,11 @@ def build_stage1(
                     body = _BODY_SOURCE_HEADER_RE.sub("", body)
                     body = _HTML_COMMENT_RE.sub("", body)
                     for kw in extractor.extract(body):
-                        if len(kw) <= max_len:
+                        # Length guard + case-insensitive stop filter (the
+                        # extractor's own stop check is case-sensitive, so the
+                        # body's "## Transcript" heading slips through it; catch
+                        # it here against the same _stop set).
+                        if len(kw) <= max_len and kw.lower() not in _stop:
                             raw_keywords.append(kw)
 
         # Count and deduplicate
