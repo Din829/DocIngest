@@ -14,7 +14,9 @@
 #   DOCINGEST__parsing__xlsx__denoising__max_page_images=30 docingest run xxx.xlsx
 
 knowledge_map:
-  # 默认 true —— 每次跑都额外 1 次 LLM 调用生成 knowledge base summary。
-  # 关掉后 Stage 1 关键词索引依然生成（零成本），只是不写 AI 摘要。
-  # 内部测试 / 反复跑同 corpus 没价值，按需手动跑。
-  ai_summary: false
+  # 每次跑额外 1 次 LLM 调用（~3K token），生成 SKILL.md 的「概要」+「検索ガイド」
+  # 两段——这正是让下游 Agent 精准搜索的核心（实测：照 search_guide 的关键词
+  # grep 能命中对的文件；关掉则 SKILL 只剩文件表 + 关键词索引，少了一半价值）。
+  # 默认 true，跟随 default.yaml。若做反复跑同一 corpus 的内部测试想省这次调用，
+  # 临时用 env：DOCINGEST__knowledge_map__ai_summary=false docingest run xxx
+  ai_summary: true
