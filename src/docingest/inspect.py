@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 # produced:
 #   pages          — page/slide/sheet count (whatever "unit of processing" is)
 #   chars_est      — estimated text length (proxy for output bulk)
-#   total_rows     — xlsx-specific
+#   total_rows     — xlsx/csv-specific (xlsx: real content rows, placeholders excluded)
+#   nominal_rows   — xlsx-specific: ws.max_row sum (padding-inflated; diagnostic only)
 #   duration_sec   — audio/video duration from ffprobe
 #   words          — docx-specific
 #   error          — exception message if introspection failed
@@ -149,21 +150,78 @@ def _inspect_pptx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
 def _inspect_xlsx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
     """XLSX: sheet count + total row count (char estimation skipped —
     total_rows is the stronger processing-cost signal for spreadsheets).
-    Legacy .xls short-circuits to a friendly note (openpyxl can't read it)."""
-    _ = config
+    Legacy .xls short-circuits to a friendly note (openpyxl can't read it).
+
+    ``total_rows`` is the count of rows that carry REAL content — a row whose
+    every non-empty cell is a filler placeholder ("--" / "N/A" / "なし" …) is
+    NOT counted. ``ws.max_row`` is the nominal value openpyxl reports, which
+    real Japanese spec/JD sheets routinely inflate to 1M+ by padding the unused
+    region with placeholders. Counting nominal rows made the cost preview and
+    the safety ``max_rows`` gate fire on phantom bulk (a 215-row sheet reported
+    as 1,053,316). We stream the real count instead (same placeholder set the
+    openpyxl renderer drops by, so preview and parse agree), and ALSO surface
+    the nominal figure as ``nominal_rows`` so a human can see the padding for
+    what it is. Both keys are additive; ``total_rows`` keeps its name and its
+    "processing-cost signal" meaning, just measured honestly."""
     legacy = _legacy_office_note(file_path)
     if legacy is not None:
         return legacy
+
+    # Same placeholder definition the renderer uses (parsing.xlsx.placeholder_rows),
+    # so "rows that survive inspection" == "rows that survive rendering". Resolved
+    # once here; falls back to the renderer's default set when unconfigured.
+    from .config import get_nested
+    from .parsers.docling_parser import _DEFAULT_PLACEHOLDER_VALUES
+    ph_cfg = get_nested(config, "parsing.xlsx.placeholder_rows", {})
+    if ph_cfg.get("enabled", True):
+        _vals = ph_cfg.get("values", None)
+        placeholders = (
+            frozenset(str(v).strip().lower() for v in _vals)
+            if _vals is not None else _DEFAULT_PLACEHOLDER_VALUES
+        )
+    else:
+        placeholders = frozenset()
+
+    # Stop counting once we've proven the file exceeds the safety gate — no need
+    # to stream a million rows just to confirm "too big". null gate ⇒ no cap, we
+    # count the whole workbook (read_only keeps it memory-bounded regardless).
+    max_rows_gate = get_nested(config, "safety.per_file.max_rows", None)
+    stop_at = int(max_rows_gate) + 1 if isinstance(max_rows_gate, (int, float)) else None
+
+    def _row_is_real(values: tuple) -> bool:
+        non_empty = [
+            s for s in (str(v).strip() for v in values if v is not None) if s
+        ]
+        if not non_empty:
+            return False
+        if not placeholders:
+            return True
+        return any(s.lower() not in placeholders for s in non_empty)
+
     try:
         from openpyxl import load_workbook
         wb = load_workbook(str(file_path), read_only=True, data_only=True)
         sheets = wb.sheetnames
+        nominal_rows = 0
         total_rows = 0
-        for name in sheets:
-            ws = wb[name]
-            total_rows += ws.max_row or 0
+        capped = False
+        for ws in wb.worksheets:
+            nominal_rows += ws.max_row or 0
+            if capped:
+                continue  # gate already tripped — keep tallying nominal only
+            for values in ws.iter_rows(values_only=True):
+                if _row_is_real(values):
+                    total_rows += 1
+                    if stop_at is not None and total_rows >= stop_at:
+                        capped = True
+                        break
         wb.close()
-        return {"pages": len(sheets), "sheets": sheets, "total_rows": total_rows}
+        return {
+            "pages": len(sheets),
+            "sheets": sheets,
+            "total_rows": total_rows,
+            "nominal_rows": nominal_rows,
+        }
     except Exception as e:
         logger.debug(f"XLSX inspection failed for {file_path.name}: {e}")
         return {"pages": None, "error": str(e)}
