@@ -151,6 +151,15 @@ def _unlimited_to_markdown(raw: str, *, keep_boxes: bool) -> str:
     return cleaned.strip()
 
 
+def _scratch_dir() -> str:
+    """A throwaway dir for the model's mandatory output_path. Unlimited-OCR's
+    infer() unconditionally calls os.makedirs(output_path), so an empty string
+    crashes — give it a real temp dir even though save_results=False writes
+    nothing into it."""
+    import tempfile
+    return tempfile.mkdtemp(prefix="docingest_local_ocr_")
+
+
 def _infer_unlimited(handle: Any, image_path: Path, prompt: str) -> str:
     """Single-image inference. Prompt is passed through but Unlimited-OCR is a
     fixed-behaviour OCR model (it ignores instruction wording — measured), so
@@ -159,7 +168,7 @@ def _infer_unlimited(handle: Any, image_path: Path, prompt: str) -> str:
         handle["tokenizer"],
         prompt="<image>document parsing.",
         image_file=str(image_path),
-        output_path="",
+        output_path=_scratch_dir(),
         base_size=1024, image_size=640, crop_mode=True,
         max_length=32768,
         no_repeat_ngram_size=35, ngram_window=128,
@@ -178,7 +187,7 @@ def _infer_unlimited_multi(handle: Any, image_paths: list[Path], prompt: str) ->
         handle["tokenizer"],
         prompt="<image>Multi page parsing.",
         image_files=[str(p) for p in image_paths],
-        output_path="",
+        output_path=_scratch_dir(),
         image_size=1024,
         max_length=32768,
         no_repeat_ngram_size=35, ngram_window=1024,
