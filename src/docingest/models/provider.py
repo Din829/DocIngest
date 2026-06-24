@@ -325,6 +325,16 @@ def describe_image(
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
+    # Local OCR backend dispatch (opt-in): when models.vision.ocr_backend is
+    # set, the page-reading task runs on a local model instead of the cloud
+    # provider. ONLY this OCR seam is affected — summary / chunking / refine go
+    # through text_completion and never reach here, so they keep using the
+    # cloud primary. Default (ocr_backend unset) skips this entirely.
+    from .local_ocr import is_local_ocr_enabled
+    if is_local_ocr_enabled(model_config):
+        from .local_ocr import run_local_ocr
+        return run_local_ocr(image_path, prompt, model_config)
+
     # Build message — one text part + one image part.
     messages = [{
         "role": "user",
@@ -440,6 +450,13 @@ def describe_images_batched(
     missing = [str(p) for p in paths if not p.exists()]
     if missing:
         raise FileNotFoundError(f"Page images not found: {missing}")
+
+    # Local OCR backend dispatch (opt-in) — same seam as describe_image, using
+    # the local model's native multi-page inference. See describe_image above.
+    from .local_ocr import is_local_ocr_enabled
+    if is_local_ocr_enabled(model_config):
+        from .local_ocr import run_local_ocr_batched
+        return run_local_ocr_batched(paths, prompt, model_config)
 
     # Build a single message containing text + N images, in caller order.
     # litellm passes this through to Gemini / OpenAI / Anthropic which all

@@ -66,6 +66,22 @@ models:
     # primary / fallback INHERITED from models.defaults (one-model-to-rule).
     # To pin Vision to a different model, add a `primary:` block here.
     #
+    # Local OCR backend (opt-in, GPU required). When ocr_backend is set, the
+    # OCR / page-transcription task (describe_image) runs on a LOCAL model
+    # instead of the cloud provider — useful for offline / data-stays-local /
+    # cost-sensitive setups, and the local model self-emits per-element layout
+    # boxes. IMPORTANT: this swaps ONLY the page-reading task. Summary /
+    # chunking-assist / refine / graph are text tasks routed through
+    # text_completion and ALWAYS keep using the cloud primary above — a local
+    # OCR model can't do them. Needs the [local-ocr] extra (torch+transformers);
+    # missing deps fail loud with an install hint. null = cloud Vision (default,
+    # nothing changes). The local model auto-inherits the existing render /
+    # triage / cache / anti-hallucination pipeline.
+    ocr_backend: null              # null | "unlimited_ocr"
+    ocr_model: "baidu/Unlimited-OCR"   # HF id or local weights path
+    ocr_device: "cuda"             # cuda | cpu (cpu is very slow)
+    ocr_keep_boxes: false          # reserved: keep per-element layout boxes
+    #
     # Per-task override; falls through to models.defaults.max_response_tokens
     # when unset. Kept explicit at the provider ceiling (65536 = Gemini 3 Flash
     # / 3.1 Pro hard limit) so dense PDF / multi-page sheet / 方眼紙 仕様書
