@@ -959,9 +959,27 @@ def _generate_page_images_via_libreoffice(
     # without touching PATH, and users can override via config or env var.
     soffice = find_binary("soffice", config)
     if not soffice:
-        _pipeline_logger.debug(
-            f"LibreOffice not found — cannot generate {format_label} page images"
+        # LibreOffice missing → no page images → Vision sees nothing → the
+        # file falls back to text-only extraction at REDUCED ACCURACY. This is
+        # the classic silent-degradation trap: the run still "succeeds", so the
+        # user never learns their knowledge base is incomplete. Surface it on
+        # BOTH channels: a warning in run.log AND result.warnings (the
+        # terminal-visible yellow block, same path as the page-cap warning) so
+        # it can't hide behind a green "Successful" tally.
+        warn_msg = (
+            f"LibreOffice not found — {format_label} page images skipped, "
+            f"Vision enrichment disabled (accuracy reduced; text-only "
+            f"fallback). Install LibreOffice or set binaries.soffice.path."
         )
+        _pipeline_logger.warning(f"{file_path.name}: {warn_msg}")
+        # The parser-level fallback (_try_external_page_images) runs first and
+        # already emits a "LibreOffice not found" warning for this same file via
+        # the same metadata channel. Don't append a second, near-identical line
+        # to the terminal — keep the log entry (above) but de-dup the visible
+        # warning so the user sees one signal per file, not two.
+        existing = parse_result.metadata.setdefault("warnings", [])
+        if not any("LibreOffice not found" in w for w in existing):
+            existing.append(warn_msg)
         return
 
     assets_dir = Path(get_nested(

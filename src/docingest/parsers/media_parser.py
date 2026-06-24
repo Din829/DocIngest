@@ -737,6 +737,20 @@ class MediaParser(BaseParser):
         cfg = get_nested(self.config, "parsing.audio.video_frames", {}) or {}
         if not cfg.get("enabled", True):
             return
+        # ffmpeg missing → no frames → the video's PICTURE is never seen by
+        # Vision (only the transcript survives, if any). Surface it on
+        # result.warnings before bailing so this silent visual loss shows up in
+        # the terminal yellow block rather than hiding behind a green tally.
+        from ..utils.binary_finder import find_binary
+        if not find_binary("ffmpeg", self.config):
+            warn_msg = (
+                f"ffmpeg not found — video frames not sampled for "
+                f"{video_path.name}, visual content not analysed by Vision "
+                f"(transcript only). Install ffmpeg or set binaries.ffmpeg.path."
+            )
+            logger.warning(warn_msg)
+            result.metadata.setdefault("warnings", []).append(warn_msg)
+            return
         frames = self._extract_frames(video_path)
         if not frames:
             return

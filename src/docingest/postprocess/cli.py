@@ -41,8 +41,9 @@ def extract_cmd(
     ),
     input_mode: Optional[str] = typer.Option(
         None, "--input",
-        help="What to extract from: 'sources' (default, whole md files) or "
-             "'chunks' (chunks.jsonl lines).",
+        help="What to extract from: 'sources' (whole md files) or 'chunks' "
+             "(chunks.jsonl lines). Omit to use postprocess.input from config "
+             "(defaults to 'sources').",
     ),
     parallel: Optional[int] = typer.Option(
         None, "--parallel",

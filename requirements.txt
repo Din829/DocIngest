@@ -52,3 +52,4 @@ requests>=2.33
 # fastmcp>=3.2,<4           # [mcp] MCP Server
 # dashscope>=1.25           # [audio] Qwen3-ASR transcription
 # pywebview>=6.2,<7         # [gui] Desktop GUI shell
+# transformers>=4.40        # [local-ocr] local OCR backend; bring your own torch (GPU)

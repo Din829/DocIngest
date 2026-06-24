@@ -88,6 +88,27 @@ ocr = [
 tesseract = [
     "docling[tesserocr]",     # Tesseract OCR support
 ]
+local-ocr = [
+    # Opt-in LOCAL OCR backend (parsing.vision.ocr_backend="unlimited_ocr"):
+    # runs the page-reading / OCR task on a local HF model (baidu/Unlimited-OCR)
+    # instead of the cloud Vision provider — for offline / data-stays-local /
+    # cost-sensitive setups. Loaded lazily inside models/local_ocr.py; core
+    # `docingest run` with the default ocr_backend=null never imports it.
+    #
+    # transformers ONLY here — torch is deliberately NOT pinned. The local OCR
+    # path is GPU-first (ocr_device="cuda"), so the right torch build depends on
+    # the user's hardware (CUDA / ROCm / CPU). Hard-coding a torch here would
+    # either drag the ~5.6GB CUDA wheel onto CPU-only users or conflict with the
+    # CPU-torch-first install the core already documents. So: bring your own
+    # torch (see scripts/install_python_deps or the README torch note), then
+    # `pip install -e ".[local-ocr]"` adds transformers on top.
+    "transformers>=4.40",     # AutoModel / AutoTokenizer.from_pretrained with
+                              # trust_remote_code + use_safetensors + torch_dtype.
+                              # >=4.40 is a safe floor for all four (stable since
+                              # 4.38); no upper cap — trust_remote_code models
+                              # track the HF ecosystem, so users should be free
+                              # to move to 5.x with newer model weights.
+]
 nlp = [
     "sudachipy>=0.6",         # Japanese morphological analysis (keyword extraction)
     "sudachidict_core>=20251022",  # SudachiPy core dictionary.

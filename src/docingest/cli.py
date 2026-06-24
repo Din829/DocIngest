@@ -145,7 +145,7 @@ def main(
     config_file: Optional[Path] = typer.Option(
         None,
         "-c", "--config",
-        help="Path to project config YAML (overrides defaults).",
+        help="Path to project docingest.yaml (overrides defaults).",
     ),
     no_chunks: bool = typer.Option(
         False,
@@ -633,7 +633,7 @@ def inspect_cmd(
     config_file: Optional[Path] = typer.Option(
         None,
         "-c", "--config",
-        help="Path to project config YAML.",
+        help="Path to project docingest.yaml.",
     ),
     json_output: bool = typer.Option(
         False,
@@ -667,6 +667,7 @@ def inspect_cmd(
     table.add_column("Recommendation")
 
     total_pages = 0
+    total_cost = 0.0
     for r in results:
         pages = r.get("pages")
         pages_str = str(pages) if pages is not None else "?"
@@ -674,6 +675,9 @@ def inspect_cmd(
             pages_str += " (est)"
         if pages:
             total_pages += pages
+        # est_cost_usd is present on every valid inspection but absent on
+        # `format="invalid"` entries — .get keeps the sum robust either way.
+        total_cost += r.get("est_cost_usd", 0) or 0
 
         size_str = f"{r['size_mb']:.1f}MB" if r['size_mb'] >= 1 else f"{r['size_mb']*1024:.0f}KB"
 
@@ -685,13 +689,23 @@ def inspect_cmd(
 
     console.print(table)
 
-    max_vision = get_nested(config, "parsing.vision.max_pages", 50)
-    vision_est = min(total_pages, int(max_vision)) if max_vision else total_pages
-    console.print(
-        f"\n  Total: {len(results)} file(s), ~{total_pages} pages, "
-        f"~{vision_est} Vision API calls"
-        f"{f' (capped at {max_vision})' if max_vision and total_pages > int(max_vision) else ''}"
-    )
+    # Vision call estimate. `parsing.vision.max_pages` is null by default, so
+    # without an explicit cap there is no Vision-specific ceiling — 1 call per
+    # page. Only when the user sets the cap does the "Vision API calls" figure
+    # diverge from the page count; otherwise reporting it as a separate number
+    # is misleading (it would just echo `pages`). So: report pages plainly by
+    # default, and surface the Vision-call line only when a real cap applies.
+    max_vision = get_nested(config, "parsing.vision.max_pages", None)
+    summary = f"\n  Total: {len(results)} file(s), ~{total_pages} pages"
+    if max_vision and total_pages > int(max_vision):
+        summary += f", ~{int(max_vision)} Vision API calls (capped at {max_vision})"
+    # Cost hint so users grasp the spend, not just the page count. Uses the
+    # library-computed est_cost_usd (real $), not a "calls" count — dollars
+    # are what users actually budget against. Shown only when there's a
+    # non-trivial estimate (a pure-text corpus with Vision skipped is ~$0).
+    if total_cost > 0:
+        summary += f", est. ~${total_cost:.2f} Vision cost"
+    console.print(summary)
     console.print()
 
 
@@ -734,7 +748,7 @@ def visualize_cmd(
         "viz", "--output", help="Output subdir under the knowledge dir.",
     ),
     config_file: Optional[Path] = typer.Option(
-        None, "-c", "--config", help="Path to project config YAML.",
+        None, "-c", "--config", help="Path to project docingest.yaml.",
     ),
 ) -> None:
     """Draw element bounding boxes onto page images (QA / debugging)."""
@@ -918,13 +932,14 @@ def refine_cmd(
     skill: Optional[str] = typer.Option(
         None,
         "--skill",
-        help="SKILL name (default: refine_default). Built-in: refine_default, "
+        help="SKILL name. Omit to use refine.default_skill from config "
+             "(refine_default unless overridden). Built-in: refine_default, "
              "refine_faithful, refine_html. Skills containing 'html' emit .html.",
     ),
     config_file: Optional[Path] = typer.Option(
         None,
         "-c", "--config",
-        help="Path to project config YAML.",
+        help="Path to project docingest.yaml.",
     ),
     yes: bool = typer.Option(
         False,
@@ -1005,7 +1020,7 @@ def refine_cmd(
 @skills_app.command("list")
 def skills_list_cmd(
     config_file: Optional[Path] = typer.Option(
-        None, "-c", "--config", help="Path to project config YAML."
+        None, "-c", "--config", help="Path to project docingest.yaml."
     ),
     as_json: bool = typer.Option(False, "--json", help="Emit the listing as JSON to stdout."),
 ) -> None:

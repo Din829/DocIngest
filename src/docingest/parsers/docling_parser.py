@@ -449,6 +449,14 @@ class DoclingParser(BaseParser):
             if self._last_parse_metadata.get("xlsx_embedded_images"):
                 metadata["xlsx_embedded_images"] = self._last_parse_metadata["xlsx_embedded_images"]
 
+            # Merge non-fatal warnings raised during page-data building (e.g.
+            # _try_external_page_images surfacing a missing LibreOffice). These
+            # ride the same metadata["warnings"] channel the pipeline collects
+            # into result.warnings → terminal yellow block.
+            page_warnings = self._last_parse_metadata.get("warnings")
+            if page_warnings:
+                metadata.setdefault("warnings", []).extend(page_warnings)
+
             # Visual-signal scan for the docx text-only Vision skip
             # (parsing.docx.vision.skip_text_only). None on scan failure →
             # key omitted → the pipeline keeps the full Vision pass.
@@ -1812,9 +1820,27 @@ class DoclingParser(BaseParser):
                 else:
                     soffice = find_binary("soffice", self.config)
                     if not soffice:
-                        logger.debug(
-                            "LibreOffice not found — skipping page image export"
+                        # LibreOffice missing → no PDF → no page images → this
+                        # office file (pptx/docx/xlsx/...) gets text-only
+                        # extraction with Vision disabled, at REDUCED ACCURACY.
+                        # This branch runs at PARSE time, before the pipeline's
+                        # own Phase-1.3 LibreOffice fallback, and for paths that
+                        # bypass that fallback (Vision-page-image switch off,
+                        # docx judged text-only) it is the ONLY place the
+                        # degradation is observable — so surface it on
+                        # result.warnings (terminal-visible yellow block), not
+                        # just a debug line. Routed via _last_parse_metadata,
+                        # which parse() merges into the ParseResult metadata.
+                        warn_msg = (
+                            f"LibreOffice not found — page images skipped for "
+                            f"{file_path.name}, Vision enrichment disabled "
+                            f"(accuracy reduced; text-only fallback). Install "
+                            f"LibreOffice or set binaries.soffice.path."
                         )
+                        logger.warning(warn_msg)
+                        meta = getattr(self, "_last_parse_metadata", {})
+                        meta.setdefault("warnings", []).append(warn_msg)
+                        self._last_parse_metadata = meta
                         return
                     run_soffice_convert(
                         file_path, tmpdir, "pdf",
