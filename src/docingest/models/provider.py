@@ -687,9 +687,11 @@ def describe_video(
             # NativeVideoUnsupported below so the caller can degrade.
             continue
         saw_supported = True
-        # Mirror the key to the env var litellm/genai read (reuses the same
-        # credential-resolution path as every other LLM call here).
-        _set_api_key(entry)
+        # Per-call credential (concurrency-safe — no os.environ mutation).
+        # google returns {"api_key": ...} only when the entry carries a
+        # plaintext key; the env/.env path yields {} and genai.Client() falls
+        # back to its own GEMINI_API_KEY lookup inside _describe_video_gemini.
+        call_creds = _resolve_call_credentials(entry)
         try:
             return _describe_video_gemini(
                 video_path=video_path,
@@ -701,6 +703,7 @@ def describe_video(
                 mime_type=mime_type,
                 upload_timeout_sec=upload_timeout_sec,
                 poll_timeout_sec=poll_timeout_sec,
+                api_key=call_creds.get("api_key"),
             )
         except NativeVideoUnsupported:
             raise
@@ -733,6 +736,7 @@ def _describe_video_gemini(
     mime_type: str,
     upload_timeout_sec: int,
     poll_timeout_sec: int,
+    api_key: str | None = None,
 ) -> str:
     """Gemini-native video call via google-genai. base64 inline for small
     files, Files API (upload → poll → reference → delete) for large ones."""
@@ -749,9 +753,12 @@ def _describe_video_gemini(
             f"pip install google-genai, or disable parsing.audio.native_video."
         ) from e
 
-    # genai.Client() reads GEMINI_API_KEY from the env (already set by
-    # _set_api_key above). No explicit key plumbing needed.
-    client = genai.Client()
+    # Explicit api_key keeps the credential local to this call (concurrency-safe
+    # — no os.environ mutation, so two concurrent ingests with different keys
+    # can't clobber each other). When api_key is None (the env/.env path), fall
+    # back to genai.Client()'s own GEMINI_API_KEY env lookup — behaviour
+    # unchanged for existing deployments.
+    client = genai.Client(api_key=api_key) if api_key else genai.Client()
     model_name = model if model.startswith("models/") else model
     video_metadata = types.VideoMetadata(fps=fps) if fps is not None else None
 
@@ -1055,7 +1062,9 @@ def text_completion_structured(
     last_error = None
 
     for model_entry in models_to_try:
-        _set_api_key(model_entry)
+        # Per-call credentials as kwargs (concurrency-safe — no os.environ
+        # mutation). Empty dict when the caller uses the env/.env path.
+        call_creds = _resolve_call_credentials(model_entry)
         model_name = _resolve_model_name(
             model_entry["provider"],
             model_entry["model"],
@@ -1068,6 +1077,7 @@ def text_completion_structured(
                 num_retries=effective_num_retries,
                 response_format=response_schema,
                 **_resolve_extra_params(model_entry),
+                **call_creds,
             )
             _record_usage(response, model_name)
             content = response.choices[0].message.content
