@@ -49,8 +49,57 @@ class HeadingChunker(BaseChunker):
         self._orphan_policy = heading_cfg.get("orphan_heading_policy", "merge_forward")
         self._title_strategy = heading_cfg.get("title_path_strategy", "deepest")
 
+        # Pseudo-heading filter: Docling routinely mislabels list items, figure
+        # captions and whole sentences as ## headings when a PDF renders them in
+        # a slightly larger font. Those bogus headings then poison title_path
+        # (measured: 39% of headings in a real spec PDF). When enabled (default),
+        # a matched #-line that doesn't look like a real heading is treated as
+        # ordinary body text — its content is kept, it just doesn't open a new
+        # section or enter title_path.
+        #
+        # The two rules are language- and format-agnostic by design (verified on
+        # JA/EN/ZH): a real heading is a short label, not (1) a sentence — it
+        # doesn't end in terminal punctuation — and not (2) a list/enumeration
+        # item — it doesn't start with a bullet or "N)"-style marker. No length
+        # threshold: char counts punish EN titles (spaces + words) and would
+        # mis-drop legitimate English headings.
+        pf = heading_cfg.get("filter_pseudo_headings", {}) or {}
+        self._filter_pseudo = bool(pf.get("enabled", True))
+        self._sentence_endings = tuple(pf.get(
+            "sentence_endings", ["。", "．", ".", "、", "！", "!", "？", "?", ";", "；"]
+        ))
+        # Bullet/enumeration prefixes that mark a LIST item, never a heading.
+        # Built once into a regex. Covers CJK bullets (・･●○), ASCII bullets
+        # (- *), circled numbers (①-⑳), and "N)" / "a)" enumerations with
+        # half/full-width parens or 、. NOTE: "N." (e.g. "2.1.") is deliberately
+        # NOT here — dotted decimals are the most common real section numbering.
+        self._list_prefix_re = re.compile(
+            r"^\s*(?:[・･●○◦‣⁃\-\*]|[0-9０-９]+\s*[\)）、]|[①-⑳]|[ａ-ｚa-z]\s*[\)）])"
+        )
+
         # Recursive chunker for subdividing large sections
         self._recursive = RecursiveChunker(config)
+
+    def _looks_like_real_heading(self, title: str) -> bool:
+        """True when `title` looks like a genuine section heading.
+
+        Conservative: returns True (keep it) unless a high-confidence rule
+        fires. Mislabelling a real heading as body loses structure (worse than
+        leaving one bogus heading), so we only reject the two unambiguous
+        non-heading shapes — sentences and list items. Disabled filter → always
+        True (every #-line is honoured, pre-filter behaviour)."""
+        if not self._filter_pseudo:
+            return True
+        t = title.strip()
+        if not t:
+            return False
+        # A sentence, not a label.
+        if t.endswith(self._sentence_endings):
+            return False
+        # A list / enumeration item, not a heading.
+        if self._list_prefix_re.match(t):
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -296,7 +345,12 @@ class HeadingChunker(BaseChunker):
                 level = len(match.group(1))
                 title = match.group(2).strip()
 
-                if level in self._levels:
+                # A #-line that's really a list item / sentence (Docling
+                # mislabel) is NOT a section boundary: skip the split logic so
+                # it falls through to current_lines.append below and stays as
+                # body text under the current title_path. _looks_like_real_heading
+                # returns True for everything when the filter is disabled.
+                if level in self._levels and self._looks_like_real_heading(title):
                     # Flush previous section
                     if current_lines:
                         text = "\n".join(current_lines).strip()

@@ -1285,6 +1285,28 @@ chunking:
     #   join_all  — all paths joined by " | " (legacy behaviour)
     title_path_strategy: "deepest"
 
+    # Pseudo-heading filter. Docling mislabels list items / figure captions /
+    # whole sentences as ## headings when a PDF renders them in a larger font;
+    # those bogus headings poison title_path (measured: 39% of headings in a
+    # real spec PDF were noise). When enabled, a #-line that doesn't look like a
+    # real heading is demoted to body text — content is kept, it just doesn't
+    # open a new section or enter title_path.
+    #
+    # Two language/format-agnostic rules (verified on JA/EN/ZH); a real heading
+    # is a short label, so it's rejected only when it (1) ends in sentence
+    # punctuation or (2) starts with a bullet / "N)"-style list marker. There is
+    # deliberately NO length rule — char thresholds mis-drop English headings
+    # (words + spaces run long). Dotted decimals ("2.1.") are NOT list markers,
+    # so real numbered sections survive.
+    filter_pseudo_headings:
+      enabled: true
+      # Trailing punctuation that marks a sentence (→ not a heading).
+      sentence_endings: ["。", "．", ".", "、", "！", "!", "？", "?", ";", "；"]
+      # NOTE: the bullet / enumeration prefixes are a fixed regex in
+      # heading.py (CJK + ASCII bullets, circled numbers, "N)"/"a)") — they are
+      # structural Markdown/Unicode facts, not a per-project knob, so they live
+      # in code rather than here. Flip `enabled: false` to honour every #-line.
+
   auto:
     min_headings: 3
     max_heading_gap_levels: 2
