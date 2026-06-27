@@ -20,6 +20,7 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -527,11 +528,41 @@ def _detect_garbled(markdown: str, threshold: int = 10) -> bool:
     """
     Detect garbled output from Docling (broken CID-to-Unicode mapping).
 
-    Checks for 'glyph<c=' patterns which indicate font encoding failures.
-    Returns True if garbled text count exceeds threshold.
+    Two independent signals — either fires triggers the pymupdf fallback:
+
+    1. ``glyph<c=`` markers: Docling's explicit "no Unicode mapping" placeholder.
+       Counted against ``threshold``.
+
+    2. CID-soup: some broken CID fonts emit NO glyph<> marker — Docling's
+       markdown path instead yields runs like ``0g0M0K0`` plus stray Latin-1
+       supplement symbols (ÿ ¥ ¶ ã …), while the SAME page's text layer reads
+       fine (Docling internal inconsistency, observed on a real PWC PDF). The
+       glyph<> check misses this entirely, so we add a density test:
+         - weird-symbol ratio  (rare Latin-1/PUA chars that real prose lacks)
+         - "X0X" run ratio      (the broken-CID fingerprint)
+       BOTH must clear their thresholds — AND, not OR — so legitimate symbol
+       use (© ° § µ in a copyright/units line, which lifts only the weird
+       ratio) never trips it. Skipped for short text where ratios are noisy.
+
+    Returns True if either signal indicates garbled output.
     """
     count = markdown.count("glyph<") + markdown.count("glyph&lt;")
-    return count >= threshold
+    if count >= threshold:
+        return True
+
+    # Signal 2: broken-CID soup with no glyph<> marker.
+    n = len(markdown)
+    if n < 2000:  # ratios are unstable on short text → don't judge
+        return False
+    # Chars that real Japanese/English prose effectively never contains, but a
+    # broken CID font sprays out. Deliberately EXCLUDES © ® ° µ § ± — those are
+    # legitimate (copyright, degrees, micro, section, plus-minus).
+    weird = sum(1 for c in markdown if c in "ÿýþ¡¥¶·ã")
+    # The broken-CID fingerprint: alnum-zero-alnum runs (e.g. "0g0M0").
+    x0 = len(re.findall(r"[A-Za-z0-9]0[A-Za-z0-9]", markdown))
+    weird_ratio = weird / n * 100
+    x0_ratio = x0 / n * 100
+    return weird_ratio > 0.3 and x0_ratio > 1.0
 
 
 def _pymupdf_fallback(file_path: Path, original_parse_result) -> None:
@@ -585,6 +616,54 @@ def _pymupdf_fallback(file_path: Path, original_parse_result) -> None:
 # ---------------------------------------------------------------------------
 # Excel denoising (applied to ALL xlsx/xls — unified path)
 # ---------------------------------------------------------------------------
+
+# A *real* Markdown separator row: every cell is ≥3 consecutive dashes with an
+# optional leading/trailing colon (`---`, `:--`, `--:`, `:-:`). Requiring 3+
+# dashes is what keeps Excel placeholder rows — which Docling renders as cells
+# holding a stray `--` or `-` (`|  | -- |  |  |`) — from being mistaken for a
+# separator and protected from cleanup. A single/double dash is NOT a separator.
+_SEPARATOR_ROW_RE = re.compile(r"^\s*\|(?:\s*:?-{3,}:?\s*\|)+\s*$")
+
+# Unicode categories that can NEVER carry information: dashes (Pd), connectors
+# (Pc, e.g. `_`), every kind of space (Zs/Zl/Zp, incl. ideographic / NBSP),
+# format chars (Cf, incl. zero-width space) and control chars (Cc). A cell built
+# only from these — in any combination — is empty noise. Everything else is
+# treated as content: letters/digits (incl. ①②/Ⅲ), currency/math symbols, and —
+# critically — the `So` "other symbol" bucket where checklist marks like ○ ✓ ●
+# ★ × live. `So` is a grab-bag (it also holds ░ ♥ decorations), so we never use
+# it to *delete*: keeping the whole bucket guarantees zero loss of marks that a
+# spreadsheet uses as real yes/no/applicable data.
+_EMPTY_UNICODE_CATEGORIES = frozenset({"Pd", "Pc", "Zs", "Zl", "Zp", "Cf", "Cc"})
+
+
+def _is_separator_row(line: str) -> bool:
+    """True only for genuine Markdown table separator rows (≥3-dash cells)."""
+    return bool(_SEPARATOR_ROW_RE.match(line))
+
+
+def _cell_is_empty(cell: str) -> bool:
+    """
+    A cell carries no information iff every character is a dash / connector /
+    space / format / control char (the categories in _EMPTY_UNICODE_CATEGORIES),
+    or the cell is Docling's `None` artifact. Any letter, digit, currency, math
+    or symbol-mark character (○ ✓ × ● ★ …) makes the cell non-empty — this is
+    what protects checklist marks and numeric data from deletion.
+
+    Judged purely by Unicode category, never an enumerated character list, so it
+    generalises to every dash / space variant (half/full-width, zero-width, …)
+    without a per-character allow-list. Ambiguous `Po` filler (`.`, `…`, `、`)
+    is deliberately treated as content: a lone `.` may be a decimal remnant, and
+    keeping it costs only a rarely-seen dot row — well within "never false-delete".
+    """
+    s = cell.strip()
+    if not s or s.lower() == "none":
+        return True
+    for ch in s:
+        if unicodedata.category(ch) in _EMPTY_UNICODE_CATEGORIES:
+            continue
+        return False
+    return True
+
 
 def _dedup_table_row(line: str) -> str:
     """
@@ -640,19 +719,23 @@ def _strip_empty_cells(line: str) -> str:
     This preserves data tables with occasional blank columns while cleaning
     layout-heavy Excel noise (where most cells are empty spacers).
 
-    Entirely empty rows are always removed (zero information).
+    Entirely empty rows are always removed (zero information). "Empty" here
+    spans every dash / space / zero-width / placeholder variant (see
+    _cell_is_empty), so a row Docling rendered as `|  | -- |  |  |` — a stray
+    dash among blanks — is correctly recognised as noise and dropped, while a
+    row keeping any letter, digit or mark (○ ✓ × …) is never removed.
     """
     if not line.strip().startswith("|"):
         return line
-    # Don't touch separator rows
-    if re.match(r"^\s*\|[-:\s|]+\|\s*$", line):
+    # Don't touch genuine separator rows (≥3-dash cells). A `--`/`-` placeholder
+    # row is NOT a separator and falls through to the empty-row check below.
+    if _is_separator_row(line):
         return line
     cells = [c.strip() for c in line.split("|")]
     cells = [c for c in cells if c is not None]  # keep bookend-stripped list
-    # Filter: treat "None" (Docling artifact) same as empty
-    non_empty = [c for c in cells if c and c.lower() != "none"]
+    non_empty = [c for c in cells if not _cell_is_empty(c)]
     if not non_empty:
-        return ""  # entire row is empty → remove
+        return ""  # entire row carries no information → remove
     # Only strip empty cells when the row is predominantly empty (>50%)
     empty_ratio = 1 - len(non_empty) / max(len(cells), 1)
     if empty_ratio > 0.5:
@@ -760,7 +843,7 @@ def _clean_excel_markdown(
         for line in cleaned:
             stripped = line.strip()
             is_table = stripped.startswith("|")
-            is_separator = is_table and re.match(r"^\s*\|[-:\s|]+\|\s*$", stripped)
+            is_separator = is_table and _is_separator_row(stripped)
             if is_table and not is_separator and deduped:
                 # Count non-empty cells — only dedup single-value rows
                 cells = [c.strip() for c in stripped.split("|") if c.strip()]
