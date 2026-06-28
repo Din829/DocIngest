@@ -66,7 +66,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 | **1.1 Garbled fallback** | 检测 `glyph<` 乱码 → pymupdf 重抽 | `_detect_garbled` + `_pymupdf_fallback` |
 | **1.2 Excel denoise** | xlsx/xls/csv 行内去重 + 空格剥离 | `_clean_excel_markdown` |
 | **1.2.5 通用表格去噪** | 非 Excel 格式的合并单元格去重 | `_denoise_markdown_table_rows` |
-| **1.3 页图生成** | xlsx/docx/pptx → LibreOffice → PDF → 截图；顺带抽 sheet→page 映射 / docx 逐页文本 | `_ensure_{excel,docx,pptx}_page_images` |
+| **1.3 页图生成** | xlsx/docx/pptx → LibreOffice → PDF → 截图；顺带抽 sheet→page 映射 / docx 逐页文本 | `_ensure_office_page_images`（格式→config 走 `_OFFICE_PAGE_IMAGE_FORMATS` 表） |
 | **1.4 post_parse hook** | 注入结构化数据给 Vision（PPTX chart 直读） | `run_post_parse_hooks("post_parse")` |
 | **1.4.5 语言检测** | CJK 字符分布 → `metadata["language"]` | `_detect_language` |
 | **1.5 Vision 增强** | 逐页 Vision（10 层 triage + 并发缓存 + ground truth 切片）；格式分流 supplement/full | `_enrich_with_vision` |
@@ -101,6 +101,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 | 增量缓存 + config_hash 白名单 | `incremental.py`（白名单常量 `_RELEVANT_CONFIG_PATHS`，代码即清单） |
 | AI provider + fallback 链 + AI 结果缓存 | `models/provider.py` / `models/audio_provider.py` / `models/cache.py` |
 | Vision 主逻辑 + 10 层 triage | `parsers/vision.py` + `pipeline.py::_enrich_with_vision` / `_should_skip_vision` |
+| 全分辨率抠图（图里小字，docx/xlsx/pptx）| 抽取 `docling_parser.py::_extract_docling_pictures`（docx/pptx）/ openpyxl（xlsx）→ 读图 `pipeline.py::_enrich_embedded_images`（专用 `_EMBEDDED_IMAGE_PROMPT`）|
 | 解析超时（按页数动态） | `pipeline.py::_resolve_parse_timeout` + `_probe_page_count` |
 | 大文件主动分批 / OOM 兜底 | `docling_parser.py::_parse_pdf_batched` |
 | xlsx openpyxl 渲染 | `docling_parser.py::_parse_xlsx_via_openpyxl` |
