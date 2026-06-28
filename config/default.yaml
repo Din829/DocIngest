@@ -306,13 +306,18 @@ parsing:
                               # information loss disguised as defence. Set an
                               # int here only if a specific workload needs a
                               # tighter cap independent of safety budget.
-    image_dpi: 180            # resolution for page images sent to Vision.
+    image_dpi: 200            # resolution for page images sent to Vision.
                               # 72 = fastest/smallest (readable for large text only)
                               # 150 = good balance (main elements clear, small labels fuzzy)
-                              # 180 = recommended default (both main + small labels clear)
-                              # 200+ = diminishing returns, risks 4MP cap downscale
-                              # Gemini charges per-image regardless of DPI,
-                              # OpenAI/Claude charge by tile/pixel count.
+                              # 200 = recommended default — the industry-balanced point
+                              #       (A4 ≈ 2.3MP, well under the 4MP cap). Measured on a
+                              #       dense IEA chart page: 180→200 is +12% input tokens
+                              #       (Gemini bills per 768px tile, so it's a step not a
+                              #       slope) for clearer small labels.
+                              # 250+ = no real gain over 200 (same tile count) AND a
+                              #       larger page can breach the 4MP cap → silent
+                              #       downscale, so it can cost more for nothing.
+                              # Gemini charges per-tile, OpenAI/Claude by tile/pixel count.
     progress_interval: 1      # How often the on_progress callback fires a
                               # "file_progress" event during Vision (every N
                               # pages). 1 = every page (smoothest UI bar).
