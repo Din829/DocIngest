@@ -465,23 +465,29 @@ class DoclingParser(BaseParser):
                 if docx_signals is not None:
                     metadata["docx_visual_signals"] = docx_signals
 
-            # Extract docx embedded pictures → assets + name their `<!-- image -->`
-            # markers. Only docx, only when enabled. Docling already decoded the
-            # pixels into doc.pictures, so this neither re-parses the zip nor adds
-            # API cost here (the optional full-res Vision read happens later, in
-            # the pipeline's Vision stage, gated by image_extraction.vision_enrich).
+            # Extract embedded pictures → assets + name their `<!-- image -->`
+            # markers. docx and pptx: both decode pixels into doc.pictures (with
+            # the original bytes), so this neither re-parses the zip nor adds API
+            # cost here (the optional full-res Vision read happens later, in the
+            # pipeline's Vision stage, gated by image_extraction.vision_enrich).
+            # PDF is excluded: docling's PDF backend leaves doc.pictures without
+            # pixel data (image.uri is not a data: URI), so there is nothing to
+            # save — see _extract_docling_pictures, which skips such pictures.
+            _img_suffix = file_path.suffix.lower().lstrip(".")
             if (
-                file_path.suffix.lower() == ".docx"
-                and get_nested(self.config, "parsing.docx.image_extraction.enabled", True)
+                _img_suffix in ("docx", "pptx")
+                and get_nested(
+                    self.config, f"parsing.{_img_suffix}.image_extraction.enabled", True
+                )
             ):
                 assets_dir = Path(get_nested(
                     self.config, "output.dir", "./knowledge"
                 )) / get_nested(self.config, "output.assets_dir", "assets")
-                markdown, docx_pics = self._extract_docling_pictures(
+                markdown, embedded_pics = self._extract_docling_pictures(
                     doc, markdown, file_path, assets_dir
                 )
-                if docx_pics:
-                    metadata["embedded_images"] = docx_pics
+                if embedded_pics:
+                    metadata["embedded_images"] = embedded_pics
 
             # Extract per-element bounding boxes (if enabled)
             if get_nested(self.config, "output.include_bounding_boxes", True):
@@ -1371,7 +1377,10 @@ class DoclingParser(BaseParser):
         if not pictures:
             return markdown, []
 
-        cfg = get_nested(self.config, "parsing.docx.image_extraction", {}) or {}
+        # Per-format config (docx / pptx both route here); fall back to the
+        # docx block's defaults if the format-specific block is absent.
+        suffix = file_path.suffix.lower().lstrip(".")
+        cfg = get_nested(self.config, f"parsing.{suffix}.image_extraction", {}) or {}
         min_dim = int(cfg.get("min_dimension", 200))
         vision_enrich = bool(cfg.get("vision_enrich", True))
 
@@ -1390,7 +1399,7 @@ class DoclingParser(BaseParser):
                 header, b64 = uri.split(",", 1)
                 raw = base64.b64decode(b64)
             except Exception as e:
-                logger.debug(f"docx picture {idx}: base64 decode failed ({e}); skipped")
+                logger.debug(f"picture {idx}: base64 decode failed ({e}); skipped")
                 continue
 
             ext = "png"
@@ -1401,7 +1410,7 @@ class DoclingParser(BaseParser):
             try:
                 out_path.write_bytes(raw)
             except Exception as e:
-                logger.debug(f"docx picture {idx}: write failed ({e}); skipped")
+                logger.debug(f"picture {idx}: write failed ({e}); skipped")
                 continue
 
             w = h = None

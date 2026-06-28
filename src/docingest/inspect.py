@@ -141,7 +141,11 @@ def _inspect_pptx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
                         chars_est += len(shape.text_frame.text or "")
                     except Exception:
                         continue
-        return {"pages": len(slides), "chars_est": chars_est}
+        return {
+            "pages": len(slides),
+            "chars_est": chars_est,
+            "media_files": _count_pptx_media(file_path),
+        }
     except Exception as e:
         logger.debug(f"PPTX inspection failed for {file_path.name}: {e}")
         return {"pages": None, "error": str(e)}
@@ -221,6 +225,7 @@ def _inspect_xlsx(file_path: Path, config: dict[str, Any]) -> dict[str, Any]:
             "sheets": sheets,
             "total_rows": total_rows,
             "nominal_rows": nominal_rows,
+            "media_files": _count_xlsx_media(file_path),
         }
     except Exception as e:
         logger.debug(f"XLSX inspection failed for {file_path.name}: {e}")
@@ -256,6 +261,52 @@ def _count_docx_media(file_path: Path) -> int:
             return sum(
                 1 for n in zf.namelist()
                 if n.startswith("word/media/") and not n.endswith("/")
+            )
+    except Exception:
+        return 0
+
+
+# Image extensions counted toward the embedded-image Vision cost term. ppt/media/
+# also holds audio/video (embedded clips) which the figure-extraction path never
+# sends to Vision — counting them would over-estimate the cost.
+_PPTX_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".tif", ".webp", ".emf", ".wmf")
+
+
+def _count_pptx_media(file_path: Path) -> int:
+    """Number of embedded images (ppt/media/*.{png,jpg,…}) — drives the
+    embedded-image Vision term of the cost estimate for slide decks. Free
+    zip-list read. Mirrors _count_docx_media, but filters to image extensions
+    because a deck's media folder may also carry audio/video clips that the
+    figure path never reads."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(str(file_path)) as zf:
+            return sum(
+                1 for n in zf.namelist()
+                if n.startswith("ppt/media/")
+                and not n.endswith("/")
+                and n.lower().endswith(_PPTX_IMAGE_EXTS)
+            )
+    except Exception:
+        return 0
+
+
+def _count_xlsx_media(file_path: Path) -> int:
+    """Number of embedded images (xl/media/*.{png,jpg,…}) — drives the
+    embedded-image Vision term of the cost estimate for spreadsheets. Free
+    zip-list read. Same xl/media/ + image-extension filter the openpyxl
+    renderer's _extract_xlsx_images uses, so the count is the same set of
+    figures that will actually be sent to full-res Vision (an honest upper
+    bound: figures below min_dimension are counted here but skipped at parse —
+    over-, not under-estimating, which is what the safety gate wants)."""
+    import zipfile
+    try:
+        with zipfile.ZipFile(str(file_path)) as zf:
+            return sum(
+                1 for n in zf.namelist()
+                if n.startswith("xl/media/")
+                and not n.endswith("/")
+                and n.lower().endswith(_PPTX_IMAGE_EXTS)
             )
     except Exception:
         return 0

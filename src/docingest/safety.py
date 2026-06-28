@@ -67,7 +67,7 @@ def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> floa
     Cost models, by file shape:
       * page-based docs (pdf/pptx/docx/...):
             calls = min(pages, vision.max_pages)
-                    + min(embedded media, docx max_images_vision)   # docx only
+                    + min(embedded media, max_images_vision)   # docx/pptx/xlsx
             cost  = calls × per-call token estimate × litellm's price table
         Per-call tokens come from safety.est_tokens_per_vision_call —
         calibrated against a real run (92-page docx, 2026-06-11: avg 42K in /
@@ -124,18 +124,21 @@ def estimate_file_cost_usd(info: dict[str, Any], config: dict[str, Any]) -> floa
     cap = int(cap_raw) if cap_raw is not None else int(pages)
     vision_calls = min(int(pages), cap)
 
-    # Embedded-image Vision (docx figures read at full resolution) — a real
-    # cost term the page count doesn't cover. media_files is reported by
-    # inspect for docx; absent for other formats.
+    # Embedded-image Vision (docx/pptx/xlsx figures read at full resolution) — a
+    # real cost term the page count doesn't cover. media_files is reported by
+    # inspect for docx, pptx and xlsx; absent for other formats. The config block
+    # is per-format, so price against the SAME format whose figures will actually
+    # be read — reading the docx block for a pptx (or vice-versa) would misprice it.
     media = int(info.get("media_files") or 0)
-    if media and get_nested(config, "parsing.docx.image_extraction.vision_enrich", True):
-        # null cap (default) = every figure is read, so every figure is
-        # priced — the estimate is the cost control, not the cap.
-        img_cap_raw = get_nested(
-            config, "parsing.docx.image_extraction.max_images_vision", None
-        )
-        img_cap = int(img_cap_raw) if img_cap_raw is not None else media
-        vision_calls += min(media, img_cap)
+    fmt = str(info.get("format", "")).lower()
+    if media and fmt in ("docx", "pptx", "xlsx"):
+        ie_key = f"parsing.{fmt}.image_extraction"
+        if get_nested(config, f"{ie_key}.vision_enrich", True):
+            # null cap (default) = every figure is read, so every figure is
+            # priced — the estimate is the cost control, not the cap.
+            img_cap_raw = get_nested(config, f"{ie_key}.max_images_vision", None)
+            img_cap = int(img_cap_raw) if img_cap_raw is not None else media
+            vision_calls += min(media, img_cap)
 
     return vision_calls * _price_per_vision_call(config)
 

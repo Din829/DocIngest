@@ -617,6 +617,24 @@ parsing:
     # to the existing Vision-only path.
     extract_chart_data: true
 
+    # Embedded picture extraction — same path as docx. Docling decodes pptx
+    # pictures (ppt/media/*) into doc.pictures WITH pixels, so a text-filled
+    # bitmap on a slide (a pasted screenshot, an SVN/Git comparison diagram)
+    # gets saved to assets/ and read at full resolution by Vision — instead of
+    # being summarised away in the whole-slide image pass. Measured: the
+    # whole-slide pass read such a diagram only ~3/8 of the time (jitter); the
+    # full-res figure read got it 8/8 (scratchpad t8).
+    image_extraction:
+      enabled: true
+      min_dimension: 200         # px; smaller on BOTH sides (slide icons) → not sent
+      vision_enrich: true        # false = extract + mark only, zero extra API cost
+      max_images_vision: null    # null = read EVERY qualifying figure (no silent
+                                 # truncation — a slide deck legitimately has many
+                                 # figures; dropping some past N would be info loss
+                                 # disguised as cost defence). Cost is surfaced
+                                 # up-front by the safety pre-flight, not hidden by
+                                 # a cap. Set an int only for a specific tight job.
+
     # Optional per-format Vision override. See parsing.pdf.vision for usage.
     vision:
       # max_response_tokens: 8192     # PPT 文字大、内容稀，可省 tokens
@@ -1071,7 +1089,14 @@ parsing:
       enabled: true
       min_dimension: 200         # px; smaller on BOTH sides (cell icons) → not sent
       vision_enrich: true        # false = extract + mark only, zero extra API cost
-      max_images_vision: 30      # per-file cap; on trip warns and skips the rest
+      max_images_vision: null    # null = read EVERY qualifying figure (no silent
+                                 # truncation — a workbook with many pasted
+                                 # screenshots/diagrams legitimately needs them all;
+                                 # dropping some past N would be info loss disguised
+                                 # as cost defence). Cost is surfaced up-front by the
+                                 # safety pre-flight (inspect counts xl/media/ images,
+                                 # estimate_file_cost_usd prices them), not hidden by
+                                 # a cap. Set an int only for a specific tight job.
 
 # =============================================================================
 # Phase 2: Output Structure

@@ -1019,7 +1019,7 @@ def _generate_page_images_via_libreoffice(
     Generic LibreOffice → PDF → page screenshots for formats without native page images.
 
     Works for any LibreOffice-supported format (xlsx, xls, docx, doc, pptx, odt, etc.).
-    This is the shared backend for _ensure_excel_page_images and _ensure_docx_page_images.
+    This is the shared backend for _ensure_office_page_images (all Office formats).
 
     Args:
         file_path: Source file.
@@ -1294,89 +1294,67 @@ def _office_file_has_no_visuals(
     return False
 
 
-def _ensure_excel_page_images(
+# Office formats whose page images come from LibreOffice → PDF → screenshots
+# (Docling does not render their pages natively). One table = the single place
+# to edit when adding a format: a new key here makes Phase 1.3 route it through
+# the shared backend, so it can never be silently forgotten (the old per-format
+# if/elif chain dropped any format not explicitly listed — Vision then saw no
+# images and the gap was invisible). Each entry encodes that format's config
+# quirks (xlsx's switch lives under `denoising.`, unlike docx/pptx at the top
+# level; per-format max_page_images fallback differs):
+#   enable_path   — config path of the on/off switch (default True if absent)
+#   root          — config section holding max_page_images / max_image_pixels
+#   default_pages — max_page_images fallback when not set in config (null in
+#                   config means "no cap"; this int is only the legacy floor)
+#   label         — human label for log lines / warnings
+_OFFICE_PAGE_IMAGE_FORMATS: dict[str, dict[str, Any]] = {
+    "xlsx": {"enable_path": "parsing.xlsx.denoising.ensure_page_images",
+             "root": "parsing.xlsx.denoising", "default_pages": 10, "label": "Excel"},
+    "xls":  {"enable_path": "parsing.xlsx.denoising.ensure_page_images",
+             "root": "parsing.xlsx.denoising", "default_pages": 10, "label": "Excel"},
+    "docx": {"enable_path": "parsing.docx.vision_page_images",
+             "root": "parsing.docx", "default_pages": 20, "label": "Word"},
+    "doc":  {"enable_path": "parsing.docx.vision_page_images",
+             "root": "parsing.docx", "default_pages": 20, "label": "Word"},
+    "pptx": {"enable_path": "parsing.pptx.vision_page_images",
+             "root": "parsing.pptx", "default_pages": 30, "label": "PPT"},
+    "ppt":  {"enable_path": "parsing.pptx.vision_page_images",
+             "root": "parsing.pptx", "default_pages": 30, "label": "PPT"},
+}
+
+
+def _ensure_office_page_images(
     file_path: Path,
     parse_result,
     config: dict[str, Any],
+    fmt: str,
 ) -> None:
-    """
-    Excel-specific page image fallback (thin wrapper around the generic backend).
+    """Generate page images for an Office format via the shared LibreOffice
+    backend, reading that format's config quirks from _OFFICE_PAGE_IMAGE_FORMATS.
 
-    Reads config from parsing.xlsx.denoising.{ensure_page_images, max_page_images, max_image_pixels}.
+    Replaces the former _ensure_{excel,docx,pptx}_page_images trio: identical
+    behaviour per format, but the format→config mapping is now data, so adding
+    a format is a one-line table edit and an unlisted format can't slip through
+    unrendered. No-op (returns) when fmt isn't an Office page-image format or
+    its enable switch is off.
+
+    The generic backend's first check (`parse_result.pages and any image_path`)
+    keeps this a no-op when a parser-level fallback already produced page
+    images (the PPT case _try_external_page_images covers), so no double work.
     """
-    xlsx_denoise = get_nested(config, "parsing.xlsx.denoising", {})
-    if not xlsx_denoise.get("ensure_page_images", True):
+    spec = _OFFICE_PAGE_IMAGE_FORMATS.get(fmt)
+    if spec is None:
         return
-
+    if not get_nested(config, spec["enable_path"], True):
+        return
+    root = get_nested(config, spec["root"], {}) or {}
     _generate_page_images_via_libreoffice(
         file_path=file_path,
         parse_result=parse_result,
         config=config,
-        max_pages=xlsx_denoise.get("max_page_images", 10),
-        max_pixels=xlsx_denoise.get("max_image_pixels", 4_000_000),
-        format_label="Excel",
-    )
-
-
-def _ensure_docx_page_images(
-    file_path: Path,
-    parse_result,
-    config: dict[str, Any],
-) -> None:
-    """
-    Word-specific page image fallback (thin wrapper around the generic backend).
-
-    Docling's DOCX pipeline extracts text but does NOT produce page images,
-    so embedded diagrams and figures are lost. This function renders the DOCX
-    via LibreOffice → PDF → screenshots, feeding them to Vision for description.
-
-    Reads config from parsing.docx.{vision_page_images, max_page_images, max_image_pixels}.
-    """
-    docx_cfg = get_nested(config, "parsing.docx", {})
-    if not docx_cfg.get("vision_page_images", True):
-        return
-
-    _generate_page_images_via_libreoffice(
-        file_path=file_path,
-        parse_result=parse_result,
-        config=config,
-        max_pages=docx_cfg.get("max_page_images", 20),
-        max_pixels=docx_cfg.get("max_image_pixels", 4_000_000),
-        format_label="Word",
-    )
-
-
-def _ensure_pptx_page_images(
-    file_path: Path,
-    parse_result,
-    config: dict[str, Any],
-) -> None:
-    """
-    PPT-specific page image fallback (thin wrapper around the generic backend).
-
-    DoclingParser has an older PPT fallback in _try_external_page_images that
-    only triggers when Docling returned pages_data but with empty image_paths.
-    If Docling returns no pages at all (some PPT backends / simple pipeline),
-    this Phase 1.3 hook fills the gap — it creates pages from scratch via
-    LibreOffice rendering so Vision can still describe every slide.
-
-    The generic backend's first check `parse_result.pages and any(p.image_path)`
-    means this is a no-op when the parser-level fallback already succeeded,
-    so there's no double work.
-
-    Reads config from parsing.pptx.{vision_page_images, max_page_images, max_image_pixels}.
-    """
-    pptx_cfg = get_nested(config, "parsing.pptx", {})
-    if not pptx_cfg.get("vision_page_images", True):
-        return
-
-    _generate_page_images_via_libreoffice(
-        file_path=file_path,
-        parse_result=parse_result,
-        config=config,
-        max_pages=pptx_cfg.get("max_page_images", 30),
-        max_pixels=pptx_cfg.get("max_image_pixels", 4_000_000),
-        format_label="PPT",
+        max_pages=root.get("max_page_images", spec["default_pages"]),
+        max_pixels=root.get("max_image_pixels", 4_000_000),
+        format_label=spec["label"],
     )
 
 
@@ -3668,26 +3646,24 @@ def process_single_file(
     # no page image. Vision-off integrators (e.g. markdown-only callers) paid
     # this on every Office document before this guard.
     if get_nested(config, "parsing.vision.enabled", True):
-        if result.format in ("xlsx", "xls"):
-            if _office_file_has_no_visuals(parse_result, config, "xlsx"):
+        # Single membership test over the format table — adding a format is a
+        # table edit, not another elif. _office_file_has_no_visuals returns
+        # False for any format without a whole-file triage rule (e.g. pptx), so
+        # the skip branch self-disables there without a special case.
+        if result.format in _OFFICE_PAGE_IMAGE_FORMATS:
+            # _office_file_has_no_visuals keys off the canonical format; the
+            # legacy .doc/.ppt/.xls suffixes are auto-converted to OOXML in
+            # Phase 0.5, so result.format is already docx/pptx/xlsx by here.
+            if _office_file_has_no_visuals(parse_result, config, result.format):
                 _pipeline_logger.info(
-                    f"{file_path.name}: no visual elements on any visible sheet "
+                    f"{file_path.name}: whole file is provably text-only "
                     f"— skipping LibreOffice render + page Vision "
-                    f"(parsing.xlsx.vision.sheet_triage)"
+                    f"(parsing.{result.format}.vision triage)"
                 )
             else:
-                _ensure_excel_page_images(file_path, parse_result, config)
-        elif result.format in ("docx", "doc"):
-            if _office_file_has_no_visuals(parse_result, config, "docx"):
-                _pipeline_logger.info(
-                    f"{file_path.name}: text-only body (no drawing/ink/highlight"
-                    f"/tracked-change signals) — skipping LibreOffice render + "
-                    f"page Vision (parsing.docx.vision.skip_text_only)"
+                _ensure_office_page_images(
+                    file_path, parse_result, config, result.format
                 )
-            else:
-                _ensure_docx_page_images(file_path, parse_result, config)
-        elif result.format in ("pptx", "ppt"):
-            _ensure_pptx_page_images(file_path, parse_result, config)
 
     # --- Phase 1.4: Post-parse hooks (pre-Vision) ---
     # Hooks that inject structured data the Vision step should be aware of
