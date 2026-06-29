@@ -256,6 +256,8 @@ parse_result.transformations.append({"step": "...", ...})  # 记 lineage
 |---|---|
 | 文件并发解析串行化 | 设计如此（避 docling-parse Windows OOM），收益靠 Vision I/O overlap |
 | Parser 路由写死在 `_DoclingWithFallback` | 未中心化为注册表；加 parser 改一处即可，暂不抽象 |
+| 多栏混排版面阅读顺序错位 | 上游 Docling reading-order 决定（三栏作者+双栏正文等复杂版面块顺序会乱，内容不丢）；DocIngest 层无法修，RAG 按关键词检索基本不受影响 |
+| 源 PDF 文本层 CMap 损坏（字形→错码位，如阿拉伯字形出希腊字母） | 源文件自身损坏（"垃圾进"）；triage 的脚本一致性检测仅覆盖 ja/zh/en/ko 且跳过 <50 字符短页，故部分漏网；非 DocIngest 层能修 |
 
 ## 附：设计依据（参考）
 
