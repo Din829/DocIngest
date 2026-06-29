@@ -97,6 +97,8 @@ _ZIPLIKE_NOT_EXPANDABLE = {
     ".docx", ".docm", ".dotx", ".dotm",
     ".pptx", ".pptm", ".ppsx", ".ppsm",
     ".xlsx", ".xlsm", ".xltx", ".xltm",
+    ".xlsb", ".xltb",  # binary OOXML (zip-shaped); no parser reads them, but
+                       # must not be expanded into raw .bin parts — see below
     ".xls",   # legacy BIFF; see comment above
     ".odt", ".ods", ".odp",
     ".epub",  # zip-based but handled by its own parser (if enabled)

@@ -43,15 +43,18 @@ _PIPELINE_LEVEL_EXTENSIONS: list[tuple[str, str]] = [
 # rejects null-byte binaries) and turns a real parse failure into a bogus
 # "success" full of garbage (e.g. a corrupt PDF's raw `%PDF-1.4 …%%EOF` bytes
 # read as document text, reported successful, silently polluting the KB).
-# These formats are either parseable by Docling or genuinely broken — there is
-# no "read it as plain text" that yields real content. So Docling failure here
-# is a hard failure, NOT a fallback case. Mirrors the same guard MediaParser
-# already applies to audio/video (see parse() below). Plain-text / unknown
-# extensions (.txt/.md/.csv/.dat/…) are deliberately NOT listed: for those,
-# TextParser fallback is legitimate.
+# These formats are parseable by Docling, genuinely broken, or a binary format
+# Docling simply doesn't support (.xlsb/.xltb) — in every case there is no "read
+# it as plain text" that yields real content. So Docling failure here is a hard
+# failure, NOT a fallback case. Mirrors the same guard MediaParser already
+# applies to audio/video (see parse() below). Plain-text / unknown extensions
+# (.txt/.md/.csv/.dat/…) are deliberately NOT listed: for those, TextParser
+# fallback is legitimate.
 _DOCLING_BINARY_FORMATS: frozenset[str] = frozenset({
     ".pdf",
     ".docx", ".pptx", ".xlsx",
+    ".xlsb", ".xltb",  # binary Excel — unsupported by Docling/openpyxl; fail
+                       # loud instead of letting TextParser read raw bytes
     ".html", ".htm",
     ".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".webp", ".gif",
 })
