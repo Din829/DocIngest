@@ -20,6 +20,7 @@ Per-flag detail: `docingest <cmd> --help`.
 | `visualize` | Draw parse bounding boxes onto page images | `--pages`; `--labels`; `--numbers` |
 | `export` | Knowledge base chunks -> vector store (opt-in `[azure]`) | `--to azure-search`; `--endpoint`; `--index`; `--search-key`; `--embed-provider azure-openai\|openai`; `--embed-model`; `--embed-dim`; `--embed-endpoint`; `--vector-field` |
 | `extract` | Docs -> strongly-typed records via a YAML template (`extracted/<template>.jsonl`) | `-t/--template`; `-o/--output`; `--input sources\|chunks`; `--parallel N`; `--json` |
+| `skills list` | List the refine SKILLs `refine --skill` can use (name + summary) | `--json` |
 
 **Graph** (`docingest graph <cmd>`, requires `[graph]`)
 

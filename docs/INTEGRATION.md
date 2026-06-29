@@ -10,7 +10,7 @@ How to embed DocIngest in your own system. **Scenario-driven, intentionally non-
 |---|---|---|---|---|
 | **CLI subprocess** | `docingest run / inspect / refine` | Shell pipelines, non-Python callers, one-shot batch | stderr (banner) + `--json` on stdout | Separate process |
 | **Python library** | `import docingest; docingest.ingest(...)` | Embedded in a Python app — RAG pipelines, web backends, workers | `on_progress` callback | In-process (sync) |
-| **MCP server** | `python -m docingest.mcp_server` | LLM agents (Claude Desktop / Cursor / Copilot) | Single response per call | Separate process, stdio/SSE |
+| **MCP server** | `python -m docingest.mcp_server` | LLM agents (Claude Desktop / Cursor / Copilot) | Single response per call | Separate process, stdio / http / SSE |
 
 Public API surface = exactly what `docingest/__init__.py` re-exports (`ingest` / `inspect` / `refine` / `list_knowledge` / `get_summary` / `IngestResult` / `build_config` / Provider classes). Everything else is internal.
 

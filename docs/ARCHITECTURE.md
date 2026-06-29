@@ -56,7 +56,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 
 ### 2.2 Phase 明细（`process_single_file` 调用链，加新 Phase 的主战场）
 
-定位某 Phase 源码：在 `pipeline.py` grep 注释标记 `--- Phase <n.x>`。
+定位某 Phase 源码：在 `pipeline.py` grep 注释标记 `--- Phase <n.x>`。（例外：1.4.5 语言检测、3.1 Lineage attach 没有独立 `--- Phase` 注释——它们是穿插在相邻 Phase 里的小步骤，直接 grep 下方"入口"列的函数名即可。）
 
 | Phase | 做什么 | 入口 |
 |---|---|---|
@@ -174,7 +174,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 
 实现细节在源码注释里，本节只给索引。
 
-- **Vision 10 层 triage**：纯文本页跳过省 30-60% 成本；8-10 层检测捕捉乱码/CMap 失败/脚本不一致。见 `pipeline.py::_should_skip_vision`（含每层注释）+ `parsing.vision.triage` config 段。
+- **Vision 10 层 triage**：纯文本页跳过省 30-60% 成本；10 层检测捕捉乱码/CMap 失败/脚本不一致/Latin 替换密码。见 `pipeline.py::_should_skip_vision`（含每层注释）+ `parsing.vision.triage` config 段。
 - **格式分流 supplement/full**：xlsx 只补视觉不重抄表（openpyxl 已渲染干净）；PDF/PPT 整页转写。见 `_enrich_with_vision` + `parsing.<format>.vision.supplement_only`。
 - **Excel openpyxl 渲染**：每 sheet 独立标题、合并单元格锚点化、空列剪除。见 `docling_parser.py::_parse_xlsx_via_openpyxl`。
 - **ground truth 切片**：Vision input 按 sheet / docx PDF 文本层切，省 input token。见 `pipeline.py::_xlsx_per_page_ground_truth` / `_docx_per_page_ground_truth`。
@@ -256,7 +256,6 @@ parse_result.transformations.append({"step": "...", ...})  # 记 lineage
 |---|---|
 | 文件并发解析串行化 | 设计如此（避 docling-parse Windows OOM），收益靠 Vision I/O overlap |
 | Parser 路由写死在 `_DoclingWithFallback` | 未中心化为注册表；加 parser 改一处即可，暂不抽象 |
-| `tests/unit/test_mixed.py` 的 `title_path` 断言 | 已知 fail，预存于当前 codebase 之前，单独跟踪 |
 
 ## 附：设计依据（参考）
 

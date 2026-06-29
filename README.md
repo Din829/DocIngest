@@ -331,7 +331,7 @@ under `postprocess.*` in `config/default.yaml`. Per-flag detail: `docingest extr
 
 ### Python Library
 
-DocIngest exposes a small, stable Python API for use as a dependency of other projects. The public surface is exactly: `ingest`, `inspect`, `refine`, `IngestResult`, `build_config`, and the Provider classes — everything else under `docingest.*` is internal.
+DocIngest exposes a small, stable Python API for use as a dependency of other projects. The public surface is exactly: `ingest`, `inspect`, `refine`, `list_knowledge`, `get_summary`, `IngestResult`, `build_config`, and the Provider classes — everything else under `docingest.*` is internal.
 
 ```python
 import docingest
@@ -679,7 +679,7 @@ models:
 
 parsing:
   vision:
-    image_dpi: 180
+    image_dpi: 200
     triage: { enabled: true }     # skip pure-text pages → saves Vision API cost
 
 sanitize:
@@ -729,7 +729,7 @@ for each new file:
       ├─ Excel denoise         merged cells, sparse rows
       ├─ LibreOffice pages     xlsx/docx/pptx → PDF → screenshots
       ├─ post_parse hook       PPTX chart direct-read
-      ├─ Vision enrichment     per-page, 8-layer triage, parallel; format-split
+      ├─ Vision enrichment     per-page, 10-layer triage, parallel; format-split
                                 supplement/full — xlsx supplements visuals only
                                 (no table re-transcribe), PDF/PPT full whole-page
       ├─ pre_write hook        exiftool / sanitize
@@ -767,7 +767,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Phase breakdown, design
 - **Legacy Office support (`.xls` / `.doc` / `.ppt`)** — pre-2007 binary Office files are auto-converted to their modern OOXML form (`.xlsx` / `.docx` / `.pptx`) via LibreOffice as Phase 0.5, then routed through the full modern-format path (Docling / openpyxl renderer + Vision + chunking). Docling rejects the binary forms outright, so this conversion is what makes them work at all. The original filename / mimetype / mtime are preserved in `metadata.lineage.original_input`, and a `format_convert` entry is recorded in `metadata.lineage.transformations`. Conversion result is cached at `.cache/_legacy_convert/<sha256>.<ext>` so the same file converts exactly once per output dir. LibreOffice missing → warning + degrades to TextParser fallback (the pipeline never raises). Disable per format via `parsing.<xls|doc|ppt>.auto_convert_to_*: false`.
 - **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
 - **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
-- **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Eight-layer defence for damaged pages: `glyph<` / `&lt;` CID markers, U+FFFD ratio, complex-table density, CJK mixed-script anomaly, **language-script consistency** (new) — catches CMap failures that produce CLEAN but WRONG Unicode (e.g. Bengali/Thai/Tibetan chars on a Japanese-declared document; the other checks miss this because the output is legal Unicode). Whitelist per language (ja/zh/en/ko by default), add a language = edit `parsing.vision.triage.language_script_check.expected_scripts` — no code change. Default ON (`parsing.vision.triage.enabled`).
+- **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Ten-layer defence for damaged pages: `glyph<` / `&lt;` CID markers, U+FFFD ratio, complex-table density, CJK mixed-script anomaly, **language-script consistency** — catches CMap failures that produce CLEAN but WRONG Unicode (e.g. Bengali/Thai/Tibetan chars on a Japanese-declared document; the other checks miss this because the output is legal Unicode) — and **Latin-script cipher garble** (a broken CMap mapping each glyph to a *different* legal Latin letter, caught by an abnormally low vowel ratio). Whitelist per language (ja/zh/en/ko by default), add a language = edit `parsing.vision.triage.language_script_check.expected_scripts` — no code change. Default ON (`parsing.vision.triage.enabled`).
 - **Bounding boxes** — per-element PDF coordinates extracted from Docling for RAG source citation and highlighting. Exposed per file in `index.json` (`files[].element_boxes[<page_no>] = [{label, bbox, text_preview}, ...]`); RAG apps look them up by matching `chunk.metadata.source` → index entry. Toggle via `output.include_bounding_boxes`.
 - **Per-page image paths (vision_only)** — when `--engine vision_only` renders every page to a screenshot, `index.json` records `files[].page_image_paths` (`{page_no: "assets/<stem>-page-NNN.png"}`) alongside `page_sizes`. A downstream visual / image-RAG consumer (e.g. a pixel-native retriever) can locate each page's image without re-deriving the filename pattern — DocIngest keeps producing text as the primary output, but the rendered pages are now first-class, discoverable artefacts too. The Docling engine doesn't emit this (its page images are an internal Vision input, not a promised artefact). The generated `knowledge_search.SKILL.md` adds a one-line pointer when such images exist.
 - **Parse visualization** — `docingest visualize <kb>` draws those element boxes onto the rendered page images (colored by label, optional reading-order numbers) for QA / debugging. PIL on PNG; scales bboxes via the per-page `page_sizes` now stored in `index.json` (falls back to render-DPI for KBs built earlier).
@@ -783,7 +783,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Phase breakdown, design
 - **Knowledge Map** — auto-generated search guide + keyword reverse index. Optional SudachiPy integration for high-precision Japanese keyword extraction (language-routed: Japanese → SudachiPy, Chinese/Korean/English → regex).
 - **Multi-provider** — Gemini / OpenAI / Anthropic / DashScope with automatic fallback.
 - **Network-level retry** — every LLM call (Vision / text completion / ASR) passes `num_retries` to litellm, which applies exponential backoff on transient errors (rate limits, 5xx, TCP resets). Default 2 retries via `models.defaults.max_retries`; per-task override (e.g. `models.vision.max_retries: 5` for a flaky endpoint). Orthogonal to truncation retry (`retry_on_truncation`) which sits at the application layer.
-- **Wall-clock timeouts** — bounded parse and Vision calls so a single hung file can't stall the run. `parsing.timeout_sec` (default 300s) caps Docling per file; `models.vision.timeout_sec` (default 180s) caps each Vision page call. On timeout the file is recorded as failed with `error_type: "timeout"` in `errors.json` and the pipeline continues. Set either to `null` to disable.
+- **Wall-clock timeouts** — bounded parse and Vision calls so a single hung file can't stall the run. `parsing.timeout_sec` (default 600s) caps Docling per file; `models.vision.timeout_sec` (default 180s) caps each Vision page call. On timeout the file is recorded as failed with `error_type: "timeout"` in `errors.json` and the pipeline continues. Set either to `null` to disable.
 - **Graceful interrupt** — Ctrl+C between files lets the current file finish, then writes `chunks.jsonl` / `index.json` / `knowledge_map.yaml` for everything completed so far and exits with code 130. Rerun resumes from the incremental cache. Press Ctrl+C twice for a hard exit.
 - **Classified errors** — `errors.json` entries carry an `error_type` field (`timeout` / `parse_error` / `chunk_error` / `io_error` / `interrupted` / `unknown`) so downstream consumers can branch without grepping the message.
 - **Per-format Vision overrides** — `parsing.<pdf|pptx|docx|xlsx>.vision` shallow-merges over the global Vision config to tune `model` / `max_response_tokens` / `image_dpi` per format. Raise DPI for dense PDFs, cap output for content-light PPTs, swap models for scans — without affecting other formats. Unset fields fall through to global.
@@ -825,10 +825,9 @@ python tests/unit/test_graph_internals.py
 python tests/unit/test_graph_enrich.py
 ```
 
-`tests/unit/test_mixed.py` exists but currently has a known failure in its
-`test_mixed_content` assertion on `title_path`. The failure predates the
-current codebase and is tracked separately — skip this suite when verifying
-your own changes.
+`tests/unit/test_mixed.py` (mixed-input integration; its `title_path`
+assertion previously had a known failure, now resolved — the suite passes
+cleanly) runs the full parse path and is slower than the units above.
 
 ## Documentation
 
