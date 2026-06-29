@@ -508,6 +508,16 @@ parsing:
 
   # PDF-specific
   pdf:
+    # Extract files embedded in the PDF's /EmbeddedFiles tree (PDF "attachments"
+    # — whole files carried like email attachments, NOT page images). When on,
+    # each attachment is pulled out as an independent input file and processed
+    # by its own path (image → Vision, child PDF → PDF parse, xlsx → openpyxl),
+    # named <parent_stem>__<attachment_name>. The parent PDF is still parsed for
+    # its own page body. Default on: probing is cheap (~10-40ms, .pdf only) and
+    # most PDFs carry none, so the cost on attachment-free PDFs is negligible.
+    # Turn off to skip the probe entirely. Attachments DO add Vision/parse cost
+    # when present — the safety budget estimate prices them like any input.
+    extract_attachments: true
     # Who renders PDF page images for per-page Vision.
     #   docling (default): use Docling's built-in page render (generate_page_images).
     #                      On the normal path Docling parses the PDF anyway, and

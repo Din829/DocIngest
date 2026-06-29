@@ -426,36 +426,64 @@ def discover_files(
                     ))
                     _pipeline_logger.warning(f"URL resolution failed: {url}")
 
+    # With no config there is no expansion to do (zip/PDF passes both need it).
+    if config is None:
+        return raw_files, invalid
+
     # Second pass: expand zip archives when enabled. We run this after
     # the directory walk so zip files found INSIDE an input directory
     # are also expanded, not just zips passed directly on the command
     # line.
-    if config is None or not get_nested(config, "parsing.zip.enabled", True):
-        return raw_files, invalid
+    expanded: list[Path] = raw_files
+    if get_nested(config, "parsing.zip.enabled", True):
+        # Lazy import to avoid a hard dependency from non-zip callers and to
+        # keep the top of pipeline.py uncluttered.
+        from .utils.zip_expander import should_expand, expand_zip, get_extract_root
 
-    # Lazy import to avoid a hard dependency from non-zip callers and to
-    # keep the top of pipeline.py uncluttered.
-    from .utils.zip_expander import should_expand, expand_zip, get_extract_root
-
-    extract_root = get_extract_root(config)
-    expanded: list[Path] = []
-
-    for f in raw_files:
-        if should_expand(f):
-            extract_root.mkdir(parents=True, exist_ok=True)
-            inner_files = expand_zip(f, extract_root, config)
-            if inner_files is not None:
-                expanded.extend(inner_files)
-                _pipeline_logger.info(
-                    f"Zip expansion: {f.name} → {len(inner_files)} file(s)"
-                )
+        extract_root = get_extract_root(config)
+        expanded = []
+        for f in raw_files:
+            if should_expand(f):
+                extract_root.mkdir(parents=True, exist_ok=True)
+                inner_files = expand_zip(f, extract_root, config)
+                if inner_files is not None:
+                    expanded.extend(inner_files)
+                    _pipeline_logger.info(
+                        f"Zip expansion: {f.name} → {len(inner_files)} file(s)"
+                    )
+                else:
+                    # Expansion failed or was refused (corrupt, bomb, password).
+                    # Keep the original zip in the list so the pipeline surfaces
+                    # the error explicitly through the normal parse-failure path.
+                    expanded.append(f)
             else:
-                # Expansion failed or was refused (corrupt, bomb, password).
-                # Keep the original zip in the list so the pipeline surfaces
-                # the error explicitly through the normal parse-failure path.
                 expanded.append(f)
-        else:
-            expanded.append(f)
+
+    # Third pass: extract PDF embedded attachments (/EmbeddedFiles) when
+    # enabled. Independent of the ZIP pass (turning off zip must not turn off
+    # this). Symmetric to ZIP expansion, with one difference: a PDF with
+    # attachments still has its own page body worth parsing, so the parent
+    # stays in the list and attachments are APPENDED (not replaced). Probing
+    # is cheap (open + read catalog, ~10-40ms even on a 15MB PDF) and only
+    # touches .pdf files, so the default-on cost on attachment-free PDFs is
+    # negligible against their own parse time.
+    if get_nested(config, "parsing.pdf.extract_attachments", True):
+        from .utils.zip_expander import get_extract_root
+        from .utils.pdf_attachment_expander import expand_pdf_attachments
+
+        # Own cache subdir, sibling to _zip_extract under the same .cache root.
+        attach_root = get_extract_root(config).parent / "_pdf_attachments"
+        with_attachments: list[Path] = []
+        for f in expanded:
+            with_attachments.append(f)
+            if f.suffix.lower() == ".pdf":
+                attached = expand_pdf_attachments(f, attach_root)
+                if attached:
+                    with_attachments.extend(attached)
+                    _pipeline_logger.info(
+                        f"PDF attachments: {f.name} → {len(attached)} file(s)"
+                    )
+        expanded = with_attachments
 
     return expanded, invalid
 

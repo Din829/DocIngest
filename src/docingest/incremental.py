@@ -129,6 +129,8 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.zip.enabled",                 # #4: ZIP expansion toggle
     "parsing.zip.max_nesting_depth",       # #4: affects what gets expanded
     "parsing.zip.filename_encodings",      # #4: affects resulting filenames
+    "parsing.pdf.extract_attachments",     # PDF /EmbeddedFiles expansion toggle:
+                                           # on adds attachment files to the run
     "parsing.magika.enabled",              # #8: format detection toggle
     "parsing.magika.weak_extensions",      # #8: what gets detected
     "parsing.magika.correct_strong_extensions",  # #8: correction aggressiveness
