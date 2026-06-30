@@ -7,7 +7,8 @@ description: >-
   cost, or build a knowledge graph. Three channels: CLI (`docingest run/inspect/refine/doctor`
   and `docingest graph build/query/status/enrich`), MCP tools, and the Python library
   (`import docingest`). NOT a retrieval engine — it prepares data; you search it with your own
-  Grep/Read on `sources/*.md` or vector search on `chunks.jsonl`.
+  Grep/Read on `sources/*.md` or vector search on `chunks.jsonl`. Processing depth/speed is
+  picked via three scenario modes (fast/balanced/best) that auto-adapt per file type.
 ---
 
 # DocIngest — command catalog
@@ -37,6 +38,24 @@ for the refine styles) — when in doubt, run those rather than trusting this co
 | `export` | Push knowledge base chunks → a vector store (Azure AI Search) | After `run`, when the user wants chunks loaded into Azure AI Search. Opt-in `[azure]` extra; bring-your-own embedding. | `--to azure-search`; `--endpoint`; `--index`; `--search-key`; `--embed-provider azure-openai\|openai`; `--embed-model`; `--embed-dim`; `--embed-endpoint`; `--vector-field` |
 | `extract` | Fill a YAML-declared schema from each document → strongly-typed records (`extracted/<template>.jsonl`) | After `run`, when the user wants a STRUCTURED table (fixed fields) out of a batch of similar docs — not free text. Template-driven (`postprocess_templates/*.yaml`); long docs auto-split + parallel + merged. | `-t/--template doc_summary\|<name>\|<path.yaml>`; `-o/--output`; `--input sources\|chunks`; `--parallel N`; `--json`; `-c/--config` |
 | `skills list` | List the refine SKILLs `refine --skill` can use | When unsure which refine style fits; `--json` for programmatic discovery. | `--json` |
+
+## Processing modes (how deep / fast)
+
+Three scenario presets bundle the cost/quality knobs so callers pick a scenario, not
+individual knobs — and the **same mode resolves to a different path per file type**
+(e.g. `fast` = `vision_only` for PDF, but `docling` + high concurrency for Office,
+because Office page images must go through LibreOffice regardless). Full mode×format
+matrix: [docs/PROCESSING_MODES.md](../../../docs/PROCESSING_MODES.md).
+
+| Mode | Use for | Note |
+|---|---|---|
+| `fast` | bulk first-pass, gist only | big speedup on PDF; **limited on Office** (LibreOffice render unavoidable) |
+| `balanced` (default) | almost everything | = current default behaviour, nothing to pass |
+| `best` | contracts / specs, never miss a word | every page to Vision, no batch shortcuts; ~2× cost |
+
+> The single `--mode` flag is **planned, not yet wired**. Until then, apply a mode via
+> `config_overrides` (MCP/Python) or `-c mode.yaml` (CLI); PROCESSING_MODES.md gives the
+> exact knobs. Default runs already equal `balanced`.
 
 ## graph subcommands (`docingest graph <cmd>`) — opt-in
 

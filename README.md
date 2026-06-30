@@ -192,6 +192,29 @@ docingest run ./docs/                 # run 2: 100% cache hit, seconds
 docingest run ./docs/ --force         # ignore cache, full rebuild
 ```
 
+### Processing modes — fast / balanced / best
+
+Rather than tuning the cost/quality knobs (engine, page triage, parallelism,
+figure-Vision) by hand, pick one of three scenario presets. The key idea: **the
+same mode resolves to a different path per file type**, so each format gets its
+fastest/most-accurate route automatically.
+
+| Mode | Use for | What it does |
+|---|---|---|
+| `fast` | bulk first-pass, gist only | PDF goes `vision_only` (skips Docling parse, big speedup). Office (PPTX/DOCX/XLSX) stays Docling + high concurrency + aggressive triage — their page images must go through LibreOffice regardless, so the win is smaller |
+| `balanced` *(default)* | almost everything | Today's default behaviour — accurate parse, triage on, figure extraction on |
+| `best` | contracts, spec sheets, never-miss-a-word | Every page to Vision (triage off), no batching shortcuts; ~2× cost for zero-miss recall |
+
+Why per-format: `vision_only`'s speed win only holds for PDF (PyMuPDF renders an
+already-laid-out format fast). Office formats are bottlenecked on LibreOffice→PDF
+rendering, which no engine can skip — so their `fast` mode saves by sending *fewer*
+Vision calls, not by switching engines. Full knob-by-knob matrix:
+[docs/PROCESSING_MODES.md](docs/PROCESSING_MODES.md).
+
+> The one-flag `--mode` entry point is planned; until it lands, apply a mode via a
+> small project `docingest.yaml` (or `config_overrides` from the library/MCP) using
+> the knob sets in PROCESSING_MODES.md. A plain `docingest run` already equals `balanced`.
+
 ### Inspect documents before processing
 
 Pre-flight check — reports file size, page count, and recommendations without parsing:

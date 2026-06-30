@@ -38,6 +38,23 @@ Per-flag detail: `docingest <cmd> --help`.
 
 **Conventions (all commands)**: JSON→stdout, banner/errors→stderr · exit `0` ok / `1` fail / `2` safety abort · `run` is incremental (avoid `--force`) · fine-grained output control: Python API `outputs=[...]`, CLI/MCP use `--no-chunks` or `config_overrides`.
 
+## Processing modes — how deep / fast to process
+
+Three scenario presets bundle the cost/quality knobs (engine, triage, parallelism,
+figure-Vision) so you pick a scenario, not individual knobs. Crucially the **same
+mode maps to a different path per file type** — full table: [PROCESSING_MODES.md](PROCESSING_MODES.md).
+
+| Mode | For | Headline |
+|---|---|---|
+| `fast` | Bulk first-pass, gist only | PDF: big speedup (`vision_only`). **Office: limited** (LibreOffice render is unavoidable) |
+| `balanced` (default) | Almost everything | Current default behaviour — nothing to pass |
+| `best` | Contracts / specs, never-miss-a-word | Every page to Vision, no batching shortcuts; cost ~2× |
+
+> **Status**: the one-flag `--mode` entry point is **planned, not yet wired**.
+> Today, select a mode via `config_overrides` (MCP/Python) or `-c mode.yaml` (CLI) —
+> PROCESSING_MODES.md lists the exact knob set per mode×format. Default runs already
+> equal `balanced`, so most callers need nothing.
+
 ## Quick start
 
 ```bash
