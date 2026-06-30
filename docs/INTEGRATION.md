@@ -76,7 +76,7 @@ Each scenario's full code lives in [README → Python Library](../README.md#pyth
 | **Long-running daemon** | embedded in a server | `install_signal_handler=False` (default); subprocess-isolate per Trap 2 | [README §Python Library](../README.md#python-library) |
 | **Agent via MCP** | Claude Desktop / Cursor / Copilot | tool docstrings drive behaviour; client config (`.mcp.json` etc.) + per-call `config_overrides` | [README §MCP Server](../README.md#mcp-server-for-ai-agents) |
 | **Refine for humans** | readable/published copy (NOT a RAG step) | `--skill refine_default\|refine_faithful\|refine_html`; raw `sources/*.md` is what RAG consumes | [README §Refine](../README.md) |
-| **CLI in shell** | language-agnostic / CI | `--json` on stdout, banner on stderr; `--engine` to switch backend | [README §Usage](../README.md) |
+| **CLI in shell** | language-agnostic / CI | `--json` on stdout, banner on stderr; `--mode fast\|balanced\|best` to pick the cost/quality preset | [README §Usage](../README.md) |
 
 ---
 

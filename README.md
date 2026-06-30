@@ -163,11 +163,11 @@ Options:
 ```
 -o, --output PATH    Output directory (default: ./knowledge/<input-name>/ for single input, ./knowledge/ for mixed)
 -c, --config PATH    Project config YAML
---engine TEXT        Parsing engine: docling (default, local) | vision_only
-                     (skip docling on PDF/image — render + full-page Vision,
-                     OOM-immune, higher Vision cost; other formats auto-delegate
-                     to docling) | azure_di (cloud parse via Azure Document
-                     Intelligence, needs [azure] extra + credentials)
+--mode TEXT          Processing preset: fast | balanced (default) | best. Bundles
+                     the cost/quality knobs and adapts per file type (fast →
+                     vision_only on PDF, Docling+high-concurrency on Office; best
+                     → every page to Vision). The easy way to control cost/quality.
+                     See "Processing modes" below.
 --strategy TEXT      Override chunking strategy: auto | heading | recursive | slide | sheet | timestamp | whole
                      (auto picks heading/recursive/slide/sheet/timestamp/whole by file format)
 --max-pages INTEGER  Parse only the first N pages of paged inputs (PDF/PPTX/DOCX).
@@ -175,13 +175,21 @@ Options:
                      cost preview reflects N. Distinct from parsing.vision.max_pages,
                      which parses every page but only Vision-enriches the first N.
 --no-chunks          Only output Markdown, skip chunks.jsonl
---parallel INTEGER   Worker count for Vision API calls and ASR segmentation
-                     (the within-file pools)
 --parallel-files N   Process up to N files in overlap (default 1 = sequential).
                      Parsing stays serialized by design — file B parses while
                      file A waits on Vision I/O, which is where the time goes.
                      Outputs stay input-ordered, byte-identical to sequential.
 --force              Ignore cache, full rebuild
+
+Advanced (usually covered by --mode; set only for the noted cases):
+--engine TEXT        Parsing engine: docling (default, local) | vision_only
+                     (skip docling on PDF/image — render + full-page Vision,
+                     OOM-immune; other formats auto-delegate to docling) |
+                     azure_di (cloud parse via Azure Document Intelligence, needs
+                     [azure] extra + credentials). Set mainly for azure_di;
+                     --mode fast already picks vision_only for PDF. Overrides --mode.
+--parallel INTEGER   Worker count for Vision API calls and ASR segmentation
+                     (the within-file pools). Usually left to --mode (fast = 64).
 ```
 
 **Incremental mode is on by default.** Second run skips unchanged files. All outputs (index.json, chunks.jsonl, knowledge_map, SKILL.md) are fully regenerated each run to include both cached and new files:

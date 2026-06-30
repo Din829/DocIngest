@@ -206,6 +206,8 @@ parse_result.transformations.append({"step": "...", ...})  # 记 lineage
 
 **四层优先级**（高→低）：CLI args > `DOCINGEST__*` 环境变量 > 项目 `docingest.yaml` > `config/default.yaml`。加载逻辑见 `config.py`，所有项的语义注释在 `config/default.yaml`（单一真相源）。
 
+**处理档位（`--mode`）**：日常不必手调单个旋钮——`fast`/`balanced`/`best` 三档把成本/质量旋钮（engine / triage / 并发 / 抠图 / batched）打包成场景预设，且按文件格式分流（实现见 `api.py::_MODE_PRESETS` / `_resolve_mode`，落点在 `build_config` 的 `config_overrides` 之下，故显式 override 仍能覆盖 mode）。档×格式映射与依据见 [PROCESSING_MODES.md](PROCESSING_MODES.md)。
+
 ⚠️ **缓存陷阱**（最常见坑）：改了 config 但没重跑？因为只有 `incremental.py::_RELEVANT_CONFIG_PATHS` 白名单里的配置变更才触发重跑——改不影响输出的配置（`output.dir` 等）故意不触发。要强制全重建用 `--force`。
 
 ---

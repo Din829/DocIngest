@@ -193,11 +193,13 @@ def main(
         None,
         "--engine",
         help=(
-            "Parsing engine: docling (default, local) | vision_only (skip docling "
-            "on PDF/image, render + full-page Vision — OOM-immune, higher Vision "
-            "cost) | azure_di (cloud parse via Azure Document Intelligence, needs "
-            "[azure] extra + credentials). Non-PDF/image formats auto-delegate to "
-            "docling under vision_only."
+            "[Advanced] Parsing engine. Usually you want --mode instead "
+            "(--mode fast already picks vision_only for PDF). Set this only "
+            "for azure_di: docling (default, local) | vision_only (skip docling "
+            "on PDF/image, render + full-page Vision — OOM-immune) | azure_di "
+            "(cloud parse via Azure Document Intelligence, needs [azure] extra + "
+            "credentials). Non-PDF/image formats auto-delegate to docling under "
+            "vision_only. An explicit --engine overrides --mode."
         ),
     ),
     max_pages: Optional[int] = typer.Option(
@@ -215,8 +217,10 @@ def main(
         None,
         "--parallel",
         help=(
-            "Worker count for Vision API calls and ASR segmentation "
-            "(the WITHIN-file pools; see --parallel-files for file overlap)."
+            "[Advanced] Worker count for Vision API calls and ASR segmentation "
+            "(the WITHIN-file pools). Usually left to --mode (fast raises it to "
+            "64); set only to override the per-file concurrency. See "
+            "--parallel-files for file-to-file overlap (a different knob)."
         ),
     ),
     parallel_files: Optional[int] = typer.Option(
