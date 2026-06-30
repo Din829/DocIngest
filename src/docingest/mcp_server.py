@@ -190,6 +190,7 @@ def run(
     purpose: str | None = None,
     outputs: list[str] | None = None,
     strategy: str | None = None,
+    mode: str | None = None,
     force: bool = False,
     acknowledge_large: bool = False,
     config_overrides: dict[str, Any] | None = None,
@@ -277,6 +278,13 @@ def run(
             See above.
         strategy: Override chunking strategy. None keeps config default
             (auto). See above for valid values.
+        mode: Processing mode — "fast" / "balanced" (default) / "best". A
+            scenario preset bundling the cost/quality knobs (engine, page
+            triage, parallelism, figure-Vision), adapting per file type:
+            fast → vision_only for PDF (big speedup) but Docling +
+            high-concurrency for Office; best → every page to Vision, no
+            batch shortcuts (~2x cost, zero-miss). Explicit `config_overrides`
+            win over the mode.
         force: Ignore incremental cache. See above.
         acknowledge_large: Pass True ONLY after reviewing safety violations.
             See above.
@@ -325,6 +333,7 @@ def run(
         output=output_dir,
         outputs=eff_outputs,
         purpose=eff_purpose,
+        mode=mode,
         config_overrides=merged_overrides or None,
         force=force,
         acknowledge_large=acknowledge_large,

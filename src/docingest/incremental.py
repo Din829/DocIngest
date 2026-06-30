@@ -171,8 +171,10 @@ _RELEVANT_CONFIG_PATHS = [
     "parsing.xlsx.vision",
     "parsing.docx.image_extraction",       # embedded-figure full-res Vision —
     "parsing.xlsx.image_extraction",       # min_dimension / vision_enrich /
-                                           # max_images_vision all change which
+    "parsing.pptx.image_extraction",       # max_images_vision all change which
                                            # figures get transcribed blocks
+                                           # (pptx added: 'fast' mode flips its
+                                           # vision_enrich, which alters the md)
     "parsing.xlsx.use_openpyxl_renderer",  # switches xlsx parser engine —
                                            # flipping it changes the markdown
                                            # produced for the same file

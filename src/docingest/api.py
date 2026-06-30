@@ -146,6 +146,68 @@ _PURPOSE_PRESETS: dict[str, list[str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Processing-mode presets — "how deep / fast", orthogonal to purpose ("which
+# files"). Each mode expands to a set of config overrides. Single source of
+# truth for the docs/PROCESSING_MODES.md matrix; the mode × file-type split is
+# handled FOR FREE by the engine layer — `vision_only` already renders PDF/image
+# pages itself and DELEGATES every other format back to Docling, so one global
+# `engine: vision_only` gives "fast for PDF, Docling for Office" with no per-file
+# branching here.
+# ---------------------------------------------------------------------------
+# Why each knob (all values verified against config/default.yaml defaults):
+#   fast — bulk first-pass, gist only:
+#     * engine=vision_only: PDF/image skip Docling parse (real speedup, OOM-immune);
+#       Office auto-delegates to Docling (LibreOffice render is unavoidable there).
+#     * parallel_files=64: saturate Vision I/O so the per-page calls finish in
+#       fewer waves (shared Phase 1.5 pool — applies to Docling-routed Office too).
+#     * <fmt>.image_extraction.vision_enrich=false: stop sending every embedded
+#       figure to Vision (the big cost on slide decks); figures are still extracted
+#       to assets/ and marked, only the per-figure Vision read is skipped.
+#     * triage min_text_length↓ / table_line_threshold↑: skip MORE plain pages.
+#       The garble safety nets (replacement-ratio / entity / script-consistency)
+#       are deliberately LEFT ON — fast may skip clean pages, never broken ones.
+#   best — never miss a word, cost no object:
+#     * triage.enabled=false: every page goes to Vision (zero skip risk).
+#     * batched_call.enabled=false: xlsx goes per-sheet — measured, batching drops
+#       chart-type visuals (月別売上 etc.) that per-sheet recovers.
+# balanced is the empty preset == today's defaults → fully backward-compatible.
+_MODE_PRESETS: dict[str, dict[str, Any]] = {
+    "balanced": {},
+    "fast": {
+        "parsing.engine": "vision_only",
+        "performance.parallel_files": 64,
+        "parsing.pptx.image_extraction.vision_enrich": False,
+        "parsing.docx.image_extraction.vision_enrich": False,
+        "parsing.xlsx.image_extraction.vision_enrich": False,
+        "parsing.vision.triage.min_text_length": 20,
+        "parsing.vision.triage.table_line_threshold": 100,
+    },
+    "best": {
+        "parsing.vision.triage.enabled": False,
+        "parsing.vision.batched_call.enabled": False,
+    },
+}
+
+
+def _resolve_mode(mode: str | None) -> dict[str, Any]:
+    """
+    Expand a processing mode into its config-override dict.
+
+    ``None`` / ``"balanced"`` → ``{}`` (today's defaults, backward-compatible).
+    Unknown mode raises ValueError listing the valid names — a typo must fail
+    loud, not silently run at the wrong cost/quality point. Returns a fresh
+    dict so callers can merge into it without mutating the shared preset.
+    """
+    if mode is None:
+        return {}
+    if mode not in _MODE_PRESETS:
+        raise ValueError(
+            f"Unknown mode: {mode!r}. Valid options: {sorted(_MODE_PRESETS)}."
+        )
+    return dict(_MODE_PRESETS[mode])
+
+
+# ---------------------------------------------------------------------------
 # Result dataclass
 # ---------------------------------------------------------------------------
 
@@ -214,6 +276,7 @@ def build_config(
     config_overrides: dict[str, Any] | None = None,
     config_file: str | Path | None = None,
     force: bool | None = None,
+    mode: str | None = None,
     extra_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
@@ -248,6 +311,11 @@ def build_config(
                 applies (picks up ``docingest.yaml`` in cwd if present).
         force: Force-rebuild flag (→ ``incremental.force``). ``None``
                 means "don't touch the setting".
+        mode: Processing mode — ``"fast"`` / ``"balanced"`` / ``"best"`` (or
+                None == balanced). Expands to a set of config overrides
+                (see ``_MODE_PRESETS``) applied BELOW ``config_overrides``,
+                so explicit overrides win. Orthogonal to ``purpose``: mode
+                = how deep/fast, purpose = which files.
         extra_overrides: Already-merged override dict to apply LAST (after
                 everything else). Useful for CLI-style adapters that
                 want to guarantee their args win.
@@ -279,6 +347,13 @@ def build_config(
     if force is True:
         _set_dotted(layered, "incremental.force", True)
 
+    # Processing mode expands to a set of overrides applied BEFORE the user's
+    # own config_overrides — so an explicit override (or -c file) always wins
+    # over the mode preset, letting advanced callers fine-tune on top of a mode.
+    mode_overrides = _resolve_mode(mode)
+    if mode_overrides:
+        layered = deep_merge(layered, _normalize_overrides(mode_overrides))
+
     if config_overrides:
         user = _normalize_overrides(config_overrides)
         layered = deep_merge(layered, user)
@@ -308,6 +383,7 @@ def ingest(
     config_overrides: dict[str, Any] | None = None,
     config_file: str | Path | None = None,
     force: bool = False,
+    mode: str | None = None,
     acknowledge_large: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     install_signal_handler: bool = False,
@@ -349,6 +425,13 @@ def ingest(
             defaults.
         config_file: Path to a project-level ``docingest.yaml``.
         force: Ignore incremental cache and reprocess all files.
+        mode: Processing mode — ``"fast"`` / ``"balanced"`` (default) /
+            ``"best"``. A scenario preset that bundles the cost/quality
+            knobs (engine, page triage, parallelism, figure-Vision) and
+            adapts per file type (e.g. ``fast`` → vision_only for PDF, but
+            Docling + high concurrency for Office). Explicit
+            ``config_overrides`` win over the mode. See
+            docs/PROCESSING_MODES.md.
         acknowledge_large: When ``safety.mode`` is ``"strict"`` and the
             pre-run check flags violations, set this to proceed anyway.
         on_progress: Optional callback fired once per file completion
@@ -402,6 +485,7 @@ def ingest(
         config_overrides=config_overrides,
         config_file=config_file,
         force=force,
+        mode=mode,
     )
 
     parser = create_parser(config)

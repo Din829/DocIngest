@@ -177,6 +177,18 @@ def main(
         "--strategy",
         help="Override chunking strategy: auto, heading, recursive, slide, sheet, timestamp, whole.",
     ),
+    mode: Optional[str] = typer.Option(
+        None,
+        "--mode",
+        help=(
+            "Processing mode preset: fast | balanced (default) | best. Bundles "
+            "the cost/quality knobs and adapts per file type — fast goes "
+            "vision_only on PDF (big speedup) but Docling+high-concurrency on "
+            "Office (LibreOffice render is unavoidable); best sends every page to "
+            "Vision (no skips, ~2x cost). Explicit flags (--engine etc.) override "
+            "the mode. See docs/PROCESSING_MODES.md."
+        ),
+    ),
     engine: Optional[str] = typer.Option(
         None,
         "--engine",
@@ -336,6 +348,19 @@ def main(
             # one-line error + exit 1, not a traceback.
             err_console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(1)
+
+    # Processing mode → a set of overrides, merged BEFORE the explicit per-flag
+    # options below so an explicit --engine / --parallel still wins over the mode
+    # preset (same precedence as the Python facade). Unknown mode → clean error.
+    if mode:
+        from .api import _resolve_mode, _normalize_overrides
+        from .config import deep_merge
+        try:
+            mode_layer = _normalize_overrides(_resolve_mode(mode))
+        except ValueError as e:
+            err_console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(1)
+        cli_overrides = deep_merge(cli_overrides, mode_layer)
 
     if strategy:
         cli_overrides.setdefault("chunking", {})["strategy"] = strategy
