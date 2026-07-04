@@ -23,7 +23,7 @@
 # CPU index, which doesn't carry litellm/typer/etc. and the install would fail.
 
 # === Core (mirrors pyproject.toml [project].dependencies) ===
-docling>=2.95
+docling>=2.107
 litellm>=1.86.1
 google-genai>=2.0
 typer>=0.15

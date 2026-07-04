@@ -182,7 +182,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 - **增量缓存**：`cache_key = 内容哈希`，`config_hash` 只算白名单子集（改不影响输出的配置不触发重跑）。白名单是代码即清单：`incremental.py::_RELEVANT_CONFIG_PATHS`。
 - **Chunk lineage**：每 chunk 挂 `source_markdown` + `original_input` + `transformations` 数组（实际起作用的变换才记）。见 `pipeline.py::_build_chunk_lineage`。
 - **视频双路径**：默认 `native_video`（整段一次调用，Gemini 原生）；不支持时降级抽帧 + per-page Vision。见 `media_parser.py` + `parsing.audio.native_video` config。
-- **动态超时 / OOM 分批**：超时按页数缩放（`_resolve_parse_timeout`）；PDF 超阈值主动分批避 Windows OOM（`docling_parser.py::_parse_pdf_batched` + `parsing.pdf.oom_batch_fallback` config，背景见 [docling_parse_OOM_Windows_长期监控.md](docling_parse_OOM_Windows_长期监控.md)）。
+- **动态超时 / OOM 分批**：超时按页数缩放（`_resolve_parse_timeout`）；PDF 超阈值主动分批控内存 + 解析失败被动分批兜底（`docling_parser.py::_parse_pdf_batched` + `parsing.pdf.oom_batch_fallback` config）。起因是 docling-parse 的 Windows OOM bug——**上游已修（7.4.0+，2026-07 本机升级验证）**，机制留作长期防线，历史见 [docling_parse_OOM_Windows_长期监控.md](docling_parse_OOM_Windows_长期监控.md)。
 - **派生 metadata**：aliases / tags / 语义 type，零额外 LLM。见 `hooks/derive_*.py` + `output/tags_enrichment.py`。
 - **其它**：ZIP 防炸弹（`utils/zip_expander.py`）/ URL 走 yt-dlp（`utils/url_resolver.py`）/ magika 内容识别（`utils/format_detector.py`）/ 加密检测（`utils/encryption.py`）。
 
@@ -256,7 +256,7 @@ parse_result.transformations.append({"step": "...", ...})  # 记 lineage
 
 | 项 | 状态 |
 |---|---|
-| 文件并发解析串行化 | 设计如此（避 docling-parse Windows OOM），收益靠 Vision I/O overlap |
+| 文件并发解析串行化 | 全局解析锁仍在（历史原因：避 docling-parse Windows OOM，上游 2026-07 已修）；解锁并行提速待评估，当前收益靠 Vision I/O overlap |
 | Parser 路由写死在 `_DoclingWithFallback` | 未中心化为注册表；加 parser 改一处即可，暂不抽象 |
 | 多栏混排版面阅读顺序错位 | 上游 Docling reading-order 决定（三栏作者+双栏正文等复杂版面块顺序会乱，内容不丢）；DocIngest 层无法修，RAG 按关键词检索基本不受影响 |
 | 源 PDF 文本层 CMap 损坏（字形→错码位，如阿拉伯字形出希腊字母） | 源文件自身损坏（"垃圾进"）；triage 的脚本一致性检测仅覆盖 ja/zh/en/ko 且跳过 <50 字符短页，故部分漏网；非 DocIngest 层能修 |

@@ -278,9 +278,8 @@ pip install -e ".[azure]"
 ```
 
 - **Azure Document Intelligence as a parse backend** — `parsing.engine: azure_di`
-  parses in Azure's cloud instead of local docling, sidestepping the
-  docling-parse Windows `std::bad_alloc` OOM bug. Default stays `docling`; you
-  opt in per run.
+  parses in Azure's cloud instead of local docling, with zero local parsing
+  memory pressure. Default stays `docling`; you opt in per run.
 - **Export chunks → Azure AI Search** — `docingest export` embeds a knowledge
   base's chunks with your own model and pushes them into an Azure AI Search
   vector index ("manual vectorization", preserving DocIngest's chunks instead of
@@ -804,7 +803,7 @@ See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Phase breakdown, design
 - **Parse visualization** — `docingest visualize <kb>` draws those element boxes onto the rendered page images (colored by label, optional reading-order numbers) for QA / debugging. PIL on PNG; scales bboxes via the per-page `page_sizes` now stored in `index.json` (falls back to render-DPI for KBs built earlier).
 - **Repeating-furniture dedup** — opt-in `pre_write` hook collapses per-page furniture Vision transcribed (e.g. a `DocuSign Envelope ID` repeated on every page) down to its first copy — never deletes every copy, so no unique content is lost. Default OFF (`hooks.strip_repeating.enabled`).
 - **LangChain integration** — `DocIngestLoader` (opt-in `[langchain]` extra) maps `chunks.jsonl` → LangChain `Document`, bridging DocIngest to any LangChain vector store / retriever (Azure AI Search, Bedrock, Pinecone, ...) while reusing its semantic chunks. Pulls only `langchain-core`.
-- **Azure plugin** — opt-in `[azure]` plugin (`docingest.azure`) with two independent capabilities: a cloud parse backend (`parsing.engine: azure_di`, sidesteps the docling-parse Windows OOM bug) and a generic chunks → Azure AI Search exporter (`docingest export`, bring-your-own embedding, injectable field map, dimension-checked). Core `run` never imports it; SDKs load only on use. Default OFF.
+- **Azure plugin** — opt-in `[azure]` plugin (`docingest.azure`) with two independent capabilities: a cloud parse backend (`parsing.engine: azure_di`, zero local parse memory pressure) and a generic chunks → Azure AI Search exporter (`docingest export`, bring-your-own embedding, injectable field map, dimension-checked). Core `run` never imports it; SDKs load only on use. Default OFF.
 - **Chunk lineage** — every chunk in `chunks.jsonl` carries a `metadata.lineage` sub-dict recording `source_markdown`, `original_input` (filename / mimetype / binary_hash / last_modified), and an ordered `transformations` array of what actually shaped it (parser → hooks → vision → chunker). Disabled features (e.g. sanitize.enabled=false) and triaged-out Vision pages are NOT recorded — lineage is a positive provenance trail for RAG citation / quality attribution / reproducibility, not a debug log. Existing flat metadata fields (`source`, `original_file`, `format`, `language`, `title_path`, …) are preserved unchanged for backwards compatibility.
 - **Hidden text detection** — flags invisible/background content via Docling ContentLayer analysis.
 - **Sensitive data sanitization** — opt-in PII masking (email, URL, credit card with Luhn validation, IPv4, JP phone). High-precision rules only, no name detection. Default OFF (`sanitize.enabled`).

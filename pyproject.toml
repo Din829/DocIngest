@@ -11,7 +11,11 @@ license = { text = "MIT" }
 
 dependencies = [
     # Core: document parsing
-    "docling>=2.95",          # Document parsing (PDF/PPT/Excel/HTML/images).
+    "docling>=2.107",         # Document parsing (PDF/PPT/Excel/HTML/images).
+                              # Floor is 2.107: earlier versions pin
+                              # docling-parse <7.0.0, which carries the Windows
+                              # std::bad_alloc page-drop bug (fixed in
+                              # docling-parse 7.4.0+, PR #287).
                               # NOTE: docling pulls torch transitively and its
                               # DocumentConverter imports torch at module load,
                               # so `pip install docling` DOES drag the ~5.6GB
@@ -227,8 +231,7 @@ gui = [
 azure = [
     # Opt-in Azure plugin (docingest.azure) — two independent capabilities:
     #   1. Parsing backend (parsing.engine=azure_di): parse in Azure DI's cloud
-    #      instead of local docling — sidesteps the docling-parse Windows
-    #      std::bad_alloc bug.
+    #      instead of local docling — zero local parsing memory pressure.
     #   2. Export (docingest export --to azure-search): embed chunks + push them
     #      into an Azure AI Search vector index (manual vectorization).
     # Core `docingest run` never imports any of this; each SDK loads only when

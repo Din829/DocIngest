@@ -25,7 +25,7 @@ DocIngest 的处理质量/成本由多个正交旋钮决定（解析引擎、要
 
 最重要的设计点：**档位必须按文件类型分别落地**，因为各格式的最优路径不同。最典型的是 `fast` 档：
 
-- **PDF 的 `fast` = `vision_only`**（跳过 Docling 解析，PyMuPDF 直接渲染整页图给 Vision）——**真省时间**，且免疫 docling-parse 的 Windows OOM。
+- **PDF 的 `fast` = `vision_only`**（跳过 Docling 解析，PyMuPDF 直接渲染整页图给 Vision）——**真省时间**，且完全不经过 docling-parse。
 - **PPTX / DOCX / XLSX 的 `fast` ≠ `vision_only`**——它们的页图**必须经 LibreOffice→PDF→截图**（这步 3–7 秒躲不掉），而 Docling 解析本身才 2.5 秒还白送高质量正文文字。跳过 Docling 省的那点时间，远抵不上丢掉的正文质量。所以它们的 `fast` = **Docling + 高并发 + 激进 triage + 关抠图**，靠并发拉满和少送页省，**不换引擎**。
 
 > **一句话**：`vision_only` 的"省时间"卖点**只对 PDF 成立**（PDF 是已排好版的格式，PyMuPDF 渲染极快）。Office 格式卡在 LibreOffice 这个躲不掉的慢步骤上，`fast` 对它们靠的是"少送 Vision"，不是"换引擎"。
