@@ -186,6 +186,8 @@ _RELEVANT_CONFIG_PATHS = [
     "output.markdown.include_metadata_header",
     "output.vision_keep",                  # which Docling/Vision half to keep —
                                            # changing it rewrites sources/*.md content
+    "output.vision_keep_min_unique_chars", # superset-guard threshold — changes
+                                           # which sections keep both halves
     "sanitize.enabled",                    # PII sanitize hook master toggle —
                                            # flipping it rewrites markdown before write
     "sanitize.rules",                      # custom PII rule set — changes

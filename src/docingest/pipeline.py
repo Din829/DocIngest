@@ -3065,6 +3065,42 @@ def _enrich_with_vision(
 # `... page=N`, `... page=N (overflow)`, and `... batched batch=X/Y pages=A-B`.
 _VISION_MARK_RE = re.compile(r"<!-- vision-enriched[^>]*-->")
 
+# Markdown decoration + whitespace, stripped before Docling↔Vision line
+# comparison so reflow/emphasis differences don't count as "missing content".
+_MD_DECOR_RE = re.compile(r"[\s*#|>\-_`•·]+")
+
+
+def _norm_for_coverage(s: str) -> str:
+    return _MD_DECOR_RE.sub("", unicodedata.normalize("NFKC", s))
+
+
+def _docling_unique_lines(
+    docling_half: str, vision_half: str, min_chars: int
+) -> list[str]:
+    """Docling-half lines whose normalized text is absent from the Vision half.
+
+    Non-empty result means Vision is NOT a superset of Docling for this section,
+    so dropping the Docling half would lose real content. The known case:
+    Docling's PPTX serializer drifts slide boundaries, parking one slide's text
+    (divider titles, the closing slide) inside a NEIGHBOURING slide's section —
+    text the neighbour's Vision render never saw.
+
+    Lines shorter than `min_chars` after normalization (page numbers, footer
+    furniture) and HTML comment placeholders don't count as unique content.
+    """
+    vision_norm = _norm_for_coverage(vision_half)
+    unique = []
+    for line in docling_half.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("<!--"):
+            continue
+        n = _norm_for_coverage(stripped)
+        if len(n) < min_chars:
+            continue
+        if n not in vision_norm:
+            unique.append(stripped)
+    return unique
+
 
 def _apply_vision_keep(markdown: str, config: dict[str, Any], doc_format: str | None) -> str:
     """
@@ -3074,7 +3110,10 @@ def _apply_vision_keep(markdown: str, config: dict[str, Any], doc_format: str | 
 
     output.vision_keep:
       both    → return markdown unchanged (zero content loss)
-      vision  → drop the Docling half (before the marker), keep the marker + Vision
+      vision  → drop the Docling half (before the marker), keep the marker + Vision.
+                Guarded per section: if the Docling half contains lines the Vision
+                half doesn't cover (see _docling_unique_lines — Docling PPTX
+                section drift), that section keeps both halves instead.
       docling → drop the marker + Vision half, keep the Docling half
       auto    → decide PER PAGE which half to keep, using on-page signals
                 (see _page_prefers_vision): Vision riddled with [unreadable]/[?]
@@ -3153,6 +3192,25 @@ def _apply_vision_keep(markdown: str, config: dict[str, Any], doc_format: str | 
             decision = "vision" if _page_prefers_vision(docling_half, vision_half) else "docling"
 
         if decision == "vision":
+            # SUPERSET GUARD: dropping the Docling half assumes Vision covers
+            # it. Docling's PPTX section drift breaks that assumption — a
+            # neighbouring slide's text can sit in this section's Docling half
+            # with no Vision fallback anywhere. If the Docling half has lines
+            # Vision doesn't cover, keep BOTH halves instead of losing them.
+            min_unique = int(
+                get_nested(config, "output.vision_keep_min_unique_chars", 4)
+            )
+            unique = _docling_unique_lines(body[: m.start()], body[m.start():], min_unique)
+            if unique:
+                _pipeline_logger.warning(
+                    f"vision_keep=vision: keeping BOTH halves for one section — "
+                    f"its Docling half has {len(unique)} line(s) absent from the "
+                    f"Vision half (first: {unique[0][:50]!r}). Common cause: "
+                    f"Docling PPTX section drift parking a neighbouring slide's "
+                    f"text here."
+                )
+                out.append(section)
+                continue
             # Keep the marker + everything after it (Vision); drop Docling before.
             kept = body[m.start():]
             out.append(frontmatter + "\n\n" + kept if frontmatter else kept)

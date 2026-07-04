@@ -1158,6 +1158,18 @@ output:
                                 # drop the redundant Docling half. xlsx/docx are
                                 # auto-protected (kept as both) by the guards above.
 
+  # Superset guard for vision_keep=vision/auto→vision: before dropping a
+  # section's Docling half, check it line-by-line (NFKC + decoration-stripped)
+  # against the Vision half. If any Docling line is ABSENT from Vision, that
+  # section keeps BOTH halves and logs a warning — dropping would lose content.
+  # Real case this catches: Docling's PPTX serializer drifts slide boundaries,
+  # parking a divider slide's title or the closing slide's text inside a
+  # neighbouring section whose Vision render never saw it (triage-skipped pages
+  # have no Vision fallback → the text would vanish entirely).
+  # This knob is the minimum normalized line length that counts as content —
+  # shorter lines (page numbers, footer furniture) never block the dedup.
+  vision_keep_min_unique_chars: 4
+
   markdown:
     include_metadata_header: true  # YAML frontmatter in each file
     image_refs: "relative"         # relative | absolute | inline_base64
