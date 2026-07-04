@@ -90,9 +90,15 @@ class VisionOnlyParser(BaseParser):
 
         assets_dir = self._assets_dir()
         image_dpi = int(get_nested(self.config, "parsing.vision.image_dpi", 180))
+        # parsing.max_pages must be enforced HERE: the Docling path caps via
+        # convert(page_range=...), but vision_only sends every rendered page to
+        # Vision — without this cap a 519-page PDF burns 519 Vision calls even
+        # when the user asked for the first 75.
+        max_pages = get_nested(self.config, "parsing.max_pages", None)
         # Reuse the already-tested PyMuPDF renderer. {page_no: png_path}.
         page_images = DoclingParser._render_pdf_pages_pymupdf(
-            file_path, assets_dir, image_dpi
+            file_path, assets_dir, image_dpi,
+            max_pages=int(max_pages) if max_pages else None,
         )
         if not page_images:
             # No pages rendered → genuine failure (corrupt PDF / PyMuPDF gone).

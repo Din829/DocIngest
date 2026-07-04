@@ -1253,9 +1253,15 @@ class DoclingParser(BaseParser):
 
     @staticmethod
     def _render_pdf_pages_pymupdf(
-        file_path: Path, assets_dir: Path, image_dpi: int
+        file_path: Path, assets_dir: Path, image_dpi: int,
+        max_pages: int | None = None,
     ) -> dict[int, str]:
         """Render every PDF page to a PNG with PyMuPDF — the fast page-image path.
+
+        max_pages caps the render to the first N pages (parsing.max_pages
+        semantics — the vision_only path has no Docling page_range to enforce
+        it, so the cap must happen here, BEFORE pages are rendered and sent
+        to Vision). None = all pages, unchanged for every other caller.
 
         Returns {page_no (1-based): saved_png_path}. On any failure returns an
         empty dict so the caller falls back to Docling's page.image render
@@ -1285,7 +1291,10 @@ class DoclingParser(BaseParser):
 
         try:
             with pymupdf.open(str(file_path)) as doc:
-                for i in range(doc.page_count):
+                page_cap = doc.page_count
+                if max_pages is not None and int(max_pages) > 0:
+                    page_cap = min(page_cap, int(max_pages))
+                for i in range(page_cap):
                     page = doc.load_page(i)
                     zoom = image_dpi / 72.0
                     rect = page.rect
