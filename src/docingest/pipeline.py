@@ -33,7 +33,6 @@ from .chunkers.base import BaseChunker
 from .chunkers.recursive import RecursiveChunker
 from .output.markdown_writer import write_markdown
 from .output.index_builder import IndexBuilder
-from .output.chunks_writer import write_chunks
 from .enrichment.path_injector import inject_paths
 from .incremental import (
     compute_cache_key,
@@ -771,28 +770,6 @@ def _strip_empty_cells(line: str) -> str:
     return line
 
 
-def _extract_metadata_kv(lines: list[str], max_rows: int) -> dict[str, str]:
-    """
-    Try to extract key-value metadata from the first N rows of Excel output.
-
-    Recognises patterns like:
-      '| 画面ID | A15S010 |'  → {"画面ID": "A15S010"}
-      '| 作成者 | | 山田 |'  → {"作成者": "山田"}
-
-    Only extracts rows that look like label-value pairs (2 non-empty cells).
-    Data table headers (3+ non-empty cells) are left alone.
-    """
-    kv: dict[str, str] = {}
-    for line in lines[:max_rows]:
-        if not line.strip().startswith("|"):
-            continue
-        cells = [c.strip() for c in line.split("|")]
-        cells = [c for c in cells if c and c.lower() != "none"]
-        if len(cells) == 2:
-            kv[cells[0]] = cells[1]
-    return kv
-
-
 def _denoise_markdown_table_rows(markdown: str) -> str:
     """
     Apply row-level merged-cell dedup to every Markdown table line.
@@ -825,9 +802,11 @@ def _clean_excel_markdown(
     Three passes:
       1. dedup_cells:  collapse identical consecutive cells in each row
       2. strip_empty:  remove empty cells from table rows, drop empty rows
-      3. metadata:     extract key-value pairs from first N rows into metadata
+      3. row dedup:    collapse consecutive identical SINGLE-cell rows
+                       (the merged-cell noise signature; multi-column
+                       duplicates are legitimate data and never touched)
 
-    Returns cleaned markdown. Metadata extraction is best-effort (non-destructive).
+    Returns cleaned markdown.
 
     Sheet boundaries (PAGEBREAK_MARKER) are preserved — cleaning is done
     per-section so downstream Vision injection / dedup / chunking stay aligned
