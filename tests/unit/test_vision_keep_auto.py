@@ -108,10 +108,13 @@ def test_auto_mixed_document() -> None:
     # page 1 kept docling → docling text present, its vision markers gone
     assert "Docling page one clean text." in out
     assert "[unreadable: a]" not in out
-    # page 2 kept vision → the labelled vision table present, collapsed gone
+    # page 2: docling collapsed → auto prefers vision, but the SUPERSET GUARD
+    # sees collapsed rows Vision doesn't cover (Vision here has only 1 data
+    # row) → keeps BOTH halves. Dropping would lose the 2025-2027 numbers;
+    # redundancy is the accepted price for zero content loss.
     assert "LCOE" in out
-    assert "| 2024 | 5000 | 30 |" not in out
-    print("ok: auto picks docling on p1, vision on p2")
+    assert "| 2024 | 5000 | 30 |" in out
+    print("ok: auto picks docling on p1, keeps both on p2 (guard)")
 
 
 def test_auto_leaves_image_supplement_untouched() -> None:
