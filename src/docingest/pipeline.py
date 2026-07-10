@@ -3472,6 +3472,107 @@ def _postprocess_chunks(
     return merged
 
 
+def _attach_chunk_locators(
+    chunk_views: list[tuple[str, dict[str, Any]]],
+    *,
+    doc_format: str,
+    page_count: int | None = None,
+) -> str | None:
+    """Attach one additive, format-neutral locator to each eligible chunk.
+
+    ``chunk_views`` deliberately accepts plain ``(text, metadata)`` pairs so
+    the exact same logic upgrades both fresh ``Chunk`` objects and cached
+    JSONL records. Existing format-specific metadata stays untouched.
+
+    PDF page ranges are evidence-based: all ``pages - 1`` pagebreak markers
+    must survive chunking. If not, no page locator is emitted for that file
+    and the caller receives a warning instead of guessed page numbers.
+    """
+    if not chunk_views:
+        return None
+
+    # Existing chunkers already carry authoritative structural coordinates.
+    # Convert them into one common contract without moving/removing old keys.
+    for _text, metadata in chunk_views:
+        slide_index = metadata.get("slide_index")
+        if (
+            isinstance(slide_index, int)
+            and not isinstance(slide_index, bool)
+            and slide_index >= 0
+        ):
+            metadata["locator"] = {"kind": "slide", "index": slide_index + 1}
+            continue
+
+        sheet_name = metadata.get("sheet_name")
+        if isinstance(sheet_name, str) and sheet_name.strip():
+            metadata["locator"] = {"kind": "sheet", "name": sheet_name}
+            continue
+
+        start = metadata.get("start_seconds")
+        end = metadata.get("end_seconds")
+        numeric = (int, float)
+        if (
+            isinstance(start, numeric) and not isinstance(start, bool)
+            and isinstance(end, numeric) and not isinstance(end, bool)
+            and start >= 0 and end >= start
+        ):
+            metadata["locator"] = {
+                "kind": "time",
+                "start_seconds": start,
+                "end_seconds": end,
+            }
+
+    # A structural locator wins. Pagebreaks in PPTX/XLSX are slide/sheet
+    # separators, not PDF page evidence, so only PDF enters the page path.
+    if doc_format.lower() != "pdf":
+        return None
+
+    def _remove_stale_page_locators() -> None:
+        for _text, metadata in chunk_views:
+            locator = metadata.get("locator")
+            if isinstance(locator, dict) and locator.get("kind") == "page":
+                metadata.pop("locator", None)
+
+    if (
+        not isinstance(page_count, int)
+        or isinstance(page_count, bool)
+        or page_count <= 0
+    ):
+        _remove_stale_page_locators()
+        return "Chunk page locator omitted: PDF page count is unavailable."
+
+    observed = sum(text.count(PAGEBREAK_MARKER) for text, _ in chunk_views)
+    expected = page_count - 1
+    if observed != expected:
+        _remove_stale_page_locators()
+        return (
+            "Chunk page locator omitted: pagebreak count "
+            f"{observed} != expected {expected} for {page_count} pages."
+        )
+
+    current_page = 1
+    for text, metadata in chunk_views:
+        # Cached chunks already include the injected source header. It is not
+        # page content, so strip it before deciding whether a marker at the
+        # very start belongs to the previous or next page.
+        body = text
+        if body.startswith("[来源:") or body.startswith("[Source:"):
+            _header, _sep, body = body.partition("\n")
+        segments = body.split(PAGEBREAK_MARKER)
+        content_indexes = [i for i, segment in enumerate(segments) if segment.strip()]
+        if content_indexes:
+            start_page = current_page + content_indexes[0]
+            end_page = current_page + content_indexes[-1]
+            metadata["locator"] = {
+                "kind": "page",
+                "start": start_page,
+                "end": end_page,
+            }
+        current_page += len(segments) - 1
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Single file processing
 # ---------------------------------------------------------------------------
@@ -4000,6 +4101,27 @@ def process_single_file(
         # Post-process: merge fragment chunks and clean image noise
         if chunks:
             chunks = _postprocess_chunks(chunks, config)
+
+        # Add one common citation coordinate without changing text, order,
+        # chunk count, IDs, or the existing format-specific metadata fields.
+        if chunks:
+            raw_page_count = parse_result.metadata.get("pages")
+            page_count = (
+                raw_page_count
+                if isinstance(raw_page_count, int)
+                and not isinstance(raw_page_count, bool)
+                and raw_page_count > 0
+                else (len(parse_result.pages) or None)
+            )
+            locator_warning = _attach_chunk_locators(
+                [(chunk.text, chunk.metadata) for chunk in chunks],
+                doc_format=result.format,
+                page_count=page_count,
+            )
+            if locator_warning:
+                parse_result.metadata.setdefault("warnings", []).append(
+                    locator_warning
+                )
 
         # Apply enrichment: path injection (if enabled)
         if chunks and get_nested(config, "chunking.enrichment.path_injection", True):
@@ -4652,11 +4774,29 @@ def run_pipeline(
         # Reuse index entry
         index_builder.add_cached_entry(meta["index_entry"])
 
-        # Reuse chunks (lookup by id in old chunks.jsonl)
+        # Reuse chunks (lookup by id in old chunks.jsonl). Locator enrichment
+        # is replay-safe and metadata-only, so old cache hits gain the current
+        # locator contract without re-running parse/Vision or bumping the cache
+        # contract version.
+        cached_records: list[dict[str, Any]] = []
         for chunk_id in meta["outputs"].get("chunk_ids", []):
             record = old_chunks_by_id.get(chunk_id)
             if record is not None:
-                reused_chunk_records.append(record)
+                cached_records.append(record)
+        locator_warning = _attach_chunk_locators(
+            [
+                (record.get("text", ""), record.setdefault("metadata", {}))
+                for record in cached_records
+            ],
+            doc_format=str(meta.get("format", "unknown")),
+            page_count=meta.get("index_entry", {}).get("pages"),
+        )
+        if locator_warning:
+            pipeline_result.warnings.append({
+                "file": file_path.name,
+                "message": locator_warning,
+            })
+        reused_chunk_records.extend(cached_records)
 
         # Reserve output filename so new files don't collide with cached ones
         source_md_rel = meta["outputs"].get("source_md", "")

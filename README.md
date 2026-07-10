@@ -219,6 +219,25 @@ manifest. Only paths recorded as DocIngest-owned under `sources/` and `assets/`
 plus their cache metadata can be removed. An empty bound directory intentionally
 syncs the knowledge base to empty.
 
+### Chunk source locators
+
+Eligible `chunks.jsonl` records carry one additive `metadata.locator` so a
+retrieval result can point back to its original unit:
+
+```json
+{"kind": "page", "start": 3, "end": 4}
+{"kind": "slide", "index": 6}
+{"kind": "sheet", "name": "売上集計"}
+{"kind": "time", "start_seconds": 120, "end_seconds": 165}
+```
+
+PDF ranges are 1-based and are emitted only when every expected pagebreak
+survived chunking; otherwise DocIngest warns and omits the locator instead of
+guessing. PPT locator indices are also 1-based for display, while the legacy
+zero-based `slide_index` stays unchanged. Existing sheet/time fields remain.
+Cache hits gain locators during replay, so this metadata upgrade does not force
+document parsing or Vision to run again.
+
 ### Processing modes — fast / balanced / best
 
 Rather than tuning the cost/quality knobs (engine, page triage, parallelism,

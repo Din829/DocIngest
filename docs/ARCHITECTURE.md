@@ -74,7 +74,8 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 | **1.7 Vision dedup** | full 模式按 `output.vision_keep` 选保留哪半 | `_apply_vision_keep` |
 | **2 Write** | sources/*.md + frontmatter + assets/ | `write_markdown` |
 | **3 Chunk** | 按策略切分 + 保护块 + 片段合并 + 路径注入 | `chunker.chunk()` + `_postprocess_chunks` + `inject_paths` |
-| **3.1 Lineage attach** | 给每个 chunk 挂 `metadata.lineage` | `_build_chunk_lineage` |
+| **3.1 Locator attach** | 纯增量补统一来源坐标（page / slide / sheet / time）；不改文本/顺序/ID | `_attach_chunk_locators` |
+| **3.2 Lineage attach** | 给每个 chunk 挂 `metadata.lineage` | `_build_chunk_lineage` |
 | **4.5 Explicit sync** | 仅 `sync_root` 显式启用；成功完整运行后清理已删除输入拥有的产物并原子更新清单 | `incremental.py::finalize_sync` |
 
 ### 2.3 数据流
@@ -107,6 +108,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 | 大文件主动分批 / OOM 兜底 | `docling_parser.py::_parse_pdf_batched` |
 | xlsx openpyxl 渲染 | `docling_parser.py::_parse_xlsx_via_openpyxl` |
 | Chunk metadata 黑名单 | `pipeline.py::_CHUNK_METADATA_BLACKLIST` |
+| Chunk 统一来源定位 | `pipeline.py::_attach_chunk_locators` |
 | Chunk lineage 构建 | `pipeline.py::_build_chunk_lineage` |
 | Refine（独立命令） | `refine.py` + `skills/*.SKILL.md` |
 | 知识图生成 / 质量报告 | `output/knowledge_map.py` / `output/quality_report.py` |
@@ -180,6 +182,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 - **Excel openpyxl 渲染**：每 sheet 独立标题、合并单元格锚点化、空列剪除。见 `docling_parser.py::_parse_xlsx_via_openpyxl`。
 - **ground truth 切片**：Vision input 按 sheet / docx PDF 文本层切，省 input token。见 `pipeline.py::_xlsx_per_page_ground_truth` / `_docx_per_page_ground_truth`。
 - **Chunking 策略 + 保护块**：auto 按格式选策略；表格/代码/列表块超限时按行/项边界切（表头每片重复）。见 `chunkers/*.py` + `chunking.protection.*` config。
+- **Chunk locator**：`metadata.locator` 统一承载 PDF 页范围、PPT 页号、Excel sheet、音视频秒数；旧字段原样保留。PDF 仅在 pagebreak 总数严格等于 `pages - 1` 时生成，否则 warning + 全文件不写，禁止猜测。缓存回放也走同一函数，所以不升 `CACHE_CONTRACT_VERSION`、不重烧解析/Vision。见 `pipeline.py::_attach_chunk_locators`。
 - **增量缓存**：`cache_key = 内容哈希`，`config_hash` 只算白名单子集（改不影响输出的配置不触发重跑）。`CACHE_CONTRACT_VERSION` 隔离不兼容的产物逻辑；改 parser/chunker/output 语义时必须同步升版。白名单与版本都在 `incremental.py`。
 - **显式目录同步**：普通 ingest 永不删除旧 source；CLI `--sync` / API、MCP `sync=True` 才把一个知识库绑定到一个本地目录。清理必须等完整运行成功，且只能删除清单登记的 `sources/`、`assets/` 和对应 cache meta；失败、中断、Safety abort 均保留旧清单。空目录同步表示明确清空。实现见 `incremental.py::load_sync_baseline/finalize_sync`。
 - **Chunk lineage**：每 chunk 挂 `source_markdown` + `original_input` + `transformations` 数组（实际起作用的变换才记）。见 `pipeline.py::_build_chunk_lineage`。
