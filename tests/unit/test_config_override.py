@@ -5,6 +5,9 @@ import tempfile
 import shutil
 from pathlib import Path
 
+import pytest
+from typer.testing import CliRunner
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
 from docingest.config import load_config
@@ -18,6 +21,7 @@ from docingest.chunkers.slide import SlideChunker
 from docingest.chunkers.sheet import SheetChunker
 from docingest.chunkers.timestamp import TimestampChunker
 from docingest.pipeline import run_pipeline
+from docingest.cli import app
 
 
 def test_strategy_override():
@@ -69,6 +73,54 @@ def test_strategy_override():
         print(f"  {strategy}: {type(cs).__name__}  OK")
 
     print("Test 7a PASSED\n")
+
+
+def test_invalid_engine_fails_loud():
+    config = load_config(cli_overrides={"parsing": {"engine": "typo_engine"}})
+    with pytest.raises(ValueError, match="Unknown parsing engine"):
+        create_parser(config)
+
+
+def test_invalid_chunking_strategy_fails_loud():
+    config = load_config(cli_overrides={
+        "chunking": {"strategy": "typo_strategy"}
+    })
+    with pytest.raises(ValueError, match="Unknown chunking strategy"):
+        create_chunker(config)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["typo_strategy", "scoring", {"nested": "bad"}]
+)
+def test_invalid_auto_format_strategy_fails_loud(invalid):
+    config = load_config(cli_overrides={
+        "chunking": {
+            "strategy": "auto",
+            "auto": {"format_strategies": {"pptx": invalid}},
+        }
+    })
+    with pytest.raises(ValueError, match="format_strategies"):
+        create_chunker(config)
+
+
+def test_cli_reports_invalid_engine_without_traceback(tmp_path: Path):
+    source = tmp_path / "source.md"
+    source.write_text("content", encoding="utf-8")
+    config_file = tmp_path / "bad.yaml"
+    config_file.write_text(
+        "parsing:\n  engine: typo_engine\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(app, [
+        "run", str(source),
+        "--output", str(tmp_path / "out"),
+        "--config", str(config_file),
+    ])
+
+    assert result.exit_code == 1
+    assert "Unknown parsing engine" in result.output
+    assert "Traceback" not in result.output
 
 
 def test_token_size_override():

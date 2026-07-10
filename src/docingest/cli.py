@@ -391,9 +391,19 @@ def main(
         cli_overrides=cli_overrides,
     )
 
-    # Create parser and chunker
-    parser = create_parser(config)
-    chunker = create_chunker(config) if config.get("chunking", {}).get("enabled", True) else None
+    # Create parser and chunker. Factories validate user-facing strategy names;
+    # turn a YAML/env typo into one clean CLI error instead of a traceback or a
+    # silent fallback to a different processing path.
+    try:
+        parser = create_parser(config)
+        chunker = (
+            create_chunker(config)
+            if config.get("chunking", {}).get("enabled", True)
+            else None
+        )
+    except ValueError as e:
+        err_console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
 
     # Attach FileHandler for run.log AFTER output_dir is finalized. Always on
     # (independent of -v) so post-mortem analysis works without re-running with

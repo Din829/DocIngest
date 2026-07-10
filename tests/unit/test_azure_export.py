@@ -20,10 +20,13 @@ Run:
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT / "src"))
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +75,24 @@ def _write_chunks(tmp: Path, records: list[dict]) -> Path:
 # ---------------------------------------------------------------------------
 
 def test_import_pulls_no_sdk() -> None:
-    for name in list(sys.modules):
-        if name.startswith("docingest.azure"):
-            del sys.modules[name]
-    import docingest.azure  # noqa: F401
-    assert "azure.search.documents" not in sys.modules
-    assert "openai" not in sys.modules
+    code = """
+import sys
+import docingest.azure
+assert "azure.search.documents" not in sys.modules
+assert "openai" not in sys.modules
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT / "src"), env.get("PYTHONPATH", "")]
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     print("ok: azure plugin import pulls no search/openai SDK")
 
 

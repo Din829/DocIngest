@@ -77,14 +77,14 @@ def _make_parent(path: Path, attachments: dict[str, bytes]) -> None:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-def test_extracts_all_types(tmp: Path) -> None:
-    parent = tmp / "parent.pdf"
+def test_extracts_all_types(tmp_path: Path) -> None:
+    parent = tmp_path / "parent.pdf"
     _make_parent(parent, {
         "diagram.png": _png_bytes(),
         "child.pdf": _child_pdf_bytes(),
         "table.xlsx": _xlsx_bytes(),
     })
-    root = tmp / "_extract"
+    root = tmp_path / "_extract"
     out = expand_pdf_attachments(parent, root)
 
     assert len(out) == 3, f"expected 3 attachments, got {len(out)}"
@@ -101,39 +101,39 @@ def test_extracts_all_types(tmp: Path) -> None:
     print("  ✓ test_extracts_all_types")
 
 
-def test_no_attachments_is_noop(tmp: Path) -> None:
-    parent = tmp / "plain.pdf"
+def test_no_attachments_is_noop(tmp_path: Path) -> None:
+    parent = tmp_path / "plain.pdf"
     _make_parent(parent, {})           # zero attachments
-    out = expand_pdf_attachments(parent, tmp / "_extract")
+    out = expand_pdf_attachments(parent, tmp_path / "_extract")
     assert out == [], f"expected [] for attachment-free PDF, got {out}"
     print("  ✓ test_no_attachments_is_noop")
 
 
-def test_non_pdf_is_noop(tmp: Path) -> None:
-    notpdf = tmp / "data.txt"
+def test_non_pdf_is_noop(tmp_path: Path) -> None:
+    notpdf = tmp_path / "data.txt"
     notpdf.write_text("hello")
-    out = expand_pdf_attachments(notpdf, tmp / "_extract")
+    out = expand_pdf_attachments(notpdf, tmp_path / "_extract")
     assert out == [], f"expected [] for non-PDF, got {out}"
     print("  ✓ test_non_pdf_is_noop")
 
 
-def test_corrupt_input_never_raises(tmp: Path) -> None:
+def test_corrupt_input_never_raises(tmp_path: Path) -> None:
     # A .pdf extension on non-PDF bytes — open() fails; must return [], not raise.
-    fake = tmp / "broken.pdf"
+    fake = tmp_path / "broken.pdf"
     fake.write_bytes(b"not a real pdf at all")
-    out = expand_pdf_attachments(fake, tmp / "_extract")
+    out = expand_pdf_attachments(fake, tmp_path / "_extract")
     assert out == [], f"expected [] for corrupt PDF, got {out}"
     print("  ✓ test_corrupt_input_never_raises")
 
 
-def test_naming_collision_across_parents(tmp: Path) -> None:
+def test_naming_collision_across_parents(tmp_path: Path) -> None:
     # Two different parents with a same-named attachment must not collide:
     # each parent gets its own subdir, and names carry the parent stem.
-    p1 = tmp / "alpha.pdf"
-    p2 = tmp / "beta.pdf"
+    p1 = tmp_path / "alpha.pdf"
+    p2 = tmp_path / "beta.pdf"
     _make_parent(p1, {"shared.png": _png_bytes()})
     _make_parent(p2, {"shared.png": _png_bytes()})
-    root = tmp / "_extract"
+    root = tmp_path / "_extract"
     out1 = expand_pdf_attachments(p1, root)
     out2 = expand_pdf_attachments(p2, root)
     assert out1[0].name == "alpha__shared.png", out1[0].name

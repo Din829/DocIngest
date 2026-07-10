@@ -50,10 +50,9 @@ mode maps to a different path per file type** — full table: [PROCESSING_MODES.
 | `balanced` (default) | Almost everything | Current default behaviour — nothing to pass |
 | `best` | Contracts / specs, never-miss-a-word | Every page to Vision, no batching shortcuts; cost ~2× |
 
-> **Status**: the one-flag `--mode` entry point is **planned, not yet wired**.
-> Today, select a mode via `config_overrides` (MCP/Python) or `-c mode.yaml` (CLI) —
-> PROCESSING_MODES.md lists the exact knob set per mode×format. Default runs already
-> equal `balanced`, so most callers need nothing.
+`--mode` is wired across CLI, Python, and MCP. Explicit config overrides still
+win over the preset, so advanced callers can start from a mode and tune one
+knob. Default runs equal `balanced`, so most callers need nothing.
 
 ## Quick start
 

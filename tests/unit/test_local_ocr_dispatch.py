@@ -20,6 +20,8 @@ import sys
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
 from docingest.models import local_ocr
@@ -127,9 +129,9 @@ def test_unknown_backend_rejected():
     print("  unknown backend name rejected loudly  PASSED\n")
 
 
-def _make_tmp_img() -> Path:
+def _make_tmp_img(root: Path | None = None) -> Path:
     import tempfile
-    p = Path(tempfile.mkdtemp()) / "page.png"
+    p = (root or Path(tempfile.mkdtemp())) / "page.png"
     # 1x1 PNG so Path.exists() passes; content never read on the mocked paths.
     p.write_bytes(bytes.fromhex(
         "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
@@ -137,6 +139,11 @@ def _make_tmp_img() -> Path:
         "0a2db40000000049454e44ae426082"
     ))
     return p
+
+
+@pytest.fixture
+def tmp_img(tmp_path: Path) -> Path:
+    return _make_tmp_img(tmp_path)
 
 
 def main():
@@ -149,10 +156,6 @@ def main():
     test_missing_deps_fail_loud()
     test_unknown_backend_rejected()
     print("ALL local-OCR-dispatch TESTS PASSED")
-
-
-# pytest-style fixture name used positionally by main(); kept simple.
-tmp_img = property  # placeholder so module imports cleanly under pytest collectors
 
 
 if __name__ == "__main__":

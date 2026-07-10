@@ -179,7 +179,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 - **Excel openpyxl 渲染**：每 sheet 独立标题、合并单元格锚点化、空列剪除。见 `docling_parser.py::_parse_xlsx_via_openpyxl`。
 - **ground truth 切片**：Vision input 按 sheet / docx PDF 文本层切，省 input token。见 `pipeline.py::_xlsx_per_page_ground_truth` / `_docx_per_page_ground_truth`。
 - **Chunking 策略 + 保护块**：auto 按格式选策略；表格/代码/列表块超限时按行/项边界切（表头每片重复）。见 `chunkers/*.py` + `chunking.protection.*` config。
-- **增量缓存**：`cache_key = 内容哈希`，`config_hash` 只算白名单子集（改不影响输出的配置不触发重跑）。白名单是代码即清单：`incremental.py::_RELEVANT_CONFIG_PATHS`。
+- **增量缓存**：`cache_key = 内容哈希`，`config_hash` 只算白名单子集（改不影响输出的配置不触发重跑）。`CACHE_CONTRACT_VERSION` 隔离不兼容的产物逻辑；改 parser/chunker/output 语义时必须同步升版。白名单与版本都在 `incremental.py`。
 - **Chunk lineage**：每 chunk 挂 `source_markdown` + `original_input` + `transformations` 数组（实际起作用的变换才记）。见 `pipeline.py::_build_chunk_lineage`。
 - **视频双路径**：默认 `native_video`（整段一次调用，Gemini 原生）；不支持时降级抽帧 + per-page Vision。见 `media_parser.py` + `parsing.audio.native_video` config。
 - **动态超时 / OOM 分批**：超时按页数缩放（`_resolve_parse_timeout`）；PDF 超阈值主动分批控内存 + 解析失败被动分批兜底（`docling_parser.py::_parse_pdf_batched` + `parsing.pdf.oom_batch_fallback` config）。起因是 docling-parse 的 Windows OOM bug——**上游已修（7.4.0+，2026-07 本机升级验证）**，机制留作长期防线，历史见 [docling_parse_OOM_Windows_长期监控.md](docling_parse_OOM_Windows_长期监控.md)。
@@ -198,7 +198,7 @@ result_field = do_something(parse_result, config)
 parse_result.transformations.append({"step": "...", ...})  # 记 lineage
 ```
 
-同步检查：① 读/写的 `parse_result` 字段有没有和上下游冲突（顺序敏感）；② 新配置项加到 `config/default.yaml` + 必要时进 `incremental.py` 白名单；③ 错误隔离（不 raise，失败降级）。
+同步检查：① 读/写的 `parse_result` 字段有没有和上下游冲突（顺序敏感）；② 新配置项加到 `config/default.yaml` + 必要时进 `incremental.py` 白名单；③ 如果旧产物不再可安全复用，升级 `CACHE_CONTRACT_VERSION`；④ 错误隔离（非关键增强失败降级，系统边界的无效配置直接报错）。
 
 ---
 
@@ -267,4 +267,4 @@ parse_result.transformations.append({"step": "...", ...})  # 记 lineage
 
 ## 附：维护约定
 
-改命令、`--strategy` 值、refine 默认值后，必须同步 `.claude/skills/docingest/SKILL.md` + `AGENTS.md`（`tests/unit/test_command_catalog.py` 会把文档钉死在代码上，不同步则测试红）。
+改命令、`--strategy` 值、refine 默认值后，必须同步 `.claude/skills/docingest/SKILL.md` + 两份 `AGENTS.md`（`tests/unit/test_command_catalog.py` 会把文档钉死在代码上，不同步则测试红）。改 parser/chunker/output 产物语义时，同时判断是否升级 `CACHE_CONTRACT_VERSION`。

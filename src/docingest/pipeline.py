@@ -4943,8 +4943,11 @@ def run_pipeline(
             for c in new_chunks
         ]
         all_final_records = reused_chunk_records + new_records
-        if all_final_records:
-            write_chunk_records(all_final_records, output_dir, config)
+        # Always overwrite, including the zero-record case. Skipping the write
+        # when a successful rebuild produced no chunks left the previous run's
+        # chunks.jsonl untouched, so downstream retrieval saw stale content
+        # even though PipelineResult.total_chunks correctly reported zero.
+        write_chunk_records(all_final_records, output_dir, config)
 
     # Generate knowledge map (Phase 4)
     if get_nested(config, "knowledge_map.enabled", True):

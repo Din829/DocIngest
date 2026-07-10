@@ -87,9 +87,19 @@ def build_chunk_id(chunk: Chunk) -> str:
     Format: {source_stem}_chunk_{index:03d}
     Example: annual-report-2025_chunk_012
 
+    ``metadata.source`` is the written Markdown path and therefore already
+    carries the writer's collision suffix (same.md, same_1.md, ...). Prefer it
+    over ``original_file`` so same-stem inputs with different extensions do
+    not collapse to the same ID. Direct callers that omit source keep the
+    legacy original_file fallback.
+
     Public (unprefixed) so incremental cache can use the same scheme.
     """
-    source = chunk.metadata.get("original_file", chunk.metadata.get("source", "unknown"))
+    source = (
+        chunk.metadata.get("source")
+        or chunk.metadata.get("original_file")
+        or "unknown"
+    )
     # Extract stem from filename
     stem = Path(source).stem if source else "unknown"
     # Sanitize: replace spaces and special chars

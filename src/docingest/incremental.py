@@ -12,7 +12,7 @@ Cache structure:
 
 Meta schema:
   {
-    "version": 1,
+    "version": 2,
     "cache_key": "<md5head_size>",
     "config_hash": "<short hash of relevant config>",
     "original_name": "spec.xlsx",
@@ -38,6 +38,15 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_nested
+
+
+# Compatibility version of the cached pipeline artefacts, not merely the JSON
+# shape. Bump this whenever parser/chunker/output semantics change in a way
+# that makes previously cached Markdown, chunks, assets, or index entries
+# unsafe to reuse. Version 2 intentionally invalidates the old v1 cache once:
+# v1 had no producer-contract boundary, so outputs from older code could live
+# forever as long as the input bytes and selected config stayed unchanged.
+CACHE_CONTRACT_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -311,8 +320,11 @@ def is_cache_valid(
     Returns:
         (is_valid, reason). reason is empty string if valid, otherwise explains why not.
     """
-    if meta.get("version") != 1:
-        return False, f"meta schema version mismatch (got {meta.get('version')})"
+    if meta.get("version") != CACHE_CONTRACT_VERSION:
+        return False, (
+            "cache contract version mismatch "
+            f"(got {meta.get('version')}, expected {CACHE_CONTRACT_VERSION})"
+        )
 
     if meta.get("config_hash") != current_config_hash:
         return False, "config changed"
@@ -396,7 +408,7 @@ def build_meta(
     All path fields use forward slashes for cross-platform consistency.
     """
     return {
-        "version": 1,
+        "version": CACHE_CONTRACT_VERSION,
         "cache_key": cache_key,
         "config_hash": config_hash,
         "original_name": file_path.name,

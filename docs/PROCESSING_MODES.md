@@ -3,7 +3,7 @@
 > 单一真相源：三个面向场景的档位（`fast` / `balanced` / `best`）如何按**文件类型**展开成底层旋钮。
 > 用户/agent 只选档位，DocIngest 按格式自动选最优路径——不必手调 engine / triage / parallel / 抠图 等旋钮。
 >
-> 这份文档既是用户指南，也是未来 `--mode` CLI 入口的实现规格（每档 → config 覆盖集）。
+> 这份文档既是用户指南，也是 `--mode` 在 CLI / Python / MCP 三个入口的行为契约。
 
 ---
 
@@ -95,13 +95,13 @@ DocIngest 的处理质量/成本由多个正交旋钮决定（解析引擎、要
 
 ---
 
-## `--mode` 入口实现规格（给下一轮代码）
+## `--mode` 当前实现
 
-`--mode <fast|balanced|best>` 不是单个旋钮，而是**展开成一组 config 覆盖**，且覆盖值**按文件格式条件分发**。落地要点：
+`--mode <fast|balanced|best>` 不是单个旋钮，而是**展开成一组 config 覆盖**。当前行为：
 
 1. **`balanced` = 不覆盖任何东西**（等同当前默认），保证向后兼容。
-2. **`fast` / `best` = 一组 `config_overrides`**，其中 engine 等"按格式分流"的旋钮需要在 per-file 处理时按 `doc_format` 取对应值（不能全局一刀切，否则 PPT 会错误地走 vision_only）。
-3. CLI 只暴露 `--mode`；底层旋钮（triage/vision_enrich/parallel…）**不单独暴露**——用户选场景，不碰旋钮。高级用户仍可用 `-c config.yaml` 精调。
+2. **`fast` / `best` = 一组 `config_overrides`**。`fast` 全局选 `vision_only`，但 `VisionOnlyParser` 只对 PDF/图片直读，Office/文本/音视频会委托回正常解析链，因此格式分流仍然成立。
+3. CLI 以 `--mode` 为主入口；高级用户仍可用 `-c config.yaml` / `config_overrides` 精调，显式覆盖优先级高于 mode。
 4. 与现有 `--purpose`（控制产出哪些文件）正交：`--mode` 管"处理多深/多快"，`--purpose` 管"产出哪些文件"，可叠加。
 
 > 旋钮的真实默认值与控制点见 `config/default.yaml`（单一真相源）：

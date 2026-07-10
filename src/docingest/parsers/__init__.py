@@ -114,8 +114,10 @@ def create_parser(config: dict[str, Any]) -> BaseParser:
         from .vision_only_parser import VisionOnlyParser
         return VisionOnlyParser(config)
     else:
-        # Unknown engine → just use text parser
-        return TextParser(config)
+        valid = ["azure_di", "docling", "docling_with_fallback", "vision_only"]
+        raise ValueError(
+            f"Unknown parsing engine: {engine!r}. Valid options: {valid}."
+        )
 
 
 class _DoclingWithFallback(BaseParser):

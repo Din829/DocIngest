@@ -25,7 +25,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 SKILL_MD = ROOT / ".claude" / "skills" / "docingest" / "SKILL.md"
 AGENTS_MD = ROOT / "AGENTS.md"
+DOCS_AGENTS_MD = ROOT / "docs" / "AGENTS.md"
+PROCESSING_MODES_MD = ROOT / "docs" / "PROCESSING_MODES.md"
 DEFAULT_YAML = ROOT / "config" / "default.yaml"
+
+CATALOG_DOCS = [
+    ("SKILL.md", SKILL_MD),
+    ("AGENTS.md", AGENTS_MD),
+    ("docs/AGENTS.md", DOCS_AGENTS_MD),
+]
 
 
 def _real_command_set() -> tuple[set[str], set[str], set[str]]:
@@ -55,7 +63,12 @@ def test_skill_and_agents_list_every_command():
     skill_text = SKILL_MD.read_text(encoding="utf-8")
     agents_text = AGENTS_MD.read_text(encoding="utf-8")
 
-    for doc_name, text in [("SKILL.md", skill_text), ("AGENTS.md", agents_text)]:
+    docs_text = {
+        "SKILL.md": skill_text,
+        "AGENTS.md": agents_text,
+        "docs/AGENTS.md": DOCS_AGENTS_MD.read_text(encoding="utf-8"),
+    }
+    for doc_name, text in docs_text.items():
         missing = sorted(n for n in all_names if n not in text)
         assert not missing, (
             f"{doc_name} command catalog is missing these real commands/tools: "
@@ -75,7 +88,7 @@ def test_strategy_values_match_code():
     print(f"  code --strategy values: {sorted(real_values)}")
 
     # Both catalog docs spell them as auto|heading|recursive|slide|sheet
-    for doc_name, path in [("SKILL.md", SKILL_MD), ("AGENTS.md", AGENTS_MD)]:
+    for doc_name, path in CATALOG_DOCS:
         text = path.read_text(encoding="utf-8")
         missing = sorted(v for v in real_values if v not in text)
         assert not missing, (
@@ -106,10 +119,27 @@ def test_refine_default_not_stale():
     print(f"  mcp docstring default matches yaml ({real_default})  PASSED\n")
 
 
+def test_processing_mode_docs_match_implemented_surface():
+    """All agent docs must describe the implemented mode entry point."""
+    from docingest.api import _MODE_PRESETS
+
+    mode_names = set(_MODE_PRESETS)
+    for doc_name, path in [*CATALOG_DOCS, ("PROCESSING_MODES.md", PROCESSING_MODES_MD)]:
+        text = path.read_text(encoding="utf-8")
+        missing = sorted(name for name in mode_names if name not in text)
+        assert not missing, f"{doc_name} is missing processing modes: {missing}"
+
+    docs_agents = DOCS_AGENTS_MD.read_text(encoding="utf-8")
+    modes_doc = PROCESSING_MODES_MD.read_text(encoding="utf-8")
+    assert "planned, not yet wired" not in docs_agents
+    assert "未来 `--mode` CLI 入口" not in modes_doc
+
+
 def main():
     test_skill_and_agents_list_every_command()
     test_strategy_values_match_code()
     test_refine_default_not_stale()
+    test_processing_mode_docs_match_implemented_surface()
     print("ALL command-catalog anti-drift TESTS PASSED")
 
 

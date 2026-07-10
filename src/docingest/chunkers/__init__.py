@@ -20,6 +20,11 @@ from .heading import HeadingChunker
 from ..config import get_nested
 
 
+_CONCRETE_STRATEGIES = frozenset({
+    "heading", "recursive", "slide", "sheet", "timestamp", "whole",
+})
+
+
 # ---------------------------------------------------------------------------
 # Structure scoring for auto strategy
 # ---------------------------------------------------------------------------
@@ -133,7 +138,28 @@ class AutoChunker(BaseChunker):
         self._heading = HeadingChunker(config)
 
         auto_cfg = get_nested(config, "chunking.auto", {})
+        if not isinstance(auto_cfg, dict):
+            raise ValueError("chunking.auto must be a mapping.")
         self._format_strategies = auto_cfg.get("format_strategies", {})
+        if not isinstance(self._format_strategies, dict):
+            raise ValueError("chunking.auto.format_strategies must be a mapping.")
+        invalid = {
+            key: value for key, value in self._format_strategies.items()
+            if (
+                not isinstance(value, str)
+                or (
+                    value not in _CONCRETE_STRATEGIES
+                    and not (key == "default" and value == "scoring")
+                )
+            )
+        }
+        if invalid:
+            raise ValueError(
+                "Unknown strategy in chunking.auto.format_strategies: "
+                f"{invalid}. Valid format routes: "
+                f"{sorted(_CONCRETE_STRATEGIES)}; only 'default' may use "
+                "'scoring'."
+            )
         self._image_formats = set(auto_cfg.get("image_formats", [
             "png", "jpg", "jpeg", "tiff", "bmp", "webp", "gif"
         ]))
@@ -178,9 +204,9 @@ class AutoChunker(BaseChunker):
                 return TimestampChunker(self.config).chunk(markdown, metadata)
             except ImportError:
                 return self._recursive.chunk(markdown, metadata)
-        else:
-            # "recursive" or any unknown → recursive
+        elif strategy == "recursive":
             return self._recursive.chunk(markdown, metadata)
+        raise RuntimeError(f"AutoChunker resolved an invalid strategy: {strategy!r}")
 
     def _select_strategy(self, markdown: str, metadata: dict[str, Any]) -> str:
         """
@@ -274,5 +300,7 @@ def create_chunker(config: dict[str, Any]) -> BaseChunker:
     elif strategy == "whole":
         return WholeChunker(config)
     else:
-        # Unknown strategy → auto
-        return AutoChunker(config)
+        valid = ["auto", *sorted(_CONCRETE_STRATEGIES)]
+        raise ValueError(
+            f"Unknown chunking strategy: {strategy!r}. Valid options: {valid}."
+        )

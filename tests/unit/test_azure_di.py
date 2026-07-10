@@ -21,10 +21,13 @@ Run:
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
+ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(ROOT / "src"))
 
 
 # ---------------------------------------------------------------------------
@@ -67,14 +70,23 @@ def _two_page_fixture() -> _FakeAnalyzeResult:
 # ---------------------------------------------------------------------------
 
 def test_main_import_does_not_need_azure_sdk() -> None:
-    for name in list(sys.modules):
-        if name == "docingest" or name.startswith("docingest."):
-            del sys.modules[name]
-    import docingest  # noqa: F401
-    # azure plugin not imported as a side effect of the main package
-    assert "docingest.azure" not in sys.modules, (
-        "importing docingest must not import the azure plugin"
+    code = """
+import sys
+import docingest
+assert "docingest.azure" not in sys.modules
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(ROOT / "src"), env.get("PYTHONPATH", "")]
     )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     print("ok: main import is azure-free")
 
 
