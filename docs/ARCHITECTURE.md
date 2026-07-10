@@ -75,6 +75,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 | **2 Write** | sources/*.md + frontmatter + assets/ | `write_markdown` |
 | **3 Chunk** | 按策略切分 + 保护块 + 片段合并 + 路径注入 | `chunker.chunk()` + `_postprocess_chunks` + `inject_paths` |
 | **3.1 Lineage attach** | 给每个 chunk 挂 `metadata.lineage` | `_build_chunk_lineage` |
+| **4.5 Explicit sync** | 仅 `sync_root` 显式启用；成功完整运行后清理已删除输入拥有的产物并原子更新清单 | `incremental.py::finalize_sync` |
 
 ### 2.3 数据流
 
@@ -98,7 +99,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 | Parser 接口 + 路由 | `parsers/base.py` / `parsers/__init__.py` `_DoclingWithFallback` |
 | Chunker 接口（含保护块规则）+ 工厂 | `chunkers/base.py` / `chunkers/__init__.py` |
 | 配置加载 + 环境变量 | `config.py` |
-| 增量缓存 + config_hash 白名单 | `incremental.py`（白名单常量 `_RELEVANT_CONFIG_PATHS`，代码即清单） |
+| 增量缓存 + config_hash 白名单 + 显式目录同步 | `incremental.py`（白名单常量 `_RELEVANT_CONFIG_PATHS`；同步清单 `.cache/sync-manifest.json`） |
 | AI provider + fallback 链 + AI 结果缓存 | `models/provider.py` / `models/audio_provider.py` / `models/cache.py` |
 | Vision 主逻辑 + 10 层 triage | `parsers/vision.py` + `pipeline.py::_enrich_with_vision` / `_should_skip_vision` |
 | 全分辨率抠图（图里小字，docx/xlsx/pptx）| 抽取 `docling_parser.py::_extract_docling_pictures`（docx/pptx）/ openpyxl（xlsx）→ 读图 `pipeline.py::_enrich_embedded_images`（专用 `_EMBEDDED_IMAGE_PROMPT`）|
@@ -180,6 +181,7 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 - **ground truth 切片**：Vision input 按 sheet / docx PDF 文本层切，省 input token。见 `pipeline.py::_xlsx_per_page_ground_truth` / `_docx_per_page_ground_truth`。
 - **Chunking 策略 + 保护块**：auto 按格式选策略；表格/代码/列表块超限时按行/项边界切（表头每片重复）。见 `chunkers/*.py` + `chunking.protection.*` config。
 - **增量缓存**：`cache_key = 内容哈希`，`config_hash` 只算白名单子集（改不影响输出的配置不触发重跑）。`CACHE_CONTRACT_VERSION` 隔离不兼容的产物逻辑；改 parser/chunker/output 语义时必须同步升版。白名单与版本都在 `incremental.py`。
+- **显式目录同步**：普通 ingest 永不删除旧 source；CLI `--sync` / API、MCP `sync=True` 才把一个知识库绑定到一个本地目录。清理必须等完整运行成功，且只能删除清单登记的 `sources/`、`assets/` 和对应 cache meta；失败、中断、Safety abort 均保留旧清单。空目录同步表示明确清空。实现见 `incremental.py::load_sync_baseline/finalize_sync`。
 - **Chunk lineage**：每 chunk 挂 `source_markdown` + `original_input` + `transformations` 数组（实际起作用的变换才记）。见 `pipeline.py::_build_chunk_lineage`。
 - **视频双路径**：默认 `native_video`（整段一次调用，Gemini 原生）；不支持时降级抽帧 + per-page Vision。见 `media_parser.py` + `parsing.audio.native_video` config。
 - **动态超时 / OOM 分批**：超时按页数缩放（`_resolve_parse_timeout`）；PDF 超阈值主动分批控内存 + 解析失败被动分批兜底（`docling_parser.py::_parse_pdf_batched` + `parsing.pdf.oom_batch_fallback` config）。起因是 docling-parse 的 Windows OOM bug——**上游已修（7.4.0+，2026-07 本机升级验证）**，机制留作长期防线，历史见 [docling_parse_OOM_Windows_长期监控.md](docling_parse_OOM_Windows_长期监控.md)。

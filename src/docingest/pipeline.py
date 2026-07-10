@@ -37,6 +37,9 @@ from .enrichment.path_injector import inject_paths
 from .incremental import (
     compute_cache_key,
     compute_config_hash,
+    collect_sync_entries,
+    finalize_sync,
+    load_sync_baseline,
     load_cached_meta,
     save_cached_meta,
     is_cache_valid,
@@ -261,6 +264,10 @@ class PipelineResult:
     # Surfaced to callers via result.stats["warnings"] so a `result.successful
     # == N, warnings == 0` invariant means "everything completed cleanly".
     warnings: list[dict[str, Any]] = field(default_factory=list)
+    # Explicit directory-sync summary. Empty for every ordinary ingest.
+    # Populated only after a complete, failure-free sync has safely pruned
+    # artifacts owned by source files that disappeared from the bound root.
+    sync: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -4323,6 +4330,7 @@ def run_pipeline(
     acknowledge_large: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     install_signal_handler: bool = False,
+    sync_root: Path | None = None,
 ) -> PipelineResult:
     """
     Run the full DocIngest pipeline.
@@ -4349,6 +4357,9 @@ def run_pipeline(
             because library callers usually want their own signal handling
             to stay in effect; the CLI passes True. No-op when not on the
             main thread.
+        sync_root: Explicit directory mirror root. ``None`` preserves normal
+            ingest semantics. A real directory enables post-success pruning
+            of artifacts owned by inputs that disappeared from that root.
 
     Progress events:
         Each call to ``on_progress`` receives a dict shaped like::
@@ -4399,6 +4410,26 @@ def run_pipeline(
     output_dir = Path(get_nested(config, "output.dir", "./knowledge"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    sync_baseline: dict[str, dict[str, Any]] = {}
+    sync_owned_dirs = (
+        str(get_nested(config, "output.sources_dir", "sources")),
+        str(get_nested(config, "output.assets_dir", "assets")),
+    )
+    if sync_root is not None:
+        sync_root = sync_root.resolve()
+        if not sync_root.is_dir():
+            raise ValueError(f"sync_root must be an existing directory: {sync_root}")
+        if not get_nested(config, "incremental.enabled", True):
+            raise ValueError("directory sync requires incremental.enabled=true")
+        sync_cache_dir = output_dir / get_nested(
+            config, "incremental.cache_dir", ".cache"
+        )
+        # Load and validate before discovery or parsing so a corrupt/mismatched
+        # binding cannot burn API cost and fail only at cleanup time.
+        sync_baseline = load_sync_baseline(
+            sync_cache_dir, sync_root, output_dir, sync_owned_dirs
+        )
+
     # Discover files (with zip expansion when enabled)
     files, invalid_inputs = discover_files(input_paths, config=config)
     pipeline_result = PipelineResult(total_files=len(files) + len(invalid_inputs))
@@ -4431,7 +4462,7 @@ def run_pipeline(
     # reports total_files=2, failed=1, successful=1 — not the silent
     # total_files=1 that hid the bug before.)
 
-    if not files:
+    if not files and sync_root is None:
         # No valid files to process. Still write a brief run log entry below
         # by falling through normally — but skip the heavy phases. If there
         # were invalid_inputs we've already populated errors, so callers
@@ -5068,5 +5099,31 @@ def run_pipeline(
     # knowledge_map, quality_report) has used them. No-op when the facade
     # didn't set output._cleanup (legacy full-output runs). Never raises.
     _finalize_artifacts(output_dir, config)
+
+    # Explicit directory mirror cleanup. This is deliberately LAST: every
+    # consumer has finished reading old artifacts, and output whitelisting has
+    # already updated meta ownership. Any failed/interrupted run keeps the old
+    # manifest and every old artifact intact.
+    if sync_root is not None:
+        if pipeline_result.failed == 0 and not pipeline_result.interrupted:
+            current_sync_entries = collect_sync_entries(cache_dir, files)
+            pipeline_result.sync = finalize_sync(
+                output_dir=output_dir,
+                cache_dir=cache_dir,
+                sync_root=sync_root,
+                previous_entries=sync_baseline,
+                current_entries=current_sync_entries,
+                owned_dirs=sync_owned_dirs,
+            )
+        else:
+            pipeline_result.sync = {
+                "enabled": True,
+                "root": str(sync_root),
+                "skipped": True,
+                "reason": "run failed or was interrupted",
+                "removed_files": 0,
+                "removed_artifacts": [],
+                "removed_cache_entries": 0,
+            }
 
     return pipeline_result

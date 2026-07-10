@@ -398,6 +398,7 @@ def ingest(
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     install_signal_handler: bool = False,
     raise_on_failure: bool = False,
+    sync: bool = False,
 ) -> IngestResult:
     """
     Process documents into a knowledge base (library entry point).
@@ -460,6 +461,10 @@ def ingest(
             return-don't-raise contract (caller owns error handling via
             ``stats["errors"]``). Regardless of this flag, failures are
             always logged at warning level so they're never fully silent.
+        sync: Mirror one local input directory into the output knowledge
+            base. Removed inputs have their owned Markdown/assets/cache
+            pruned only after a complete successful run. Ordinary ingest is
+            unchanged. Files, URLs, and multiple inputs are rejected.
 
     Returns:
         :class:`IngestResult` — statistics + actual artefact contents
@@ -473,6 +478,16 @@ def ingest(
     # are kept as-is and not wrapped in Path — pipeline.discover_files
     # detects them by string prefix.
     path_list = _normalize_paths(paths)
+    sync_root: Path | None = None
+    if sync:
+        if len(path_list) != 1 or _is_url(path_list[0]):
+            raise ValueError("sync=True requires exactly one local directory")
+        sync_root = Path(path_list[0]).resolve()
+        if not sync_root.is_dir():
+            raise ValueError(
+                "sync=True requires exactly one existing local directory: "
+                f"{sync_root}"
+            )
 
     # Resolve output dir consistently with CLI: single input → auto-stem,
     # multi-input → require explicit (we pick cwd/knowledge as a reasonable
@@ -514,6 +529,7 @@ def ingest(
         acknowledge_large=acknowledge_large,
         on_progress=on_progress,
         install_signal_handler=install_signal_handler,
+        sync_root=sync_root,
     )
 
     # Build IngestResult by reading artefacts back from disk, filtered by
@@ -897,6 +913,7 @@ def _pipeline_stats(pipeline_result: Any) -> dict[str, Any]:
         "token_usage": dict(pipeline_result.token_usage),
         "safety": dict(pipeline_result.safety),
         "interrupted": bool(getattr(pipeline_result, "interrupted", False)),
+        "sync": dict(getattr(pipeline_result, "sync", {}) or {}),
     }
 
 

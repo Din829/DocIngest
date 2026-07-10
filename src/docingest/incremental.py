@@ -47,6 +47,8 @@ from .config import get_nested
 # v1 had no producer-contract boundary, so outputs from older code could live
 # forever as long as the input bytes and selected config stayed unchanged.
 CACHE_CONTRACT_VERSION = 2
+SYNC_MANIFEST_VERSION = 1
+SYNC_MANIFEST_FILENAME = "sync-manifest.json"
 
 
 # ---------------------------------------------------------------------------
@@ -421,4 +423,219 @@ def build_meta(
             "chunk_ids": list(chunk_ids),
         },
         "index_entry": index_entry,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Explicit directory-sync ownership
+# ---------------------------------------------------------------------------
+
+def _canonical_path(path: Path) -> str:
+    """Return a stable absolute path string for manifest comparisons."""
+    return os.path.normcase(str(path.resolve()))
+
+
+def _sync_entry(meta: dict[str, Any]) -> dict[str, Any]:
+    outputs = meta.get("outputs", {})
+    return {
+        "cache_key": str(meta["cache_key"]),
+        "source_md": str(outputs.get("source_md", "")).replace("\\", "/"),
+        "assets": [str(p).replace("\\", "/") for p in outputs.get("assets", [])],
+    }
+
+
+def load_sync_baseline(
+    cache_dir: Path,
+    sync_root: Path,
+    output_dir: Path,
+    owned_dirs: tuple[str, ...] = ("sources", "assets"),
+) -> dict[str, dict[str, Any]]:
+    """Load the previous sync snapshot, or safely bootstrap an old library.
+
+    A manifest binds one knowledge base to one directory. On the first sync,
+    only cache entries whose last-seen input lives under that directory are
+    adopted. Derived ZIP/PDF-attachment entries become owned after this first
+    successful sync; guessing their pre-manifest parent would be unsafe.
+    """
+    manifest_path = cache_dir / SYNC_MANIFEST_FILENAME
+    root_key = _canonical_path(sync_root)
+    if manifest_path.exists():
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid sync manifest: {manifest_path}: {exc}") from exc
+        if data.get("version") != SYNC_MANIFEST_VERSION:
+            raise ValueError(
+                f"Unsupported sync manifest version: {data.get('version')!r} "
+                f"(expected {SYNC_MANIFEST_VERSION})"
+            )
+        if os.path.normcase(str(data.get("root", ""))) != root_key:
+            raise ValueError(
+                "This knowledge base is already bound to a different sync root: "
+                f"{data.get('root')!r}"
+            )
+        entries = data.get("entries")
+        if not isinstance(entries, dict):
+            raise ValueError("Invalid sync manifest: entries must be an object")
+        _validate_sync_entries(entries, output_dir, owned_dirs)
+        return entries
+
+    entries: dict[str, dict[str, Any]] = {}
+    if not cache_dir.exists():
+        return entries
+    root = Path(root_key)
+    for meta_path in cache_dir.glob("*.meta.json"):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            seen = Path(str(meta["last_seen_path"])).resolve()
+            seen.relative_to(root)
+            entries[_canonical_path(seen)] = _sync_entry(meta)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+    _validate_sync_entries(entries, output_dir, owned_dirs)
+    return entries
+
+
+def collect_sync_entries(
+    cache_dir: Path,
+    files: list[Path],
+) -> dict[str, dict[str, Any]]:
+    """Collect exact current-run ownership from content-addressed metadata."""
+    entries: dict[str, dict[str, Any]] = {}
+    for file_path in files:
+        cache_key = compute_cache_key(file_path)
+        meta = load_cached_meta(cache_dir, cache_key)
+        if meta is None:
+            raise RuntimeError(
+                f"Sync cannot establish output ownership for {file_path}; "
+                "incremental metadata is missing"
+            )
+        entries[_canonical_path(file_path)] = _sync_entry(meta)
+    return entries
+
+
+def _owned_output_path(
+    output_dir: Path,
+    rel: str,
+    owned_dirs: tuple[str, ...] = ("sources", "assets"),
+) -> Path:
+    """Resolve a manifest output path, rejecting traversal and foreign dirs."""
+    rel_path = Path(rel)
+    if rel_path.is_absolute() or not rel_path.parts:
+        raise ValueError(f"unsafe owned path: {rel!r}")
+    target = (output_dir / rel_path).resolve()
+    try:
+        target.relative_to(output_dir.resolve())
+    except ValueError as exc:
+        raise ValueError(f"sync may only remove configured source/asset outputs: {rel!r}") from exc
+    allowed = False
+    for owned_dir in owned_dirs:
+        base = (output_dir / owned_dir).resolve()
+        try:
+            base.relative_to(output_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(f"sync output directory escapes knowledge root: {owned_dir!r}") from exc
+        try:
+            target.relative_to(base)
+            allowed = True
+            break
+        except ValueError:
+            continue
+    if not allowed:
+        raise ValueError(
+            f"sync may only remove configured source/asset outputs: {rel!r}"
+        )
+    return target
+
+
+def _validate_sync_entries(
+    entries: dict[str, dict[str, Any]],
+    output_dir: Path,
+    owned_dirs: tuple[str, ...] = ("sources", "assets"),
+) -> None:
+    """Validate a whole ownership snapshot before any destructive action."""
+    for owner, entry in entries.items():
+        if not isinstance(owner, str) or not isinstance(entry, dict):
+            raise ValueError("Invalid sync manifest: owner and entry must be objects")
+        if not isinstance(entry.get("cache_key"), str) or not entry["cache_key"]:
+            raise ValueError(f"Invalid sync manifest cache_key for {owner!r}")
+        source_md = entry.get("source_md")
+        if not isinstance(source_md, str) or not source_md:
+            raise ValueError(f"Invalid sync manifest source_md for {owner!r}")
+        assets = entry.get("assets")
+        if not isinstance(assets, list) or not all(isinstance(p, str) for p in assets):
+            raise ValueError(f"Invalid sync manifest assets for {owner!r}")
+        _owned_output_path(output_dir, source_md, owned_dirs)
+        for asset in assets:
+            _owned_output_path(output_dir, asset, owned_dirs)
+
+
+def finalize_sync(
+    output_dir: Path,
+    cache_dir: Path,
+    sync_root: Path,
+    previous_entries: dict[str, dict[str, Any]],
+    current_entries: dict[str, dict[str, Any]],
+    owned_dirs: tuple[str, ...] = ("sources", "assets"),
+) -> dict[str, Any]:
+    """Delete artifacts owned only by inputs removed from the sync root."""
+    _validate_sync_entries(previous_entries, output_dir, owned_dirs)
+    _validate_sync_entries(current_entries, output_dir, owned_dirs)
+    removed_keys = sorted(set(previous_entries) - set(current_entries))
+    live_outputs: set[str] = set()
+    for entry in current_entries.values():
+        source_md = entry.get("source_md")
+        if source_md:
+            live_outputs.add(str(source_md))
+        live_outputs.update(str(p) for p in entry.get("assets", []))
+
+    # Build and validate the complete deletion plan before touching disk. A
+    # corrupt later entry must not cause a partially-applied cleanup.
+    delete_plan: list[tuple[str, Path]] = []
+    for key in removed_keys:
+        entry = previous_entries[key]
+        owned = [entry.get("source_md"), *entry.get("assets", [])]
+        for rel in owned:
+            if not rel or str(rel) in live_outputs:
+                continue
+            target = _owned_output_path(output_dir, str(rel), owned_dirs)
+            if target.exists() and not target.is_file():
+                raise ValueError(f"refusing to remove non-file sync artifact: {target}")
+            delete_plan.append((str(rel).replace("\\", "/"), target))
+
+    removed_artifacts: list[str] = []
+    for rel, target in delete_plan:
+        if target.exists():
+            target.unlink()
+            removed_artifacts.append(rel)
+
+    removed_cache_entries = 0
+    for key in removed_keys:
+        entry = previous_entries[key]
+        cache_key = entry.get("cache_key")
+        if cache_key:
+            meta_path = get_meta_path(cache_dir, str(cache_key))
+            if meta_path.exists():
+                meta_path.unlink()
+                removed_cache_entries += 1
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "version": SYNC_MANIFEST_VERSION,
+        "root": _canonical_path(sync_root),
+        "entries": current_entries,
+    }
+    manifest_path = cache_dir / SYNC_MANIFEST_FILENAME
+    temp_path = cache_dir / f"{SYNC_MANIFEST_FILENAME}.tmp"
+    temp_path.write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    temp_path.replace(manifest_path)
+    return {
+        "enabled": True,
+        "root": _canonical_path(sync_root),
+        "removed_files": len(removed_keys),
+        "removed_artifacts": removed_artifacts,
+        "removed_cache_entries": removed_cache_entries,
     }

@@ -237,6 +237,14 @@ def main(
         "--force",
         help="Ignore incremental cache and re-process all files.",
     ),
+    sync: bool = typer.Option(
+        False,
+        "--sync",
+        help=(
+            "Mirror one input directory into the knowledge base. After a "
+            "fully successful run, prune outputs owned by removed files."
+        ),
+    ),
     yes: bool = typer.Option(
         False,
         "-y", "--yes", "--acknowledge-large",
@@ -279,6 +287,13 @@ def main(
     #     output_dir below (file path needs to exist first).
     import logging
     import sys
+
+    if sync and (len(inputs) != 1 or not inputs[0].is_dir()):
+        err_console.print(
+            "[red]Error:[/red] --sync requires exactly one input directory."
+        )
+        raise typer.Exit(1)
+
     logging.getLogger("docingest").setLevel(logging.INFO)
     for noisy in ("LiteLLM", "litellm", "httpx", "httpcore",
                   "openpyxl", "PIL"):
@@ -448,6 +463,7 @@ def main(
         chunker=chunker,
         acknowledge_large=yes,
         install_signal_handler=True,
+        sync_root=inputs[0].resolve() if sync else None,
     )
 
     # Show results — JSON to stdout for agents, Rich table to stderr-attached
@@ -492,6 +508,21 @@ def _print_results(result) -> None:
     table.add_row("Elapsed", f"{result.elapsed_ms}ms")
 
     console.print(table)
+
+    sync_summary = getattr(result, "sync", None) or {}
+    if sync_summary:
+        if sync_summary.get("skipped"):
+            console.print(
+                "\n[yellow]Sync cleanup skipped:[/yellow] "
+                f"{sync_summary.get('reason', 'run incomplete')}"
+            )
+        else:
+            console.print(
+                "\n[green]Sync complete:[/green] "
+                f"{sync_summary.get('removed_files', 0)} removed input(s), "
+                f"{len(sync_summary.get('removed_artifacts', []))} artifact(s), "
+                f"{sync_summary.get('removed_cache_entries', 0)} cache entry(s) pruned"
+            )
 
     # Non-fatal warnings — page-cap hits, OCR fallbacks, etc. Files all
     # processed successfully, but with a quality compromise that's invisible
@@ -648,6 +679,7 @@ def _print_results_json(result) -> None:
         "quality": dict(result.quality),
         "token_usage": dict(result.token_usage),
         "safety": dict(result.safety),
+        "sync": dict(getattr(result, "sync", {}) or {}),
     }
     if payload["safety"].get("aborted"):
         payload["status"] = "aborted_by_safety"

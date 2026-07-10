@@ -180,6 +180,9 @@ Options:
                      file A waits on Vision I/O, which is where the time goes.
                      Outputs stay input-ordered, byte-identical to sequential.
 --force              Ignore cache, full rebuild
+--sync               Mirror exactly one input directory. After a fully
+                     successful run, remove Markdown/assets/cache owned by
+                     source files that disappeared from that directory.
 
 Advanced (usually covered by --mode; set only for the noted cases):
 --engine TEXT        Parsing engine: docling (default, local) | vision_only
@@ -199,6 +202,22 @@ docingest run ./docs/                 # run 1: full pipeline
 docingest run ./docs/                 # run 2: 100% cache hit, seconds
 docingest run ./docs/ --force         # ignore cache, full rebuild
 ```
+
+Incremental mode skips unchanged files, but ordinary runs deliberately do not
+delete old `sources/*.md`: a normal call may be a partial import. Use explicit
+directory sync when the knowledge base should mirror one folder exactly:
+
+```bash
+docingest run ./docs/ -o ./knowledge/project --sync
+```
+
+The first successful sync binds that knowledge base to the resolved directory
+in `.cache/sync-manifest.json`. A later `--sync` with another directory is
+rejected. Cleanup runs only after every discovered file succeeds; safety aborts,
+parse failures, and graceful interrupts preserve the previous files and
+manifest. Only paths recorded as DocIngest-owned under `sources/` and `assets/`
+plus their cache metadata can be removed. An empty bound directory intentionally
+syncs the knowledge base to empty.
 
 ### Processing modes — fast / balanced / best
 
@@ -371,6 +390,10 @@ result = docingest.ingest("./docs/", output="./kb/")
 print(result.stats["successful"], "files processed")
 for md in result.markdown_files:
     print(md["path"], "→", len(md["content"]), "chars")
+
+# Explicit folder mirror; ordinary ingest remains non-destructive.
+result = docingest.ingest("./docs/", output="./kb/", sync=True)
+print(result.stats["sync"])
 
 # Select only the outputs you need (skips disabled stages entirely)
 result = docingest.ingest(

@@ -192,6 +192,7 @@ def run(
     strategy: str | None = None,
     mode: str | None = None,
     force: bool = False,
+    sync: bool = False,
     acknowledge_large: bool = False,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -247,6 +248,10 @@ def run(
         strategy) but the cache didn't invalidate automatically, or
         when debugging.
 
+    `sync=True` — require exactly one local directory and mirror it into the
+        knowledge base. Outputs owned by deleted inputs are pruned only after
+        a complete successful run. Leave False for ordinary partial imports.
+
     `acknowledge_large=True` — ONLY meaningful in safety.mode="strict".
         Pre-run budget check flags oversized files → run aborts → you
         pass this True to proceed anyway AFTER reviewing the violation
@@ -286,6 +291,7 @@ def run(
             batch shortcuts (~2x cost, zero-miss). Explicit `config_overrides`
             win over the mode.
         force: Ignore incremental cache. See above.
+        sync: Explicitly mirror one local directory. See above.
         acknowledge_large: Pass True ONLY after reviewing safety violations.
             See above.
         config_overrides: Override any config value. Accepts BOTH flat
@@ -336,6 +342,7 @@ def run(
         mode=mode,
         config_overrides=merged_overrides or None,
         force=force,
+        sync=sync,
         acknowledge_large=acknowledge_large,
     )
 
@@ -350,6 +357,9 @@ def run(
         "errors": stats.get("errors", []),
         "quality": stats.get("quality", {}),
     }
+    sync_summary = stats.get("sync") or {}
+    if sync_summary:
+        out["sync"] = sync_summary
     # Surface Phase 0 safety report so agents can inspect violations and
     # decide whether to retry with acknowledge_large=True. Only included
     # when Phase 0 produced a non-empty dict (keeps typical successful
