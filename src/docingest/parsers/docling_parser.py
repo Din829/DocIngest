@@ -1623,6 +1623,30 @@ class DoclingParser(BaseParser):
                         # rendered as an inline 〔図形: …〕 line by the
                         # renderer so the label survives even when the
                         # LibreOffice print range cuts its region off.
+                        # When the collector paired a drawn arrow to this
+                        # label, append what it points at ("→ 対象: …") —
+                        # the label's anchor row is where the box SITS,
+                        # which can be many rows from where the arrow
+                        # points (measured: 18 rows on a real form).
+                        # Unresolvable targets are silently dropped: the
+                        # label itself is preserved either way.
+                        target_labels: list[str] = []
+                        for tgt in anchor_info.get("targets", []):
+                            if tgt.get("kind") == "shape":
+                                name = " ".join(str(tgt.get("text", "")).split())[:40]
+                            else:
+                                name = _xlsx_arrow_target_label(
+                                    ws, tgt.get("row", 0), tgt.get("col", 0)
+                                )
+                            # Dedupe (order-preserving): stacked duplicate
+                            # arrows (copy-pasted in Excel) are common and
+                            # would repeat the same target verbatim.
+                            if name and name not in target_labels:
+                                target_labels.append(name)
+                        if target_labels:
+                            shape_text = (
+                                f"{shape_text} → 対象: {'、'.join(target_labels)}"
+                            )
                         row_to_shapes.setdefault(row_1, []).append(shape_text)
                         continue
                     media = anchor_info.get("media")
@@ -2109,6 +2133,300 @@ def _collect_xlsx_sheet_visuals(file_path: Path) -> dict[str, int]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Drawing-layer arrow attribution (callout label → what it points at).
+#
+# Real spec sheets tie a floating note to its target with a drawn arrow
+# ("注！配偶者の記入対象範囲…" + a long arrow down to the A 欄). The label
+# text survives via the 〔図形: …〕 mechanism, but its anchor row is where
+# the BOX sits, not where the arrow POINTS — measured on a real 扶養控除
+# form, one label anchored 18 rows away from its target. These helpers
+# recover the pointing relation from the drawing XML so the renderer can
+# append "→ 対象: <target>" to the label.
+#
+# Geometry contract (validated on a real form, 18/18 arrows):
+#   * pairing (which box owns an arrow) uses the shapes' absolute-EMU
+#     ``xfrm off/ext`` rectangles — self-consistent, no row/col conversion;
+#   * endpoint (which cell the arrow points at) uses the anchor's from/to
+#     cells — Excel's own EMU→cell conversion, exact by construction.
+#     (Building our own row-height/col-width EMU table was tried and
+#     rejected: Excel's column-width px formula drifts ~5px per narrow
+#     column, off by 9 columns after 30 方眼紙 columns.)
+#   * anchor from/to are the line's BOUNDING BOX corners; flipH/flipV
+#     decide which corners the line actually connects. tailEnd marks the
+#     pointed end. Double-headed arrows are skipped (direction unknowable).
+#   * any doubt → no attribution (wrong attribution is worse than none;
+#     the label text itself is preserved regardless).
+# ---------------------------------------------------------------------------
+
+# Line-ish geometries that can carry arrow ends. Block-arrow shapes
+# (rightArrow…) and freeform (custGeom) are deliberately out: their
+# "direction" is not derivable from the bounding box alone.
+_ARROW_GEOMS = frozenset(
+    {"line", "straightConnector1", "bentConnector2", "bentConnector3"}
+)
+# Pairing tolerance ≈ 21px: arrows start flush against (or a hair outside)
+# their label box. Ambiguity margin: two boxes within 50k EMU of the same
+# arrow start → attribution refused.
+_ARROW_PAIR_TOL_EMU = 200_000
+_ARROW_AMBIG_EMU = 50_000
+
+
+def _xlsx_sp_xfrm_rect(shape_elem: Any) -> tuple[int, int, int, int] | None:
+    """Absolute-EMU rect (x1, y1, x2, y2) from a shape's spPr/xfrm, or None.
+
+    Only valid for TOP-LEVEL shapes: children of ``<xdr:grpSp>`` use the
+    group's child coordinate space and would need the group transform
+    applied — callers must exclude them.
+    """
+    xdr_ns = _OOXML_NS["xdr"]
+    a_ns = _OOXML_NS["a"]
+    xfrm = shape_elem.find(f"{{{xdr_ns}}}spPr/{{{a_ns}}}xfrm")
+    if xfrm is None:
+        return None
+    off = xfrm.find(f"{{{a_ns}}}off")
+    ext = xfrm.find(f"{{{a_ns}}}ext")
+    if off is None or ext is None:
+        return None
+    try:
+        x = int(off.get("x", ""))
+        y = int(off.get("y", ""))
+        cx = int(ext.get("cx", ""))
+        cy = int(ext.get("cy", ""))
+    except ValueError:
+        return None
+    return (x, y, x + cx, y + cy)
+
+
+# Corner helpers: an anchor/xfrm bounding box has its line endpoints on one
+# diagonal — which one is a geometric FACT (flipH XOR flipV picks the
+# anti-diagonal), while which end is the path START is flip-direction
+# semantics that real files proved reliable for straight lines only.
+_ARROW_OPP_CORNER = {"tl": "br", "br": "tl", "bl": "tr", "tr": "bl"}
+
+
+def _xlsx_corner_pt(rect: tuple[int, int, int, int], corner: str) -> tuple[int, int]:
+    x1, y1, x2, y2 = rect
+    return {"tl": (x1, y1), "tr": (x2, y1),
+            "bl": (x1, y2), "br": (x2, y2)}[corner]
+
+
+def _xlsx_corner_cell(
+    from_cell: tuple[int, int], to_cell: tuple[int, int], corner: str
+) -> tuple[int, int]:
+    (fr, fc), (tr, tc) = from_cell, to_cell
+    return {"tl": (fr, fc), "tr": (fr, tc),
+            "bl": (tr, fc), "br": (tr, tc)}[corner]
+
+
+def _xlsx_arrow_spec(
+    shape_elem: Any,
+    from_cell: tuple[int, int],
+    to_cell: tuple[int, int] | None,
+    is_connector: bool = False,
+) -> dict[str, Any] | None:
+    """Parse one top-level <xdr:sp>/<xdr:cxnSp> as a directed arrow, or None.
+
+    Returns a geometry+connection descriptor for ``_xlsx_attach_arrow_targets``:
+      rect          — absolute-EMU bounding box
+      start_corner  — flip-derived path start ("tl"/"tr"/"bl"/"br").
+                      Trustworthy for straight lines (validated 22/22 on
+                      real forms); NOT for bentConnectors (validated
+                      wrong on a real flowchart — see geom_reliable).
+      anti_diag     — endpoints sit on the bl/tr diagonal (flipH XOR flipV)
+      head_arrow    — arrow head on the path START (direction reversed)
+      st_id/end_id  — explicit shape attachments (<a:stCxn>/<a:endCxn>,
+                      connectors only). AUTHORITATIVE when present: Excel
+                      wrote which shapes the connector snaps to.
+      geom_reliable — True for line/straightConnector1; bentConnector*
+                      direction must come from attachments instead.
+
+    None when: not a line-ish geometry, no/both arrow heads, missing
+    xfrm, or no ``to`` anchor cell (oneCellAnchor — can't resolve the
+    endpoint cell without EMU→cell conversion, which we refuse to build).
+    """
+    if to_cell is None:
+        return None
+    xdr_ns = _OOXML_NS["xdr"]
+    a_ns = _OOXML_NS["a"]
+    geom = shape_elem.find(f".//{{{a_ns}}}prstGeom")
+    if geom is None or geom.get("prst") not in _ARROW_GEOMS:
+        return None
+    ln = shape_elem.find(f"{{{xdr_ns}}}spPr/{{{a_ns}}}ln")
+    if ln is None:
+        return None
+    head = ln.find(f"{{{a_ns}}}headEnd")
+    tail = ln.find(f"{{{a_ns}}}tailEnd")
+    head_arrow = head is not None and head.get("type", "none") != "none"
+    tail_arrow = tail is not None and tail.get("type", "none") != "none"
+    if head_arrow == tail_arrow:
+        # No arrow head (decorative divider) or both ends (direction
+        # unknowable) — skip.
+        return None
+    rect = _xlsx_sp_xfrm_rect(shape_elem)
+    if rect is None:
+        return None
+    xfrm = shape_elem.find(f"{{{xdr_ns}}}spPr/{{{a_ns}}}xfrm")
+    flip_h = xfrm.get("flipH") == "1"
+    flip_v = xfrm.get("flipV") == "1"
+    start_corner = {(False, False): "tl", (True, False): "tr",
+                    (False, True): "bl", (True, True): "br"}[(flip_h, flip_v)]
+    st_id = end_id = None
+    if is_connector:
+        nv = shape_elem.find(
+            f"{{{xdr_ns}}}nvCxnSpPr/{{{xdr_ns}}}cNvCxnSpPr"
+        )
+        if nv is not None:
+            st = nv.find(f"{{{a_ns}}}stCxn")
+            en = nv.find(f"{{{a_ns}}}endCxn")
+            st_id = st.get("id") if st is not None else None
+            end_id = en.get("id") if en is not None else None
+    return {
+        "rect": rect,
+        "start_corner": start_corner,
+        "anti_diag": flip_h != flip_v,
+        "head_arrow": head_arrow,
+        "st_id": st_id,
+        "end_id": end_id,
+        "geom_reliable": geom.get("prst") in ("line", "straightConnector1"),
+        "from_cell": from_cell,
+        "to_cell": to_cell,
+    }
+
+
+def _xlsx_point_box_dist(x: int, y: int, box: tuple[int, int, int, int]) -> int:
+    """Chebyshev distance (EMU) from a point to a rect; 0 when inside."""
+    x1, y1, x2, y2 = box
+    dx = max(x1 - x, 0, x - x2)
+    dy = max(y1 - y, 0, y - y2)
+    return max(dx, dy)
+
+
+def _xlsx_arrow_corners(
+    spec: dict[str, Any], all_rects: dict[str, tuple[int, int, int, int]]
+) -> tuple[str, str] | None:
+    """(origin_corner, pointed_corner) of an arrow's bounding box, or None.
+
+    Straight lines: flip semantics give the path start directly (validated
+    22/22 against rendered真值 on real forms). BentConnectors: flip-derived
+    direction was validated WRONG on a real flowchart, so the corner split
+    is inferred from the one attached end instead — the endpoints sit on a
+    known diagonal, the corner nearer the attached shape is the attached
+    end, the other corner is the free end. No attachment → None (refuse).
+    """
+    diag = ("bl", "tr") if spec["anti_diag"] else ("tl", "br")
+    if spec["geom_reliable"]:
+        start = spec["start_corner"]
+        end = _ARROW_OPP_CORNER[start]
+    else:
+        anchored_id = spec["end_id"] or spec["st_id"]
+        rect_a = all_rects.get(anchored_id) if anchored_id else None
+        if rect_a is None:
+            return None
+        ca, cb = diag
+        da = _xlsx_point_box_dist(*_xlsx_corner_pt(spec["rect"], ca), rect_a)
+        db = _xlsx_point_box_dist(*_xlsx_corner_pt(spec["rect"], cb), rect_a)
+        anchored_corner, free_corner = (ca, cb) if da <= db else (cb, ca)
+        if spec["end_id"]:
+            start, end = free_corner, anchored_corner
+        else:
+            start, end = anchored_corner, free_corner
+    return (end, start) if spec["head_arrow"] else (start, end)
+
+
+def _xlsx_attach_arrow_targets(
+    shape_boxes: list[dict[str, Any]],
+    arrow_specs: list[dict[str, Any]],
+    all_rects: dict[str, tuple[int, int, int, int]] | None = None,
+) -> None:
+    """Pair each arrow to the label box it starts at; attach targets in place.
+
+    shape_boxes: [{"rect": (x1,y1,x2,y2), "id": str|None,
+                   "entry": <anchors entry dict>}].
+    all_rects: {shape_id: rect} for ALL top-level shapes (labelled or not)
+      — needed to orient bentConnectors from their attached end.
+
+    Resolution order per arrow end:
+      1. Explicit attachment (<a:stCxn>/<a:endCxn> shape id) — Excel's own
+         record of what the connector snaps to. Authoritative.
+      2. EMU geometry — corner point vs. label-box rects (tolerance +
+         ambiguity refusal), falling back to the anchor cell for targets.
+
+    On success the owning entry grows a ``"targets"`` item: either
+    {"kind": "shape", "text": str} (points at another label box,
+    flowchart-style) or {"kind": "cell", "row": r, "col": c}.
+    Unpairable/ambiguous arrows attach nothing.
+    """
+    all_rects = all_rects or {}
+    text_by_id = {b["id"]: b for b in shape_boxes if b.get("id")}
+
+    def nearest_box(pt: tuple[int, int], exclude: dict | None) -> dict | None:
+        hits = sorted(
+            (_xlsx_point_box_dist(pt[0], pt[1], b["rect"]), i)
+            for i, b in enumerate(shape_boxes)
+            if b is not exclude
+        )
+        if not hits or hits[0][0] > _ARROW_PAIR_TOL_EMU:
+            return None
+        if len(hits) > 1 and hits[1][0] - hits[0][0] < _ARROW_AMBIG_EMU:
+            return None
+        return shape_boxes[hits[0][1]]
+
+    for spec in arrow_specs:
+        head = spec["head_arrow"]
+        origin_id = spec["end_id"] if head else spec["st_id"]
+        pointed_id = spec["st_id"] if head else spec["end_id"]
+        corners = _xlsx_arrow_corners(spec, all_rects)
+
+        owner = text_by_id.get(origin_id) if origin_id else None
+        if owner is None and corners is not None:
+            owner = nearest_box(
+                _xlsx_corner_pt(spec["rect"], corners[0]), None
+            )
+        if owner is None:
+            continue
+
+        target: dict[str, Any] | None = None
+        pointed_box = text_by_id.get(pointed_id) if pointed_id else None
+        if pointed_box is not None and pointed_box is not owner:
+            target = {"kind": "shape", "text": pointed_box["entry"]["text"]}
+        elif corners is not None:
+            pt = _xlsx_corner_pt(spec["rect"], corners[1])
+            end_box = nearest_box(pt, owner)
+            if end_box is not None:
+                target = {"kind": "shape", "text": end_box["entry"]["text"]}
+            else:
+                row, col = _xlsx_corner_cell(
+                    spec["from_cell"], spec["to_cell"], corners[1]
+                )
+                target = {"kind": "cell", "row": row, "col": col}
+        if target is not None:
+            owner["entry"].setdefault("targets", []).append(target)
+
+
+def _xlsx_arrow_target_label(
+    ws: Any, row: int, col: int, scan: int = 2, max_len: int = 40
+) -> str | None:
+    """Human-readable name for the cell an arrow points at, or None.
+
+    The endpoint cell itself is often blank (arrows point at checkbox
+    regions / merged areas whose value lives in the top-left cell), so:
+    walk left up to 8 columns on the endpoint row first, then the rows
+    above/below (nearest first). Stays inside ws.max_row/max_column —
+    ws.cell() on a fresh coordinate would CREATE it and inflate the
+    sheet's dimensions before rendering.
+    """
+    for dr in range(scan + 1):
+        for r in ([row] if dr == 0 else [row - dr, row + dr]):
+            if r < 1 or r > ws.max_row:
+                continue
+            for c in range(min(col, ws.max_column), max(0, col - 8), -1):
+                v = ws.cell(row=r, column=c).value
+                if v is not None and str(v).strip():
+                    return " ".join(str(v).split())[:max_len]
+    return None
+
+
 def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any]]]:
     """
     Read sheet→image anchor info directly from the xlsx OOXML structure.
@@ -2134,18 +2452,27 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
         17 of them existed NOWHERE else: not in any cell, not inside the
         pasted PNGs, and outside the LibreOffice print range so the page
         render never showed them to Vision. The renderer is the only
-        layer that can preserve them.) Text-less shapes and connectors
-        (``<xdr:cxnSp>``) are still skipped — nothing to preserve.
+        layer that can preserve them.) Text-less decorative shapes are
+        still skipped.
+      * Drawn ARROWS (text-less line-ish ``<xdr:sp>``/``<xdr:cxnSp>``
+        with exactly one arrow head) are paired to the label box they
+        start at; the owning text entry grows an optional ``"targets"``
+        list saying what the arrow points at (see
+        ``_xlsx_attach_arrow_targets``). Group-nested arrows/boxes are
+        excluded from pairing (child coordinate space); their text is
+        still collected as before.
 
     Returns:
       {sheet_display_name: [{"row": int, "col": int,
-                             "media": str | absent, "text": str | absent},
+                             "media": str | absent, "text": str | absent,
+                             "targets": list | absent},
                             ...]}
 
       Each entry carries EITHER ``media`` (picture) or ``text`` (shape
-      label), never both. ``row`` / ``col`` are 1-indexed (matching
-      ``ws.cell(row=...)``). ``media`` is the basename of the embedded
-      media file (e.g. ``"image1.emf"``), matching the names emitted by
+      label), never both; ``targets`` only ever appears on text entries.
+      ``row`` / ``col`` are 1-indexed (matching ``ws.cell(row=...)``).
+      ``media`` is the basename of the embedded media file (e.g.
+      ``"image1.emf"``), matching the names emitted by
       ``_extract_xlsx_images``.
 
       Sheets with no drawing reference get an empty list. Workbooks that
@@ -2266,6 +2593,15 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
                 continue
 
             anchors: list[dict[str, Any]] = []
+            # Arrow attribution working sets (per sheet): top-level label
+            # boxes with their absolute-EMU rects, directed arrows, and an
+            # id→rect index of ALL top-level shapes (labelled or not — a
+            # connector can snap to a decorative shape, and orienting a
+            # bentConnector needs its attached end's rect regardless).
+            # Paired after the anchor sweep — pairing needs the full lists.
+            shape_boxes: list[dict[str, Any]] = []
+            arrow_specs: list[dict[str, Any]] = []
+            all_shape_rects: dict[str, tuple[int, int, int, int]] = {}
             for anchor_tag in ("twoCellAnchor", "oneCellAnchor"):
                 for anc in drawing_xml.findall(f"xdr:{anchor_tag}", _OOXML_NS):
                     from_elem = anc.find("xdr:from", _OOXML_NS)
@@ -2280,6 +2616,21 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
                         col_1 = int((col_elem.text or "0").strip()) + 1
                     except ValueError:
                         continue
+                    # ``to`` cell (twoCellAnchor only) — needed to resolve
+                    # where an arrow points. None for oneCellAnchor.
+                    to_cell: tuple[int, int] | None = None
+                    to_elem = anc.find("xdr:to", _OOXML_NS)
+                    if to_elem is not None:
+                        to_row = to_elem.find("xdr:row", _OOXML_NS)
+                        to_col = to_elem.find("xdr:col", _OOXML_NS)
+                        if to_row is not None and to_col is not None:
+                            try:
+                                to_cell = (
+                                    int((to_row.text or "0").strip()) + 1,
+                                    int((to_col.text or "0").strip()) + 1,
+                                )
+                            except ValueError:
+                                pass
 
                     pic = anc.find("xdr:pic", _OOXML_NS)
                     if pic is None:
@@ -2287,9 +2638,20 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
                         # under it (iter() also reaches shapes nested in
                         # <xdr:grpSp> groups). Paragraphs (<a:p>) join with
                         # a space so multi-line labels stay one searchable
-                        # string. Connectors / text-less shapes yield
-                        # nothing and are skipped.
+                        # string. Text-less shapes yield nothing and are
+                        # skipped — unless they parse as directed arrows,
+                        # which feed the attribution pass instead.
                         xdr_ns = _OOXML_NS["xdr"]
+                        # Group-nested shapes use the group's child
+                        # coordinate space: their xfrm rects are NOT
+                        # sheet-absolute, so they must stay out of arrow
+                        # pairing (text collection is unaffected).
+                        grouped_ids = {
+                            id(child)
+                            for grp in anc.iter(f"{{{xdr_ns}}}grpSp")
+                            for tag in ("sp", "cxnSp")
+                            for child in grp.iter(f"{{{xdr_ns}}}{tag}")
+                        }
                         for sp in anc.iter(f"{{{xdr_ns}}}sp"):
                             paras = []
                             for p in sp.iter(f"{{{a_ns}}}p"):
@@ -2300,12 +2662,41 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
                                 if t.strip():
                                     paras.append(t.strip())
                             text = " ".join(paras).strip()
+                            grouped = id(sp) in grouped_ids
+                            rect = None if grouped else _xlsx_sp_xfrm_rect(sp)
+                            cnv = sp.find(
+                                f"{{{xdr_ns}}}nvSpPr/{{{xdr_ns}}}cNvPr"
+                            )
+                            sp_id = cnv.get("id") if cnv is not None else None
+                            if rect is not None and sp_id:
+                                all_shape_rects[sp_id] = rect
                             if text:
-                                anchors.append({
+                                entry = {
                                     "row": row_1,
                                     "col": col_1,
                                     "text": text,
-                                })
+                                }
+                                anchors.append(entry)
+                                if rect is not None:
+                                    shape_boxes.append(
+                                        {"rect": rect, "id": sp_id,
+                                         "entry": entry}
+                                    )
+                                continue
+                            if grouped:
+                                continue
+                            spec = _xlsx_arrow_spec(sp, (row_1, col_1), to_cell)
+                            if spec is not None:
+                                arrow_specs.append(spec)
+                        for cxn in anc.iter(f"{{{xdr_ns}}}cxnSp"):
+                            if id(cxn) in grouped_ids:
+                                continue
+                            spec = _xlsx_arrow_spec(
+                                cxn, (row_1, col_1), to_cell,
+                                is_connector=True,
+                            )
+                            if spec is not None:
+                                arrow_specs.append(spec)
                         continue
                     embed_rid = None
                     for blip in pic.iter(f"{{{a_ns}}}blip"):
@@ -2323,6 +2714,7 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
                         "media": media_basename,
                     })
 
+            _xlsx_attach_arrow_targets(shape_boxes, arrow_specs, all_shape_rects)
             result[sheet_name] = anchors
     finally:
         zf.close()
