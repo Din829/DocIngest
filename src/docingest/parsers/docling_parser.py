@@ -1612,7 +1612,19 @@ class DoclingParser(BaseParser):
                 visible_sheet_names.append(sheet_name)
 
                 row_to_assets: dict[int, list[str]] = {}
+                row_to_shapes: dict[int, list[str]] = {}
                 for anchor_info in anchors_by_sheet.get(sheet_name, []):
+                    row_1 = anchor_info.get("row")
+                    if not isinstance(row_1, int):
+                        continue
+                    shape_text = anchor_info.get("text")
+                    if shape_text:
+                        # Shape label (text box / callout) — no media file,
+                        # rendered as an inline 〔図形: …〕 line by the
+                        # renderer so the label survives even when the
+                        # LibreOffice print range cuts its region off.
+                        row_to_shapes.setdefault(row_1, []).append(shape_text)
+                        continue
                     media = anchor_info.get("media")
                     if not media:
                         continue
@@ -1622,9 +1634,6 @@ class DoclingParser(BaseParser):
                         # likely because parsing.xlsx.denoising.extract_images
                         # was disabled. Skip silently; the renderer just
                         # won't emit a marker for it.
-                        continue
-                    row_1 = anchor_info.get("row")
-                    if not isinstance(row_1, int):
                         continue
                     row_to_assets.setdefault(row_1, []).append(asset_fname)
                     anchored_assets.add(asset_fname)
@@ -1637,6 +1646,7 @@ class DoclingParser(BaseParser):
                     # avoids listing the same orphan on every sheet.
                     orphan_image_names=None,
                     placeholder_values=placeholder_values,
+                    shape_texts=row_to_shapes,
                 )
                 if body_lines:
                     sheet_sections.append(
@@ -2115,19 +2125,27 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
       regardless of format.
 
     What gets collected:
-      Only ``<xdr:pic>`` anchors (embedded pictures). Shape anchors
-      (``<xdr:sp>``, ``<xdr:cxnSp>`` — text boxes, arrows, connectors
-      used in sequence diagrams) are deliberately skipped: they carry no
-      media reference and the LibreOffice page-image render already
-      describes them via the Vision path. Including them here would
-      produce ghost image markers with no corresponding ``assets/`` file.
+      * ``<xdr:pic>`` anchors (embedded pictures) → ``{"media": basename}``.
+      * ``<xdr:sp>`` shapes carrying TEXT (text boxes, callout labels,
+        flowchart nodes — including shapes nested in ``<xdr:grpSp>``
+        groups) → ``{"text": str}``. These captions routinely hold the
+        index keys that tie a mockup to its definition table (measured on
+        a real 画面設計書: 25 labels like "2-1", "S-020 企業詳細画面" —
+        17 of them existed NOWHERE else: not in any cell, not inside the
+        pasted PNGs, and outside the LibreOffice print range so the page
+        render never showed them to Vision. The renderer is the only
+        layer that can preserve them.) Text-less shapes and connectors
+        (``<xdr:cxnSp>``) are still skipped — nothing to preserve.
 
     Returns:
-      {sheet_display_name: [{"row": int, "col": int, "media": str}, ...]}
+      {sheet_display_name: [{"row": int, "col": int,
+                             "media": str | absent, "text": str | absent},
+                            ...]}
 
-      ``row`` / ``col`` are 1-indexed (matching ``ws.cell(row=...)``).
-      ``media`` is the basename of the embedded media file (e.g.
-      ``"image1.emf"``), matching the names emitted by
+      Each entry carries EITHER ``media`` (picture) or ``text`` (shape
+      label), never both. ``row`` / ``col`` are 1-indexed (matching
+      ``ws.cell(row=...)``). ``media`` is the basename of the embedded
+      media file (e.g. ``"image1.emf"``), matching the names emitted by
       ``_extract_xlsx_images``.
 
       Sheets with no drawing reference get an empty list. Workbooks that
@@ -2263,11 +2281,31 @@ def _collect_xlsx_image_anchors(file_path: Path) -> dict[str, list[dict[str, Any
                     except ValueError:
                         continue
 
-                    # Picture anchors only — skip shape (``sp``) and
-                    # connector (``cxnSp``) anchors; they have no media
-                    # reference and would otherwise produce ghost markers.
                     pic = anc.find("xdr:pic", _OOXML_NS)
                     if pic is None:
+                        # Shape anchor: harvest the text of every <xdr:sp>
+                        # under it (iter() also reaches shapes nested in
+                        # <xdr:grpSp> groups). Paragraphs (<a:p>) join with
+                        # a space so multi-line labels stay one searchable
+                        # string. Connectors / text-less shapes yield
+                        # nothing and are skipped.
+                        xdr_ns = _OOXML_NS["xdr"]
+                        for sp in anc.iter(f"{{{xdr_ns}}}sp"):
+                            paras = []
+                            for p in sp.iter(f"{{{a_ns}}}p"):
+                                t = "".join(
+                                    el.text or ""
+                                    for el in p.iter(f"{{{a_ns}}}t")
+                                )
+                                if t.strip():
+                                    paras.append(t.strip())
+                            text = " ".join(paras).strip()
+                            if text:
+                                anchors.append({
+                                    "row": row_1,
+                                    "col": col_1,
+                                    "text": text,
+                                })
                         continue
                     embed_rid = None
                     for blip in pic.iter(f"{{{a_ns}}}blip"):
@@ -2344,6 +2382,7 @@ def _render_xlsx_sheet_to_markdown(
     image_anchors: dict[int, list[str]] | None = None,
     orphan_image_names: list[str] | None = None,
     placeholder_values: frozenset[str] | None = None,
+    shape_texts: dict[int, list[str]] | None = None,
 ) -> list[str]:
     """
     Render a single openpyxl Worksheet to Markdown table lines.
@@ -2383,6 +2422,14 @@ def _render_xlsx_sheet_to_markdown(
         openpyxl). When non-empty, a footer block lists them so the
         information is not lost downstream — every chunk consumer can at
         least know the images exist and find them in ``assets/``.
+      shape_texts: row(1-indexed) → list of drawing-layer shape labels
+        (text boxes, callouts, flowchart nodes) anchored at that row.
+        Emitted as ``〔図形: <text>〕`` lines after the row, same
+        interleaving as image markers. These labels exist ONLY in the
+        drawing XML — not in cells, not inside pasted images, and
+        possibly outside the LibreOffice print range — so this is the
+        single point where they can be preserved (measured: 17/25 labels
+        on a real 画面設計書 were otherwise lost in every mode).
 
     Returns a list of markdown lines (header + separator + body, with
     optional image marker lines and orphan footer interleaved) ready for
@@ -2407,12 +2454,48 @@ def _render_xlsx_sheet_to_markdown(
         for c in range(1, max_col + 1):
             if (r, c) in spanned:
                 continue
-            v = ws.cell(row=r, column=c).value
-            if v is None:
-                continue
+            cell = ws.cell(row=r, column=c)
+            v = cell.value
             # Coerce to a single-line, pipe-safe string.
-            text = str(v).replace("\n", " ").replace("\r", " ")
+            text = "" if v is None else str(v).replace("\n", " ").replace("\r", " ")
             text = text.replace("|", r"\|").strip()
+
+            # Hyperlink target: cell.value only carries the DISPLAY text;
+            # the URL lives on cell.hyperlink and was previously dropped
+            # entirely (measured: 101/101 external targets lost on a real
+            # WBS workbook — e.g. an entire Playbook column of links).
+            # Render as [text](url) so the URL is grep-/RAG-visible.
+            # Internal anchors (hyperlink.location, target=None) are
+            # navigation within the workbook — no information beyond the
+            # display text, skip. When the display text already contains
+            # the URL, wrapping would only duplicate it.
+            link = getattr(cell, "hyperlink", None)
+            target = getattr(link, "target", None) if link is not None else None
+            if target and target not in text:
+                # Neutralise chars that break Markdown link syntax or the
+                # surrounding table row (equivalent %-encoding, still a
+                # working URL).
+                safe = (
+                    str(target)
+                    .replace("(", "%28").replace(")", "%29")
+                    .replace(" ", "%20").replace("|", "%7C")
+                )
+                text = f"[{text}]({safe})" if text else f"<{safe}>"
+
+            # Cell comment (Excel 注釈): filling guidance often lives ONLY
+            # here (measured: 27/28 comments lost on the same workbook —
+            # ●/◎ legend, format rules, review-scope notes). Not visible
+            # on the page render either (only the red triangle is), so
+            # Vision cannot recover it — the renderer is the single point
+            # where it can be preserved. Author prefix is kept verbatim
+            # (information conservation over cosmetics).
+            cm = getattr(cell, "comment", None)
+            note = cm.text if cm is not None and cm.text else ""
+            note = note.replace("\n", " ").replace("\r", " ")
+            note = note.replace("|", r"\|").strip()
+            if note:
+                text = f"{text} 〔注: {note}〕" if text else f"〔注: {note}〕"
+
             if text:
                 cell_values[(r, c)] = text
                 cols_with_content.add(c)
@@ -2431,8 +2514,12 @@ def _render_xlsx_sheet_to_markdown(
     # deserves a markdown line — without one, the image marker would
     # become orphaned and lose its "where in the sheet" context. So we
     # widen the set of "rows worth emitting" to include image anchor rows.
+    # Shape-label rows (text boxes / callouts) join the same set: their
+    # text exists ONLY in the drawing layer, so the row must be emitted
+    # even when every cell on it is empty.
     image_anchors = image_anchors or {}
-    anchor_rows = set(image_anchors.keys())
+    shape_texts = shape_texts or {}
+    anchor_rows = set(image_anchors.keys()) | set(shape_texts.keys())
 
     if not cols_with_content and not anchor_rows:
         # Truly empty sheet — let caller emit a stub.
@@ -2446,8 +2533,12 @@ def _render_xlsx_sheet_to_markdown(
     # number for each emitted body row so we can interleave image markers.
     # When a row has no cell content but DOES anchor an image, we still
     # emit it as an empty row so the marker that follows lines up visually.
+    # Scan through the last ANCHOR row, not just ws.max_row: drawing
+    # anchors (images / shape labels) legally sit below the last cell,
+    # and capping at max_row silently dropped them.
     emitted: list[tuple[int, list[str] | None]] = []   # (src_row, cells_or_None)
-    for r in range(1, max_row + 1):
+    scan_max_row = max(max_row, max(anchor_rows, default=0))
+    for r in range(1, scan_max_row + 1):
         row = [cell_values.get((r, c), "") for c in kept_cols] if kept_cols else []
         if _row_has_real_content(row, placeholders):
             emitted.append((r, row))
@@ -2489,6 +2580,15 @@ def _render_xlsx_sheet_to_markdown(
         for fname in image_anchors.get(src_row, []):
             cells = [f"<!-- image: {fname} -->"] + [""] * (n - 1)
             lines.append("| " + " | ".join(cells) + " |")
+        # Shape labels (drawing-layer text boxes / callouts). Same
+        # table-row wrapping rationale as image markers above; sanitised
+        # for the table context like any cell value.
+        for label in shape_texts.get(src_row, []):
+            safe = label.replace("\n", " ").replace("\r", " ")
+            safe = safe.replace("|", r"\|").strip()
+            if safe:
+                cells = [f"〔図形: {safe}〕"] + [""] * (n - 1)
+                lines.append("| " + " | ".join(cells) + " |")
 
     # Header (first emitted row).
     first_row_src, first_row_cells = emitted[0]

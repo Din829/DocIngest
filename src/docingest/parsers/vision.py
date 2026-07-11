@@ -88,6 +88,9 @@ If you can make out some of a value but not all:
 - Example: "¥1,234,5[?]" when the last digit is blurred but you see the rest
 - Example: "invoice_20[?]" when the year is clear but the month/day is smudged
 - A partial read with [?] is MORE useful than [unreadable] or guessing
+- Long URLs: transcribe each character exactly ONCE, left to right; if part
+  is illegible, stop at the last legible character and append [?] — NEVER
+  extend a URL by repeating fragments of it
 
 ### Priority 3: [unreadable] is the last resort
 Only use [unreadable] when the content is genuinely illegible (tag the

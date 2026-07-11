@@ -1779,6 +1779,105 @@ def _is_empty_supplement(text: str) -> bool:
     return t in ("(no additional visual content)", "no additional visual content")
 
 
+def _xlsx_page_owner_index(
+    visible: list[str],
+    page_map: dict[str, int],
+    page_no: int,
+    total_pages: int,
+) -> int | None:
+    """Index (into ``visible`` / the section list) of the sheet that owns a
+    rendered PDF page — or None when ownership can't be asserted.
+
+    Attribution is the anchored-range rule shared with ground-truth slicing:
+    a mapped sheet owns pages from its first page up to the next MAPPED
+    sheet's first page − 1 (the last mapped sheet owns through
+    ``total_pages``) — but only when no UNMAPPED visible sheet follows it in
+    workbook order (its pages, if any, would fall inside the range and the
+    attribution would lie). Any doubt → None; callers must fall back, never
+    guess.
+    """
+    ordered_mapped = [s for s in visible if s in page_map]
+    if not ordered_mapped:
+        return None
+    anchors = [page_map[s] for s in ordered_mapped]
+    if anchors != sorted(set(anchors)):
+        return None
+    for i, s in enumerate(ordered_mapped):
+        start = page_map[s]
+        end = (
+            page_map[ordered_mapped[i + 1]] - 1
+            if i + 1 < len(ordered_mapped) else total_pages
+        )
+        if start <= page_no <= end:
+            vi = visible.index(s)
+            nxt = visible[vi + 1] if vi + 1 < len(visible) else None
+            if nxt is not None and nxt not in page_map:
+                return None
+            return vi
+    return None
+
+
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s<>\"\)\]\[|]+")
+
+
+def _truncate_url_echoes(text: str, body_markdown: str) -> str:
+    """Cut Vision's URL echo-hallucinations back to the ground-truth URL.
+
+    Failure mode (observed on a real workbook): a long URL rendered in small
+    type makes the Vision model enter a repetition loop — it transcribes the
+    true URL correctly and then keeps appending fragments of it (measured:
+    293-char truth → 978-char output repeating one %-encoded word 7×). The
+    parser text already carries the correct URL, so the echoed variant is
+    pure pollution a RAG query could surface instead of the real one.
+
+    Deliberately narrow so legitimate sub-paths survive — ALL must hold:
+      * only URLs that START WITH a body URL of ≥ 40 chars,
+      * with ≥ 24 extra chars appended,
+      * where ≥ 70% of the extension's 16-char windows already occur in the
+        body URL (an echo recombines existing fragments; a real sub-path
+        like ``/visual-identity`` is new material and never crosses 70%),
+      * AND some 12-char fragment occurs ≥ 3 times MORE in the echoed URL
+        than in the body URL. This is the repetition-loop fingerprint: the
+        measured echo repeated one fragment 7× vs 2× in truth (+5), while a
+        legitimate URL whose path legitimately repeats a segment (e.g.
+        ``/guide/…guide``) adds at most +1..2 — the window test alone could
+        false-positive on those, the count-explosion test cannot.
+    Every cut is logged (WARNING) so a false positive is traceable; the body
+    always keeps its own correct URL regardless.
+    """
+    body_urls = [
+        u for u in set(_URL_IN_TEXT_RE.findall(body_markdown)) if len(u) >= 40
+    ]
+    if not body_urls:
+        return text
+    # Longest first: when body holds both a URL and its own prefix, compare
+    # against the most specific one.
+    body_urls.sort(key=len, reverse=True)
+
+    def _fix(m: "re.Match[str]") -> str:
+        u = m.group(0)
+        for b in body_urls:
+            if u.startswith(b) and len(u) - len(b) >= 24:
+                ext = u[len(b):]
+                windows = [ext[i:i + 16] for i in range(len(ext) - 15)]
+                if not windows or (
+                    sum(1 for w in windows if w in b) / len(windows) < 0.7
+                ):
+                    continue
+                # Independent second signal: fragment-count explosion.
+                frags = {ext[i:i + 12] for i in range(0, len(ext) - 11, 4)}
+                if any(u.count(f) - b.count(f) >= 3 for f in frags):
+                    _pipeline_logger.warning(
+                        f"Vision URL echo truncated: {len(u)} chars -> "
+                        f"{len(b)} chars (ground-truth prefix kept): "
+                        f"{b[:80]}..."
+                    )
+                    return b
+        return u
+
+    return _URL_IN_TEXT_RE.sub(_fix, text)
+
+
 def _xlsx_batch_ground_truth_slice(
     sections: list[str],
     visible: list[str],
@@ -1816,20 +1915,7 @@ def _xlsx_batch_ground_truth_slice(
 
     covered: set[int] = set()
     for p in batch_page_nos:
-        owner_idx: int | None = None
-        for i, s in enumerate(ordered_mapped):
-            start = page_map[s]
-            end = (
-                page_map[ordered_mapped[i + 1]] - 1
-                if i + 1 < len(ordered_mapped) else total_pages
-            )
-            if start <= p <= end:
-                vi = visible.index(s)
-                nxt = visible[vi + 1] if vi + 1 < len(visible) else None
-                if nxt is not None and nxt not in page_map:
-                    return None
-                owner_idx = vi
-                break
+        owner_idx = _xlsx_page_owner_index(visible, page_map, p, total_pages)
         if owner_idx is None:
             return None
         covered.add(owner_idx)
@@ -2858,6 +2944,17 @@ def _enrich_with_vision(
         if batched_block:
             batched_block = _demote_headings(batched_block)
 
+    # URL echo-hallucination guard: Vision can enter a repetition loop on
+    # long small-type URLs (see _truncate_url_echoes). The parser text holds
+    # the correct URL, so echoed variants are cut back to it before injection.
+    _body_md = parse_result.markdown or ""
+    if results:
+        results = {
+            idx: _truncate_url_echoes(t, _body_md) for idx, t in results.items()
+        }
+    if batched_block:
+        batched_block = _truncate_url_echoes(batched_block, _body_md)
+
     # Inject results into markdown sections.
     # Two modes depending on whether the source has pagebreak markers:
     #   A) pagebreak-aligned (PDF, PPT): inject each page's result into its section
@@ -2870,14 +2967,54 @@ def _enrich_with_vision(
 
     if has_pagebreaks:
         # Mode A: align by section index.
+        # xlsx twist: one section = one SHEET, but LibreOffice renders long
+        # sheets to MULTIPLE PDF pages, so page idx ≠ section idx and the
+        # legacy sections[idx] alignment misattributes continuation pages
+        # (observed: a 案件情報 page's supplement landing under the last WBS
+        # sheet's heading). When the sheet→page map is armed, attribute each
+        # page to its owning sheet's section via the same anchored-range rule
+        # as ground-truth slicing; pages the map can't own go to the overflow
+        # tail below (content never dropped). Non-xlsx keeps the legacy path
+        # byte-identical.
+        _owner_of = None
+        if parse_result.metadata.get("format") == "xlsx":
+            _vis_names = parse_result.metadata.get("xlsx_visible_sheet_names")
+            _page_map = parse_result.metadata.get("xlsx_sheet_page_map")
+            if (
+                isinstance(_vis_names, list) and _vis_names
+                and isinstance(_page_map, dict) and _page_map
+                and len(sections) == len(_vis_names)
+            ):
+                _total_pages = len(parse_result.pages)
+
+                def _owner_of(idx: int) -> int | None:
+                    if idx >= len(parse_result.pages):
+                        return None
+                    return _xlsx_page_owner_index(
+                        _vis_names, _page_map,
+                        parse_result.pages[idx].page_no, _total_pages,
+                    )
+
         # Overflow: when LibreOffice renders one xlsx sheet to multiple PDF
         # pages (long 方眼紙 layouts), page_count can exceed sheet_count and
         # results[idx>=len(sections)] would otherwise be silently dropped.
         # Append overflow to the last section (typically continuation pages
         # of the final sheet) and log a warning so the leak is visible.
         overflow: list[tuple[int, str]] = []
-        for idx, text in results.items():
-            if idx < len(sections):
+        for idx, text in sorted(results.items()):
+            if _owner_of is not None:
+                sec = _owner_of(idx)
+                if sec is None:
+                    overflow.append((idx, text))
+                else:
+                    # page=N marker: several pages of one sheet now land in
+                    # the same section — the page number keeps them
+                    # distinguishable (already a known marker variant).
+                    sections[sec] = (
+                        sections[sec].rstrip()
+                        + f"\n\n<!-- vision-enriched page={idx + 1} -->\n{text}\n"
+                    )
+            elif idx < len(sections):
                 sections[idx] = (
                     sections[idx].rstrip()
                     + f"\n\n<!-- vision-enriched -->\n{text}\n"
@@ -2906,7 +3043,12 @@ def _enrich_with_vision(
         # Same philosophy as [unreadable]: the artefact records its own gaps,
         # quality_report stays a pure disk scanner.
         for idx in sorted(failed_idxs):
-            sec = idx if idx < len(sections) else -1
+            if _owner_of is not None:
+                sec = _owner_of(idx)
+                if sec is None:
+                    sec = -1
+            else:
+                sec = idx if idx < len(sections) else -1
             sections[sec] = (
                 sections[sec].rstrip() + f"\n\n<!-- vision-failed page={idx + 1} -->\n"
             )
