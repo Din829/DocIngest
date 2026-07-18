@@ -125,12 +125,35 @@ def _default(ctx: typer.Context):
         pass
 
 
+def _looks_like_url(p: Path | str) -> bool:
+    """URL detection tolerant of typer's Path conversion.
+
+    On Windows, Path("https://x") stringifies to "https:\\x" — the same
+    mangled form discover_files() (pipeline.py) is designed to accept.
+    """
+    s = str(p).replace("\\", "/")
+    return s.startswith("http:/") or s.startswith("https:/")
+
+
+def _validate_inputs(inputs: list[Path]) -> list[Path]:
+    """Replacement for exists=True that lets URL inputs reach the pipeline.
+
+    typer's exists=True rejects URLs at the CLI boundary even though
+    discover_files() resolves them (yt-dlp / direct HTTP). Local paths
+    keep the same early existence check.
+    """
+    for p in inputs:
+        if not _looks_like_url(p) and not p.exists():
+            raise typer.BadParameter(f"Path '{p}' does not exist.")
+    return inputs
+
+
 @app.command("run")
 def main(
     inputs: list[Path] = typer.Argument(
         ...,
-        help="Input files or directories to process.",
-        exists=True,
+        help="Input files, directories, or http(s) URLs to process.",
+        callback=_validate_inputs,
     ),
     output: Optional[Path] = typer.Option(
         None,
@@ -325,7 +348,17 @@ def main(
     # existence check is needed.
     if output is None:
         if len(inputs) == 1:
-            output = Path("./knowledge") / inputs[0].stem
+            if _looks_like_url(inputs[0]):
+                # Query strings contain characters Windows forbids in dir
+                # names — derive from the last URL path segment instead.
+                from urllib.parse import urlparse
+                url = str(inputs[0]).replace("\\", "/")
+                segments = [s for s in urlparse(url).path.split("/") if s]
+                output = Path("./knowledge") / (
+                    segments[-1] if segments else "url_ingest"
+                )
+            else:
+                output = Path("./knowledge") / inputs[0].stem
         else:
             err_console.print(
                 "[red]Error:[/red] multiple inputs require an explicit "
@@ -698,8 +731,8 @@ def _print_results_json(result) -> None:
 def inspect_cmd(
     inputs: list[Path] = typer.Argument(
         ...,
-        help="Files or directories to inspect.",
-        exists=True,
+        help="Files, directories, or http(s) URLs to inspect.",
+        callback=_validate_inputs,
     ),
     config_file: Optional[Path] = typer.Option(
         None,
