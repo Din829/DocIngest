@@ -31,6 +31,11 @@ output directly:
 - `title`, `tags`, `resource` — same semantics as OKF. `resource` carries the
   canonical source URI for URL-resolved inputs (e.g. the original video URL);
   it is absent for ordinary local files.
+- `description` — one retrieval-optimized sentence per file (opt-in:
+  `output.derived_metadata.description.enabled`, costs one LLM call per ~20
+  files). **Recommended for multi-file knowledge bases**: in our 10-file
+  cross-domain benchmark, an agent picking which file to open from
+  frontmatter alone went from 64% (title+tags) to 89% (+description).
 - `related` links use OKF §5.1 bundle-relative form (`/sources/<file>.md`).
 
 DocIngest deliberately does NOT emit a full OKF bundle (no `index.md` tree —

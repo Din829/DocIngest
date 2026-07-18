@@ -119,7 +119,13 @@ def lookup_url_origin(file_path: Path, config: dict[str, Any]) -> str | None:
         data = json.loads(origin_path.read_text(encoding="utf-8"))
         url = data.get("url")
         return url if isinstance(url, str) and url else None
-    except Exception:
+    except FileNotFoundError:
+        # Pre-sidecar cache — expected, not worth logging.
+        return None
+    except Exception as e:
+        # Provenance is best-effort, but a corrupt manifest or bad config
+        # should leave a trace instead of vanishing silently.
+        logger.debug(f"URL origin lookup failed for {file_path}: {e}")
         return None
 
 

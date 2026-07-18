@@ -1885,6 +1885,37 @@ knowledge_map:
       - "table"
       - "image"
       - "content"
+      # URL / domain fragments. Tokenizing "pwc.com" or "shaho.or.jp" splits
+      # on the dots and leaks TLDs as standalone "keywords" (found in a real
+      # audit: com / jp / llc pointing at a document that merely contains a
+      # URL). The domain's meaningful part (pwc, shaho) is kept — only the
+      # generic suffixes are noise.
+      - "com"
+      - "org"
+      - "net"
+      - "www"
+      - "http"
+      - "https"
+      - "html"
+      - "llc"
+      - "inc"
+      - "jp"                      # 2-char TLDs still surfaced in the audit —
+      - "co"                      # some extraction paths skip latin_min_len
+      # Japanese formal nouns (形式名詞) and quantifier furniture. SudachiPy's
+      # POS filter keeps 名詞, which lets these grammatical nouns through —
+      # they carry no retrieval value ("こと" = "thing/matter"). Same audit
+      # source as the TLD group. High-confidence noise only, mirroring the
+      # English list's policy on ambiguous words.
+      - "こと"
+      - "もの"
+      - "ため"
+      - "とき"
+      - "ところ"
+      - "これ"
+      - "それ"
+      - "ように"
+      - "以上"
+      - "以下"
     max_per_file: 15              # Max keywords per file in knowledge_map
     max_index: 50                 # Max entries in keyword_index reverse map
     # Discrimination filter (TF-IDF document-frequency cut-off): words that

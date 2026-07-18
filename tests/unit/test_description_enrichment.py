@@ -107,3 +107,41 @@ def test_string_numeric_keys_accepted(monkeypatch):
         lambda **kw: ('"1": First file.\n"2": Second file.', "stop"),
     )
     assert enrich_sources_with_descriptions(km, out, _config()) == 2
+
+
+def test_prompt_carries_per_file_language_directive():
+    from docingest.output.description_enrichment import _build_prompt
+
+    prompt = _build_prompt([
+        {"original": "a.md", "format": "md", "language": "zh", "excerpt": "x"},
+        {"original": "b.md", "format": "md", "language": "ja", "excerpt": "y"},
+    ])
+    assert "WRITE THE DESCRIPTION IN: zh" in prompt
+    assert "WRITE THE DESCRIPTION IN: ja" in prompt
+    assert "never the majority language" in prompt
+
+
+def test_enabled_without_knowledge_map_warns(caplog):
+    """description.enabled + outputs excluding knowledge_map must warn
+    instead of silently doing nothing (pipeline mount-point behavior)."""
+    import logging
+    import docingest
+
+    inp = Path(tempfile.mkdtemp(prefix="docingest_desc_warn_in_"))
+    (inp / "doc.md").write_text("# T\n\nBody text here.\n", encoding="utf-8")
+    out = Path(tempfile.mkdtemp(prefix="docingest_desc_warn_out_"))
+
+    with caplog.at_level(logging.WARNING):
+        docingest.ingest(
+            inp / "doc.md",
+            output=out,
+            outputs=["markdown"],  # knowledge_map deliberately excluded
+            config_overrides={
+                "output.derived_metadata.description.enabled": True,
+                "run_log.enabled": False,
+            },
+        )
+    assert any(
+        "description.enabled" in r.message and "knowledge_map" in r.message
+        for r in caplog.records
+    ), "expected a warning about the missing knowledge_map artefact"

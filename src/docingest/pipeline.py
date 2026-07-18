@@ -5330,11 +5330,15 @@ def run_pipeline(
         except Exception as e:
             _pipeline_logger.warning(f"Related-links enrichment failed: {e}")
 
-        # Description enrichment: add a retrieval-optimized `description`
-        # frontmatter sentence (OKF-recommended field) to each sources/*.md.
-        # Default-off — it costs an LLM call per batch of files, unlike the
-        # zero-cost tags/related passes. Independent try block, same
-        # knowledge_map data source.
+    # Description enrichment: add a retrieval-optimized `description`
+    # frontmatter sentence (OKF-recommended field) to each sources/*.md.
+    # Default-off — it costs an LLM call per batch of files, unlike the
+    # zero-cost tags/related passes. Sits OUTSIDE the knowledge_map.enabled
+    # block: when the map is missing (outputs excluded it, or generation
+    # failed) an explicitly enabled switch must warn, not silently no-op.
+    # The enabled gate comes FIRST so the default-off case costs nothing
+    # (no knowledge_map.yaml read/parse on every run).
+    if get_nested(config, "output.derived_metadata.description.enabled", False):
         try:
             from .output.description_enrichment import (
                 enrich_sources_with_descriptions,
@@ -5346,6 +5350,12 @@ def run_pipeline(
                 km_data = yaml.safe_load(km_path.read_text(encoding="utf-8"))
                 if isinstance(km_data, dict):
                     enrich_sources_with_descriptions(km_data, output_dir, config)
+            else:
+                _pipeline_logger.warning(
+                    "description.enabled is set but knowledge_map.yaml is not "
+                    "available (outputs excludes 'knowledge_map', or map "
+                    "generation failed) — no descriptions generated."
+                )
         except Exception as e:
             _pipeline_logger.warning(f"Description enrichment failed: {e}")
 

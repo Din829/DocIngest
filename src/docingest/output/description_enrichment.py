@@ -65,10 +65,16 @@ def _body_excerpt(md_path: Path) -> str:
 
 def _build_prompt(entries: list[dict[str, Any]]) -> str:
     """Numbered-list prompt for one batch. Numeric keys make the reply
-    robust to filename quirks (emoji titles, CJK, spaces)."""
+    robust to filename quirks (emoji titles, CJK, spaces).
+
+    Each file carries an explicit per-file "write in <language>" directive:
+    with a soft "same language as the content" rule, mixed-language batches
+    drift toward the batch's majority language (observed in a real run —
+    Chinese files came back with Japanese descriptions)."""
     lines = []
     for i, e in enumerate(entries, 1):
-        line = f"{i}. {e['original']} ({e['format']}, {e.get('language', '?')})"
+        lang = e.get("language") or "?"
+        line = f"{i}. {e['original']} ({e['format']}) → WRITE THE DESCRIPTION IN: {lang}"
         if e.get("sections"):
             line += " sections=[" + ", ".join(str(s) for s in e["sections"][:8]) + "]"
         if e.get("keywords"):
@@ -79,9 +85,12 @@ def _build_prompt(entries: list[dict[str, Any]]) -> str:
 
     return f"""For each numbered file below, write ONE search-retrieval description:
 1-2 plain sentences stating what the file contains and what questions it can
-answer. Write in the SAME language as that file's content.
+answer.
 
 Rules:
+- Each description MUST be written in the language marked for THAT file
+  ("WRITE THE DESCRIPTION IN: ..."), never the majority language of the
+  batch. A language code of "?" means: use the language of the excerpt.
 - Summarize in YOUR OWN words. Do NOT copy the file's own title, intro,
   or promotional self-description verbatim — that text may appear at the
   start of the excerpt and is usually marketing, not substance.
@@ -173,8 +182,24 @@ def enrich_sources_with_descriptions(
 
     model_config = get_nested(config, "models.chunking_assist", {})
     modified = 0
-    for start in range(0, len(todo), batch_size):
-        batch = todo[start:start + batch_size]
+    # Batch by language, not by arrival order. Mixed-language batches drift
+    # toward the batch's majority language REGARDLESS of prompt directives —
+    # measured on a real 10-file zh/ja/en corpus, where even an explicit
+    # per-file "WRITE THE DESCRIPTION IN: zh" line was ignored. Same-language
+    # batches remove the failure mode structurally; the prompt directive
+    # stays as harmless reinforcement.
+    by_lang: dict[str, list[dict[str, Any]]] = {}
+    for entry in todo:
+        by_lang.setdefault(str(entry.get("language") or "?"), []).append(entry)
+
+    batches: list[list[dict[str, Any]]] = []
+    for group in by_lang.values():
+        batches.extend(
+            group[start:start + batch_size]
+            for start in range(0, len(group), batch_size)
+        )
+
+    for batch in batches:
         try:
             response, finish_reason = text_completion(
                 prompt=_build_prompt(batch),
