@@ -92,6 +92,12 @@ _DEFAULT_FRONTMATTER_FIELDS: list[str] = [
     "title",
     "language",
     "pages",
+    # Source URL for URL-resolved inputs (OKF `resource`: canonical URI of
+    # the underlying asset). Absent for ordinary local files.
+    "resource",
+    # Retrieval-optimized one-sentence summary (OKF `description`) — added
+    # post-run by description_enrichment when enabled (default off).
+    "description",
     # Docling origin (promoted by file_metadata hook)
     "mimetype",
     "binary_hash",

@@ -1191,6 +1191,13 @@ output:
       - title
       - language
       - pages
+      # Source URL for URL-resolved inputs (OKF `resource`: canonical URI
+      # of the underlying asset). Absent for ordinary local files.
+      - resource
+      # Retrieval-optimized one-sentence summary (OKF `description`) —
+      # written post-run by description enrichment when
+      # output.derived_metadata.description.enabled is true.
+      - description
       # Docling origin (promoted by file_metadata hook)
       - mimetype
       - binary_hash
@@ -1287,6 +1294,15 @@ output:
       max_links: 3                # per-file cap on related links
       min_similarity: 0.15        # Jaccard threshold (0~1); below → no link
                                   #   (don't manufacture weak associations)
+    # Description: one retrieval-optimized frontmatter sentence per file
+    # (OKF-recommended `description` field). Costs an LLM call per batch of
+    # files (model: models.chunking_assist), hence default OFF — same
+    # precedent as `related`: zero-cost derived fields default on, fields
+    # that cost an API call default off. Files that already carry a
+    # description are skipped (idempotent across incremental runs).
+    description:
+      enabled: false              # default OFF — opt-in (costs an LLM call)
+      batch_size: 20              # files per LLM call
       algorithm: jaccard          # only 'jaccard' implemented; seam for future
                                   #   metrics (overlap / cosine) without breaking
 

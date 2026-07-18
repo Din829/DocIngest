@@ -3469,6 +3469,11 @@ def _build_chunk_lineage(
     # with what the chunker's doc_metadata already carries.
     if meta.get("last_modified"):
         original_input["last_modified"] = meta["last_modified"]
+    # Source URL for inputs that came from URL resolution (stamped onto
+    # metadata as `resource` before Phase 2). Fulfils the "or URL" part of
+    # this docstring's original_input contract.
+    if meta.get("resource"):
+        original_input["url"] = meta["resource"]
 
     # Copy transformations so later chunks can't accidentally mutate the
     # parse_result's list (e.g. if post-processing logic ever appends).
@@ -4040,6 +4045,16 @@ def process_single_file(
         parse_result.markdown, config, parse_result.metadata.get("format")
     )
 
+    # URL provenance: files that came from URL resolution live in the media
+    # cache; recover their source URL from the .origin.json sidecar so it
+    # reaches frontmatter (`resource`, OKF canonical-URI field), index.json,
+    # and chunk lineage. Local inputs get None → field simply absent.
+    if "resource" not in parse_result.metadata:
+        from .utils.url_resolver import lookup_url_origin
+        origin_url = lookup_url_origin(Path(result.original_file), config)
+        if origin_url:
+            parse_result.metadata["resource"] = origin_url
+
     # --- Phase 2: Write Markdown + assets ---
     # original_file determines the sources/*.md filename — must be the
     # user's input, not the Phase-0.5-converted xlsx in .cache/.
@@ -4149,6 +4164,10 @@ def process_single_file(
             # first 10 sent to Vision") — surfaced to sources/*.md
             # frontmatter, not per-chunk relevant.
             "warnings",
+            # File-level source URL (URL-resolved inputs). Frontmatter and
+            # index.json carry it per file; chunks get it via
+            # `lineage.original_input.url`.
+            "resource",
             # File-level timestamps / search-tags. The frontmatter writer
             # already emits them per file; chunks duplicate without gain.
             # NOTE: last_modified is deliberately NOT here — it is also
@@ -5310,6 +5329,25 @@ def run_pipeline(
                     enrich_sources_with_related(km_data, output_dir, config)
         except Exception as e:
             _pipeline_logger.warning(f"Related-links enrichment failed: {e}")
+
+        # Description enrichment: add a retrieval-optimized `description`
+        # frontmatter sentence (OKF-recommended field) to each sources/*.md.
+        # Default-off — it costs an LLM call per batch of files, unlike the
+        # zero-cost tags/related passes. Independent try block, same
+        # knowledge_map data source.
+        try:
+            from .output.description_enrichment import (
+                enrich_sources_with_descriptions,
+            )
+            km_path = output_dir / get_nested(
+                config, "knowledge_map.output_file", "knowledge_map.yaml"
+            )
+            if km_path.exists():
+                km_data = yaml.safe_load(km_path.read_text(encoding="utf-8"))
+                if isinstance(km_data, dict):
+                    enrich_sources_with_descriptions(km_data, output_dir, config)
+        except Exception as e:
+            _pipeline_logger.warning(f"Description enrichment failed: {e}")
 
     # Write errors.json if any failures, OR remove a stale one from a prior
     # failing run when this run succeeded. errors.json is a per-run snapshot

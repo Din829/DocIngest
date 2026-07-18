@@ -28,7 +28,9 @@ Design
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -67,6 +69,58 @@ def _is_direct_media_url(url: str) -> bool:
 def _url_hash(url: str) -> str:
     """Short deterministic hash for cache directory naming."""
     return hashlib.md5(url.encode("utf-8")).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
+# URL origin sidecar (provenance)
+# ---------------------------------------------------------------------------
+#
+# The downloaded media files carry no trace of the URL they came from, so
+# downstream consumers (frontmatter `resource`, chunk lineage) would lose
+# provenance entirely. A sidecar manifest in the download dir survives cache
+# hits and parallel runs without threading extra state through the pipeline.
+# The leading dot keeps it out of no filter by itself — the two glob
+# collection sites below exclude it by name.
+
+_ORIGIN_FILENAME = ".origin.json"
+
+
+def _write_origin(download_dir: Path, url: str) -> None:
+    """Record the source URL next to its downloaded files. Idempotent."""
+    origin_path = download_dir / _ORIGIN_FILENAME
+    if origin_path.exists():
+        return
+    try:
+        origin_path.write_text(
+            json.dumps(
+                {"url": url, "resolved_at": datetime.datetime.now().isoformat(timespec="seconds")},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        # Provenance is best-effort — never fail the download over it.
+        logger.warning(f"Could not write URL origin manifest: {e}")
+
+
+def lookup_url_origin(file_path: Path, config: dict[str, Any]) -> str | None:
+    """
+    Return the source URL for a file that came from URL resolution.
+
+    Returns None for ordinary local inputs, for media-cache files downloaded
+    before origin manifests existed, and on any read error.
+    """
+    try:
+        media_root = get_media_cache_root(config).resolve()
+        resolved = file_path.resolve()
+        if not resolved.is_relative_to(media_root):
+            return None
+        origin_path = resolved.parent / _ORIGIN_FILENAME
+        data = json.loads(origin_path.read_text(encoding="utf-8"))
+        url = data.get("url")
+        return url if isinstance(url, str) and url else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +271,11 @@ def _download_ytdlp(
 
     # Collect whatever files yt-dlp produced
     produced = sorted(download_dir.glob("*"))
-    # Filter out directories and zero-byte files
-    produced = [f for f in produced if f.is_file() and f.stat().st_size > 0]
+    # Filter out directories, zero-byte files, and the provenance sidecar
+    produced = [
+        f for f in produced
+        if f.is_file() and f.stat().st_size > 0 and f.name != _ORIGIN_FILENAME
+    ]
 
     if produced:
         logger.info(
@@ -259,12 +316,14 @@ def resolve_url(
     download_dir.mkdir(parents=True, exist_ok=True)
 
     # Check cache: if the directory already has files, reuse them
+    # (.origin.json is the provenance sidecar, not downloaded media)
     existing = [
         f for f in download_dir.glob("*")
-        if f.is_file() and f.stat().st_size > 0
+        if f.is_file() and f.stat().st_size > 0 and f.name != _ORIGIN_FILENAME
     ]
     if existing:
         logger.debug(f"URL cache hit for {url}: {len(existing)} file(s)")
+        _write_origin(download_dir, url)  # backfill pre-sidecar caches
         return existing
 
     # Route: direct media URL vs video platform
@@ -273,7 +332,10 @@ def resolve_url(
     else:
         files = _download_ytdlp(url, download_dir, config)
 
-    return files if files else None
+    if files:
+        _write_origin(download_dir, url)
+        return files
+    return None
 
 
 def get_media_cache_root(config: dict[str, Any]) -> Path:

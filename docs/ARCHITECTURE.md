@@ -188,7 +188,9 @@ GraphRAG 详见 §9；二次加工层（postprocess）详见 §10。
 - **Chunk lineage**：每 chunk 挂 `source_markdown` + `original_input` + `transformations` 数组（实际起作用的变换才记）。见 `pipeline.py::_build_chunk_lineage`。
 - **视频双路径**：默认 `native_video`（整段一次调用，Gemini 原生）；不支持时降级抽帧 + per-page Vision。见 `media_parser.py` + `parsing.audio.native_video` config。
 - **动态超时 / OOM 分批**：超时按页数缩放（`_resolve_parse_timeout`）；PDF 超阈值主动分批控内存 + 解析失败被动分批兜底（`docling_parser.py::_parse_pdf_batched` + `parsing.pdf.oom_batch_fallback` config）。起因是 docling-parse 的 Windows OOM bug——**上游已修（7.4.0+，2026-07 本机升级验证）**，机制留作长期防线，历史见 [docling_parse_OOM_Windows_长期监控.md](docling_parse_OOM_Windows_长期监控.md)。
-- **派生 metadata**：aliases / tags / 语义 type，零额外 LLM。见 `hooks/derive_*.py` + `output/tags_enrichment.py`。
+- **派生 metadata**：aliases / tags / 语义 type，零额外 LLM。见 `hooks/derive_*.py` + `output/tags_enrichment.py`。related 链接（Jaccard，零 LLM，默认关）见 `output/related_enrichment.py`；description（检索优化一句话，**有 LLM 成本，默认关**）见 `output/description_enrichment.py`。惯例：零成本派生默认开，烧 API 的派生默认关。
+- **OKF 对齐**：frontmatter 与 Google Open Knowledge Format v0.1 字段级兼容（`type` 必填语义 / `title` / `tags` / `resource` / `description`；related 链接用 §5.1 bundle-relative 形式）。不产完整 OKF bundle（无 index.md 树）。声明见 README「OKF compatibility」节。
+- **URL 溯源**：URL 摄取的原始地址随下载写入 media cache 的 `.origin.json` sidecar，经 `lookup_url_origin` 流入 frontmatter `resource`、index.json 和 `lineage.original_input.url`；chunk 平铺 metadata 不带（黑名单）。见 `utils/url_resolver.py`。
 - **其它**：ZIP 防炸弹（`utils/zip_expander.py`）/ URL 走 yt-dlp（`utils/url_resolver.py`）/ magika 内容识别（`utils/format_detector.py`）/ 加密检测（`utils/encryption.py`）。
 
 ---

@@ -150,6 +150,10 @@ class IndexBuilder:
         # Optional fields (only include if available)
         if "pages" in metadata:
             entry["pages"] = metadata["pages"]
+        # Source URL for URL-resolved inputs (OKF `resource`) — lets agents
+        # answer "where did this come from" without opening the .md.
+        if metadata.get("resource"):
+            entry["resource"] = metadata["resource"]
         if sections:
             entry["sections"] = sections
         if metadata.get("has_tables"):

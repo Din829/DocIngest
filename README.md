@@ -18,6 +18,25 @@ Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → pa
 | `chunks_enriched.jsonl` | Same chunks as `chunks.jsonl` but with graph entity descriptions injected, for traditional vector RAG (optional, via `docingest graph enrich` or `--enrich-chunks`) |
 | `extracted/<template>.jsonl` | One strongly-typed record per document, filled from a YAML template (optional, via `docingest extract` — see [Structured extraction](#structured-extraction-optional)) |
 
+### Open Knowledge Format (OKF) compatibility
+
+`sources/*.md` frontmatter is field-level compatible with
+[Google Open Knowledge Format v0.1](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md),
+so OKF-aware consumers (OpenWiki, knowledge catalogs, …) can read DocIngest
+output directly:
+
+- `type` — OKF's only REQUIRED field; a short semantic kind
+  (`Document` / `Spreadsheet` / `Transcript` / …) derived from the file format
+  (config: `output.derived_metadata.type`).
+- `title`, `tags`, `resource` — same semantics as OKF. `resource` carries the
+  canonical source URI for URL-resolved inputs (e.g. the original video URL);
+  it is absent for ordinary local files.
+- `related` links use OKF §5.1 bundle-relative form (`/sources/<file>.md`).
+
+DocIngest deliberately does NOT emit a full OKF bundle (no `index.md` tree —
+`index.json` is DocIngest's own machine-readable contract). Compatibility is
+per-file frontmatter semantics, which is what retrieval-side consumers read.
+
 ## Install
 
 **Prerequisites:** Python 3.10+ and git. (DocIngest installs everything else; it
