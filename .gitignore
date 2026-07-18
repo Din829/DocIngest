@@ -31,6 +31,9 @@ test_word_*/
 test_pptx/
 test_pptx_*/
 
+# Scratch/benchmark workspaces (ad-hoc experiments, never source)
+temp/
+
 # Reference projects (cloned externally, not checked in)
 参考项目/
 
