@@ -276,6 +276,75 @@ def _collect_charts_on_slide(slide: Any) -> list[str]:
 # Markdown injection
 # ---------------------------------------------------------------------------
 
+def _table_row_multisets(markdown: str) -> list[dict[str, int]]:
+    """All table rows in `markdown` as cell-value → count multisets.
+
+    Multisets, not sets: a chart row like | Q1 | 8 | 8 | (two series with
+    the same value — common in real charts) must NOT collapse to {Q1, 8},
+    or an unrelated row | Q1 | 8 | 3 | would count as containing it and a
+    real data row would be silently dropped."""
+    rows: list[dict[str, int]] = []
+    for line in markdown.splitlines():
+        s = line.strip()
+        if s.startswith("|") and s.endswith("|") and "---" not in s:
+            counts: dict[str, int] = {}
+            for c in s.strip("|").split("|"):
+                c = c.strip()
+                if c:
+                    counts[c] = counts.get(c, 0) + 1
+            if counts:
+                rows.append(counts)
+    return rows
+
+
+def _row_contained(row: dict[str, int], md_row: dict[str, int]) -> bool:
+    """Multiset containment: every cell value with at least its multiplicity."""
+    return all(md_row.get(cell, 0) >= n for cell, n in row.items())
+
+
+def _chart_already_present(
+    chart_md: str, existing_rows: list[dict[str, int]]
+) -> bool:
+    """
+    True when every DATA row of this chart already appears as a table row
+    in the parsed markdown.
+
+    docling >= 2.113 extracts native PPTX charts itself; injecting on top of
+    that duplicates the whole data table. Comparison is content-level, not
+    version-sniffing: cell values are compared as multisets so formatting
+    differences (docling's aligned padding, its empty first header cell vs
+    our "Category") don't matter, and a chart row counts as present when its
+    cells are CONTAINED in some markdown row (docling may add columns).
+    Header rows are excluded from the check — only data rows decide.
+
+    Bias every ambiguity toward INJECTING (a duplicate table is cheap, a
+    silently dropped one is data loss):
+      * partial extraction (any row missing) → inject;
+      * charts with a single data row → always inject — one small row of
+        common values (e.g. "Total", "100") can collide with an unrelated
+        table anywhere in the document, and one row is too little evidence
+        that docling truly extracted this chart.
+    """
+    chart_rows: list[dict[str, int]] = []
+    for line in chart_md.splitlines():
+        s = line.strip()
+        if s.startswith("|") and s.endswith("|") and "---" not in s:
+            counts: dict[str, int] = {}
+            for c in s.strip("|").split("|"):
+                c = c.strip()
+                if c:
+                    counts[c] = counts.get(c, 0) + 1
+            if counts:
+                chart_rows.append(counts)
+    data_rows = chart_rows[1:]  # first table row is our header
+    if len(data_rows) < 2:
+        return False
+    return all(
+        any(_row_contained(row, md_row) for md_row in existing_rows)
+        for row in data_rows
+    )
+
+
 def _inject_into_markdown(
     parse_result: ParseResult,
     per_slide_charts: list[list[str]],
@@ -365,6 +434,23 @@ def pptx_chart_hook(
             logger.debug(f"Chart extraction failed on slide: {e}")
             charts = []
         per_slide_charts.append(charts)
+
+    # Content-level dedup: skip charts whose data docling already extracted
+    # natively (>= 2.113 parses PPTX charts itself). Checked against the
+    # PRE-injection markdown so charts can't suppress each other.
+    existing_rows = _table_row_multisets(parse_result.markdown)
+    skipped = 0
+    filtered: list[list[str]] = []
+    for charts in per_slide_charts:
+        kept = [c for c in charts if not _chart_already_present(c, existing_rows)]
+        skipped += len(charts) - len(kept)
+        filtered.append(kept)
+    if skipped:
+        logger.info(
+            f"PPTX chart extraction: {skipped} chart(s) already present in "
+            f"parsed markdown (native docling extraction) — not re-injected."
+        )
+    per_slide_charts = filtered
 
     injected = _inject_into_markdown(parse_result, per_slide_charts)
 
