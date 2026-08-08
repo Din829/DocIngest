@@ -74,10 +74,16 @@ _EXTERNAL_STOP = threading.Event()
 #   (_last_parse_metadata), and concurrent parses amplify the intermittent
 #   docling-parse Windows std::bad_alloc (probe: a 2nd model copy + a
 #   177-page PDF killed the process; see docs/docling_parse_OOM_Windows_
-#   长期监控.md). The concurrency win comes from OVERLAP instead: file B
-#   parses while file A waits on Vision I/O. The lock sits OUTSIDE
-#   run_with_timeout so the parse timeout budget never includes queueing
-#   time (and run_with_timeout never leaks a running zombie — measured).
+#   长期监控.md). RE-VERIFIED 2026-07-18 on docling-parse 7.5.0 (which fixed
+#   the SINGLE-instance crash): a single 160-page parse peaks at ~26.5 GB
+#   RSS, so 2 concurrent instances exhaust a 64 GB machine (page-level
+#   bad_alloc storm), and 3 kill the process outright. The gate is memory
+#   physics, not a fixable upstream bug — do NOT unlock without measuring
+#   peak RSS × workers against the machine first. The concurrency win comes
+#   from OVERLAP instead: file B parses while file A waits on Vision I/O.
+#   The lock sits OUTSIDE run_with_timeout so the parse timeout budget never
+#   includes queueing time (and run_with_timeout never leaks a running
+#   zombie — measured).
 #
 # _WRITE_NAMES_GATE — write_markdown mutates the shared `existing_names`
 #   collision set; Phase 2 is cheap file I/O, so one coarse lock suffices.
@@ -1385,27 +1391,55 @@ def _should_skip_vision(
     """
     Conservative triage: decide if a page can safely skip Vision enrichment.
 
+    Thin wrapper over _vision_skip_reason — see there for the actual checks.
+    Kept as the boolean-returning entry point because that is what callers
+    and tests assert on; the reason string is an addition, not a replacement.
+    """
+    return _vision_skip_reason(
+        page_data, structured_per_page, triage_cfg, doc_language
+    ) is None
+
+
+def _vision_skip_reason(
+    page_data,
+    structured_per_page: dict,
+    triage_cfg: dict[str, Any],
+    doc_language: str | None = None,
+) -> str | None:
+    """
+    Same triage as _should_skip_vision, but returns WHY the page must go to
+    Vision instead of just "it must".
+
+    Returns None when the page can safely skip Vision; otherwise a short
+    machine-readable identifier naming the layer that vetoed the skip
+    (e.g. "picture_elements", "glyph_garble", "latin_cipher"). The pipeline
+    tallies these into metadata["vision_triage"] so a run can answer
+    "why did page N go to Vision?" — the question the tally was always meant
+    to support but could not, having only counts.
+
     ALL conditions must be met to skip. Any single failure → send to Vision.
     This ensures we never miss important content — it's acceptable to send
     a few extra pages (false negatives are cheap, false positives lose info).
 
-    Checks (all must pass to skip):
-      1. No image markers in Docling output (no charts/diagrams to describe)
-      2. No picture elements (Docling figures / fitz-detected embedded images)
-      3. No structured data injection (no chart hook data needing visual context)
-      4. Sufficient text extracted (not a scanned/image-only page)
-      5. No garbled text (glyph< CID failure, or CJK-adjacent &lt; entity garble)
-      6. Low replacement character ratio (no CID font issues)
-      7. No complex tables (simple tables are fine, complex ones need Vision)
-      8. No mixed-script anomaly (CJK mismap garbling from OCR)
-      9. Text scripts match the document's declared language (catches CMap
-         failures that produce "clean" but wrong Unicode — e.g. Bengali /
-         Thai / Tibetan characters in a document declared as Japanese).
-     10. No Latin-script cipher garble (catches a broken CMap that maps each
-         glyph to a *different* legal Latin letter — the output is clean ASCII,
-         no glyph< / U+FFFD / CJK / unexpected script, so checks 5-9 all pass,
-         but the text is an unreadable substitution cipher. Flagged by an
-         abnormally low vowel ratio. Latin-script docs only.)
+    Checks (all must pass to skip), with the identifier each returns:
+      1. No image markers in Docling output          → "image_marker"
+      2. No picture elements (Docling figures /
+         fitz-detected embedded images)              → "picture_elements"
+      3. No structured data injection (chart hook)   → "structured_data"
+      4. Sufficient text extracted (not scan-empty)  → "low_text"
+      5. No garbled text: glyph< CID failure         → "glyph_garble"
+         ...or CJK-adjacent &lt; entity garble       → "entity_garble"
+      6. Low replacement character ratio             → "replacement_chars"
+      7. No complex tables                           → "complex_table"
+      8. No mixed-script anomaly (OCR CJK mismap)    → "mixed_script"
+      9. Text scripts match the declared language
+         (catches CMap failures that produce "clean" but wrong Unicode —
+         e.g. Bengali / Thai / Tibetan in a ja doc)  → "unexpected_script"
+     10. No Latin-script cipher garble (a broken CMap mapping each glyph to a
+         *different* legal Latin letter — clean ASCII, so checks 5-9 all pass,
+         but the text is an unreadable substitution cipher; flagged by an
+         abnormally low vowel ratio, Latin-script docs only)
+                                                     → "latin_cipher"
     """
     text = page_data.text
     stripped = text.strip()
@@ -1445,7 +1479,7 @@ def _should_skip_vision(
 
     # Has image/chart markers → Vision needs to describe visual elements
     if "<!-- image -->" in text:
-        return False
+        return "image_marker"
 
     # Page carries picture elements (Docling figures or, for PDF, embedded
     # images detected by fitz) → Vision must describe them. This is the
@@ -1454,21 +1488,21 @@ def _should_skip_vision(
     # trigger was OCR garble — get wrongly skipped once Docling OCR is off.
     # Furniture-only pages are the deliberate exception (see above).
     if getattr(page_data, "num_pictures", 0) > 0 and not furniture_only_page:
-        return False
+        return "picture_elements"
 
     # Has structured data (e.g. PPTX chart) → Vision describes surrounding visuals
     if structured_per_page.get(page_data.page_no):
-        return False
+        return "structured_data"
 
     # Too little text → possibly scanned/image-only page
     min_len = int(triage_cfg.get("min_text_length", 50))
     if len(stripped) < min_len:
-        return False
+        return "low_text"
 
     # Garbled text → Docling failed, Vision can re-OCR
     # glyph< = CID font mapping failure
     if "glyph<" in text or "glyph&lt;" in text:
-        return False
+        return "glyph_garble"
     # CJK-adjacent &lt; entity = OCR garble where a CJK char was truncated into
     # an HTML entity (e.g. 確認 → 確&lt;). We match ONLY a CJK char immediately
     # followed by &lt; — NOT a bare &lt;/&gt; anywhere — because legitimate
@@ -1479,12 +1513,12 @@ def _should_skip_vision(
     # skipped, code/HTML prose not flagged. Toggle via
     # parsing.vision.triage.entity_garble_check.
     if triage_cfg.get("entity_garble_check", True) and _CJK_ENTITY_GARBLE_RE.search(stripped):
-        return False
+        return "entity_garble"
 
     # High U+FFFD ratio → CID font extraction failure
     max_fffd = float(triage_cfg.get("max_replacement_ratio", 0.05))
     if len(stripped) > 0 and stripped.count("\ufffd") / len(stripped) > max_fffd:
-        return False
+        return "replacement_chars"
 
     # Complex Markdown table → Vision may help correct structure
     table_threshold = int(triage_cfg.get("table_line_threshold", 10))
@@ -1493,7 +1527,7 @@ def _should_skip_vision(
         if "|" in line and line.strip().startswith("|")
     )
     if table_lines >= table_threshold:
-        return False
+        return "complex_table"
 
     # Mixed-script anomaly → CJK mismap garbling (e.g. する→寸, 査→查)
     # Detects short ASCII fragments (1-3 chars) sandwiched between CJK chars,
@@ -1501,14 +1535,14 @@ def _should_skip_vision(
     # Normal text (e.g. "PwC" in Japanese docs) has whitespace/punctuation
     # around ASCII, not direct CJK adjacency.
     if _has_mixed_script_anomaly(stripped, triage_cfg):
-        return False
+        return "mixed_script"
 
     # Language-script consistency — catches PDFs whose font CMap produced
     # clean but *wrong* Unicode (Bengali / Thai / Tibetan chars on a page
     # declared as Japanese). The other garble checks miss this case because
     # the output is legal Unicode, no glyph< markers, no U+FFFD, no CJK.
     if _has_unexpected_scripts(stripped, triage_cfg, doc_language):
-        return False
+        return "unexpected_script"
 
     # Latin-script substitution-cipher garble — a broken font CMap that maps
     # each glyph to a DIFFERENT legal Latin letter. The output is clean ASCII
@@ -1519,10 +1553,10 @@ def _should_skip_vision(
     # excluded inside the check). See language_script_check for the sibling case
     # where the garble lands in a *different* script entirely.
     if _has_latin_cipher_garble(stripped, triage_cfg):
-        return False
+        return "latin_cipher"
 
     # All checks passed → pure text page, safe to skip
-    return True
+    return None
 
 
 # Shared CJK character class for the two OCR-garble triage checks below. Covers
@@ -2302,6 +2336,7 @@ def _enrich_with_vision(
     their Docling text regardless of the systemic decision.
     """
     import logging
+    from collections import Counter
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from .parsers.vision import describe_page_cached
     from .models.cache import AICache
@@ -2394,6 +2429,11 @@ def _enrich_with_vision(
     sheet_triage_skipped = 0
     pages_with_pictures = 0  # pages that carry any picture signal (would have
                              # triggered Vision pre-triage) — the "trigger" count.
+    # Which triage layer vetoed the skip, per page. Answers "why did page N go
+    # to Vision?" — the question the tally below was always meant to support.
+    # Counts triage's VERDICT, so a page later dropped by max_pages still
+    # appears here (cap_skipped records that separately).
+    sent_reasons: Counter[str] = Counter()
     for i, page_data in enumerate(parse_result.pages):
         if not page_data.image_path:
             no_image += 1
@@ -2410,9 +2450,19 @@ def _enrich_with_vision(
             continue
         if getattr(page_data, "num_pictures", 0) > 0:
             pages_with_pictures += 1
-        if triage_enabled and _should_skip_vision(
-            page_data, structured_per_page, triage_cfg, doc_language
-        ):
+        # Reason string (None = safe to skip). Same checks as before — this is
+        # _should_skip_vision's body, now naming the layer that vetoed instead
+        # of only returning False.
+        skip_reason = (
+            _vision_skip_reason(
+                page_data, structured_per_page, triage_cfg, doc_language
+            )
+            if triage_enabled
+            else "triage_disabled"
+        )
+        if skip_reason is not None:
+            sent_reasons[skip_reason] += 1
+        else:
             triage_skipped += 1
             # A page is a furniture skip iff it has pictures AND every picture
             # is furniture (matches _should_skip_vision's furniture_only_page
@@ -2432,12 +2482,20 @@ def _enrich_with_vision(
     # when nothing was skipped) so a run log / -v output shows the full picture
     # at a glance: how many pages carried visuals, how many actually went to
     # Vision, how many were skipped, and how many of those skips were furniture.
+    # Reason breakdown, most common first — turns "38 pages went to Vision"
+    # into "38 went, 30 of them for picture_elements" without a re-run.
+    reason_phrase = (
+        " | sent because: "
+        + ", ".join(f"{name}={n}" for name, n in sent_reasons.most_common())
+        if sent_reasons else ""
+    )
     logger.info(
         f"Vision triage summary: trigger(pages w/ pictures)={pages_with_pictures}, "
         f"sent_to_vision={len(vision_tasks)}, triage_skipped={triage_skipped} "
         f"(of which furniture={furniture_skipped}), "
         f"sheet_triage_skipped={sheet_triage_skipped}, "
         f"cap_skipped={cap_skipped}, no_image_pages={no_image}"
+        f"{reason_phrase}"
     )
     if cap_skipped:
         logger.warning(
@@ -2457,6 +2515,11 @@ def _enrich_with_vision(
         "sheet_triage_skipped": sheet_triage_skipped,
         "cap_skipped": cap_skipped,
         "no_image_pages": no_image,
+        # Per-layer breakdown, flattened to `sent_reason_<layer>: <count>`.
+        # Flat ints on purpose: FileResult/PipelineResult keep only int values
+        # from this dict (isinstance(v, int) filter), so a nested dict would be
+        # dropped silently on its way to run_log.
+        **{f"sent_reason_{name}": n for name, n in sent_reasons.items()},
     })
 
     doc_format = parse_result.metadata.get("format")
