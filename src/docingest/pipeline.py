@@ -3826,6 +3826,157 @@ def _resolve_parse_timeout(file_path: Path, config: dict[str, Any]) -> float | N
     return max(base, min(ceiling, base + per_page * pages))
 
 
+def _looks_vertical_pdf(file_path: Path, config: dict[str, Any]) -> bool:
+    """Cheap probe (~0.02 s): is this PDF vertically typeset CJK text?
+
+    Why bother: layout engines read vertical Japanese as a TABLE — each glyph is
+    its own text object arranged in regular columns, so the grid detector fires
+    and every character lands in its own cell. Docling produces 358 s of
+    unusable pseudo-table for a 17-page file whose text layer PyMuPDF reads in
+    0.02 s. anydoc (a completely different engine) fails the same way, so this
+    is a property of text-layer layout analysis, not a Docling bug.
+
+    Two signals must BOTH fire, because either alone has real false positives
+    (measured over ~60 real PDFs incl. scans, rotations, damaged CMaps):
+      * single-glyph spans dominate — forms also score high (77%), but
+      * the average span is barely one glyph wide — dense tables score low (1%).
+    The one true vertical file measured 99.7% / 12.0 pt; the closest decoy was
+    77.2% / 71.1 pt. No sample satisfied both.
+
+    Being wrong is survivable in BOTH directions, which is why a heuristic is
+    acceptable here at all: a false positive routes a horizontal file through
+    vision_only (still good output, just pricier and without bounding boxes),
+    and a miss simply leaves today's behaviour (parse fails, fallback recovers).
+    """
+    if not get_nested(config, "parsing.vertical_detect.enabled", True):
+        return False
+    if file_path.suffix.lower() != ".pdf":
+        return False
+
+    ratio_min = float(get_nested(config, "parsing.vertical_detect.single_span_ratio", 0.9))
+    width_max = float(get_nested(config, "parsing.vertical_detect.max_avg_span_width", 20.0))
+    sample_pages = int(get_nested(config, "parsing.vertical_detect.sample_pages", 3))
+
+    try:
+        import pymupdf
+
+        doc = pymupdf.open(str(file_path))
+        try:
+            singles = total = 0
+            width_sum = 0.0
+            for page_no in range(min(sample_pages, doc.page_count)):
+                # get_text("dict") returns the rich block/line/span tree; the
+                # pymupdf stubs only describe the plain-text overload.
+                page_dict: dict[str, Any] = doc[page_no].get_text("dict")  # type: ignore[assignment]
+                for block in page_dict["blocks"]:
+                    if block.get("type") != 0:      # 0 = text, 1 = image
+                        continue
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            x0, _, x1, _ = span["bbox"]
+                            total += 1
+                            width_sum += float(x1) - float(x0)
+                            if len(span["text"].strip()) <= 1:
+                                singles += 1
+        finally:
+            doc.close()
+    except Exception:
+        # Encrypted / damaged / not really a PDF — the probe must never decide
+        # anything on a guess, so stay out of the way and let the normal path
+        # (and its error reporting) handle it.
+        return False
+
+    # No text layer at all (pure scan): nothing to judge — Vision triage already
+    # handles those on the normal path.
+    if total == 0:
+        return False
+    return (singles / total) >= ratio_min and (width_sum / total) <= width_max
+
+
+def _try_vision_only_fallback(
+    file_path: Path,
+    config: dict[str, Any],
+    parse_timeout: float | None,
+    reason: str,
+) -> Any | None:
+    """Retry a failed parse with the vision_only engine. None = not applicable.
+
+    Without this, a Docling parse failure loses the WHOLE file — and the Vision
+    step that could have read it lives in a later Phase it never reaches. The
+    retry is deliberately narrow, because a retry that cannot succeed is just
+    wasted Vision spend:
+
+      * ``error_handling.on_parse_failure`` must be ``vision_fallback``.
+      * The format must be one vision_only actually handles itself. Every other
+        format DELEGATES back to Docling inside VisionOnlyParser, so retrying
+        would re-run the parse that just failed.
+      * The engine must not already be vision_only — nothing to fall back to.
+
+    Returns the fallback ParseResult on success. Returns None when the fallback
+    does not apply OR itself fails, so the caller reports the ORIGINAL error
+    rather than a confusing second one.
+    """
+    if get_nested(config, "error_handling.on_parse_failure", "skip") != "vision_fallback":
+        return None
+    if get_nested(config, "parsing.engine", "docling") == "vision_only":
+        return None
+
+    # Reuse the engine's own format list instead of duplicating it here — one
+    # source of truth for "which formats vision_only reads on its own".
+    from .parsers.vision_only_parser import _PAGE_IMAGE_FORMATS, VisionOnlyParser
+
+    if file_path.suffix.lower() not in _PAGE_IMAGE_FORMATS:
+        return None
+
+    _pipeline_logger.warning(
+        f"Parse failed ({reason}) for {file_path.name} — retrying with the "
+        f"vision_only engine (renders pages, skips the Docling parse). "
+        f"Set error_handling.on_parse_failure=skip to disable this."
+    )
+    from .utils.timeout import run_with_timeout
+
+    try:
+        with _PARSE_GATE:
+            return run_with_timeout(
+                lambda: VisionOnlyParser(config).parse(file_path),
+                parse_timeout,
+            )
+    except Exception as exc:
+        # Fall through to the original error — the caller still fails loud, and
+        # the log keeps both halves of the story.
+        _pipeline_logger.warning(
+            f"vision_only fallback for {file_path.name} also failed: {exc}"
+        )
+        return None
+
+
+def _record_parse_fallback(parse_result: Any, reason: str, detail: str) -> None:
+    """Make a successful downgrade visible instead of silently normal-looking.
+
+    A fallback nobody can see is worse than the failure it replaced: the file
+    reports success while its content actually came from another engine, with
+    different properties (no per-element bounding boxes, every page billed to
+    Vision). So it is recorded in BOTH channels a consumer reads — the run
+    warnings and the chunk lineage.
+
+    This belongs in `transformations` despite that list being "successful steps
+    only": vision_only is the step that actually produced this content, so it is
+    positive provenance, not a debug trace of the path that failed.
+    """
+    parse_result.metadata.setdefault("warnings", []).append(
+        f"Docling parse failed ({reason}) — content recovered via the "
+        f"vision_only engine. Text came from Vision, so per-element bounding "
+        f"boxes are unavailable for this file and every page was sent to Vision."
+    )
+    parse_result.transformations.append({
+        "step": "parse_fallback",
+        "from": "docling",
+        "to": "vision_only",
+        "reason": reason,
+        "detail": detail,
+    })
+
+
 def process_single_file(
     file_path: Path,
     parser: BaseParser,
@@ -3881,6 +4032,31 @@ def process_single_file(
     # count instead of the same flat cap a 10-page memo gets (see
     # _resolve_parse_timeout / parsing.dynamic_timeout).
     parse_timeout = _resolve_parse_timeout(file_path, config)
+    # Set only when another engine replaces `parser` below, so the provenance
+    # trail names the engine that actually produced the content.
+    parser_name_override: str | None = None
+
+    # Route vertical CJK PDFs straight to vision_only. The fallback below would
+    # recover them anyway, but only AFTER the doomed parse runs to completion —
+    # a timeout marks a call failed, it cannot interrupt it (see utils/timeout),
+    # so the wasted time is the FULL parse (measured 358 s), not the timeout.
+    # Probing first turns that into ~21 s. Rebinding the local `parser` leaves
+    # the caller's instance untouched, so other files are unaffected.
+    if get_nested(config, "parsing.engine", "docling") != "vision_only" and \
+            _looks_vertical_pdf(file_path, config):
+        from .parsers.vision_only_parser import VisionOnlyParser
+
+        _pipeline_logger.warning(
+            f"{file_path.name}: vertical CJK text layer detected — using the "
+            f"vision_only engine, because layout analysis reads vertical text "
+            f"as a table and shreds it one glyph per cell. Disable with "
+            f"parsing.vertical_detect.enabled=false."
+        )
+        parser = VisionOnlyParser(config)
+        parser_name_override = "VisionOnlyParser"
+        _vertical_routed = True
+    else:
+        _vertical_routed = False
     # Parse is a Docling black box (no per-page hook), so we can only signal
     # "busy parsing" — not a percentage. Emitting sub_total=0 tells the UI to
     # show an indeterminate/spinner state for this phase instead of sitting
@@ -3898,27 +4074,52 @@ def process_single_file(
                 parse_timeout,
             )
     except TimeoutError as e:
-        result.success = False
-        # Tell the caller exactly which knob to raise — both humans and agents
-        # see the error string, and "timed out after Ns" alone doesn't reveal
-        # whether to raise parsing.timeout_sec or parsing.dynamic_timeout.max_sec.
-        ext = file_path.suffix.lstrip(".").lower()
-        dyn_on = get_nested(config, "parsing.dynamic_timeout.enabled", True)
-        is_paged_pdf = ext == "pdf" and dyn_on
-        knob = (
-            "parsing.dynamic_timeout.max_sec" if is_paged_pdf
-            else "parsing.timeout_sec"
+        # Losing the whole file is the worst outcome, so try the vision_only
+        # engine before reporting failure (see _try_vision_only_fallback).
+        parse_result = _try_vision_only_fallback(
+            file_path, config, parse_timeout, reason="timeout",
         )
-        env_knob = "DOCINGEST__" + knob.replace(".", "__")
-        result.error = (
-            f"Parse timed out: {e}. "
-            f"This is {knob} (current={parse_timeout}s). "
-            f"Raise it for this input — e.g. {env_knob}=1800, or set in your "
-            f"docingest.yaml. For long-form video, native_video uploads can "
-            f"also stall on Files API: see parsing.audio.native_video.files_api_poll_timeout_sec."
-        )
-        result.error_type = "timeout"
-        return result, []
+        if parse_result is None:
+            result.success = False
+            # Name the knob that ACTUALLY produced this budget. The dynamic
+            # budget is base + per_page * pages clamped to max_sec, so pointing
+            # at max_sec sends users to raise a ceiling they never reached.
+            ext = file_path.suffix.lstrip(".").lower()
+            dyn_on = get_nested(config, "parsing.dynamic_timeout.enabled", True)
+            if ext == "pdf" and dyn_on:
+                base = get_nested(config, "parsing.dynamic_timeout.base_sec", 120)
+                per_page = get_nested(config, "parsing.dynamic_timeout.per_page_sec", 3)
+                ceiling = get_nested(config, "parsing.dynamic_timeout.max_sec", 1800)
+                hit_ceiling = parse_timeout is not None and float(parse_timeout) >= float(ceiling)
+                knob_hint = (
+                    f"This budget comes from parsing.dynamic_timeout "
+                    f"(base_sec={base} + per_page_sec={per_page} x pages, "
+                    f"clamped to max_sec={ceiling}). "
+                    + (
+                        "It reached max_sec, so raise "
+                        "DOCINGEST__parsing__dynamic_timeout__max_sec."
+                        if hit_ceiling else
+                        "It did NOT reach max_sec, so raising max_sec changes "
+                        "nothing — raise base_sec or per_page_sec instead, e.g. "
+                        "DOCINGEST__parsing__dynamic_timeout__per_page_sec=20."
+                    )
+                )
+            else:
+                knob_hint = (
+                    f"This budget is parsing.timeout_sec (current={parse_timeout}s). "
+                    f"Raise it e.g. DOCINGEST__parsing__timeout_sec=1800."
+                )
+            result.error = (
+                f"Parse timed out: {e}. {knob_hint} "
+                f"Alternatively run this input with --engine vision_only, which "
+                f"skips the Docling parse entirely. For long-form video, "
+                f"native_video uploads can also stall on Files API: see "
+                f"parsing.audio.native_video.files_api_poll_timeout_sec."
+            )
+            result.error_type = "timeout"
+            return result, []
+        parser_name_override = "VisionOnlyParser"
+        _record_parse_fallback(parse_result, reason="timeout", detail=str(e))
     except (FileNotFoundError, PermissionError, OSError) as e:
         result.success = False
         result.error = f"Parse failed (io): {e}"
@@ -3973,9 +4174,25 @@ def process_single_file(
     # wants to see in provenance trails.
     parse_result.transformations.append({
         "step": "parser",
-        "name": parser.__class__.__name__,
+        "name": parser_name_override or parser.__class__.__name__,
         "format": result.format,
     })
+    if _vertical_routed:
+        # Same visibility contract as the failure fallback: the file processed
+        # fine, but through a different engine with different properties, and
+        # on the strength of a heuristic the user may want to overrule.
+        parse_result.metadata.setdefault("warnings", []).append(
+            "Vertical CJK text layer detected — parsed with the vision_only "
+            "engine instead of Docling (layout analysis shreds vertical text "
+            "into one-glyph table cells). No per-element bounding boxes, and "
+            "every page was sent to Vision. Override with "
+            "parsing.vertical_detect.enabled=false."
+        )
+        parse_result.transformations.append({
+            "step": "parse_route",
+            "to": "vision_only",
+            "reason": "vertical_cjk_text",
+        })
 
     # Phase 0.5 aftermath: when a legacy file was auto-converted upstream, the
     # parser saw the cached file (stem = sha256). Restore the user's original
@@ -4061,7 +4278,15 @@ def process_single_file(
     # detection still correctly yields "ja" — exactly the signal the
     # per-page script check needs.
     if "language" not in parse_result.metadata:
-        parse_result.metadata["language"] = _detect_language(parse_result.markdown)
+        # Only detect when the parser actually produced text. Under vision_only
+        # the markdown at this point is nothing but pagebreak markers (Vision
+        # fills the text in the next Phase), and detecting on those ASCII
+        # markers classifies a Japanese document as English. Leaving it unset
+        # lets the post-Vision detection further down run on real content;
+        # triage's script check already handles an unknown language with a
+        # generic whitelist.
+        if re.sub(r"<!--.*?-->", "", parse_result.markdown or "", flags=re.S).strip():
+            parse_result.metadata["language"] = _detect_language(parse_result.markdown)
 
     # --- Phase 1.5: Vision enrichment (describe extracted images) ---
     if parse_result.pages and get_nested(config, "parsing.vision.enabled", True):
@@ -4092,6 +4317,15 @@ def process_single_file(
                     k: int(v) for k, v in vt.items() if isinstance(v, int)
                 }
             return result, []
+
+    # Language, second chance: engines that produce no text of their own
+    # (vision_only renders pages and lets Vision read them) were skipped by the
+    # pre-Vision detection above, because at that point the markdown is nothing
+    # but pagebreak markers. Now that Vision has filled it in, detect on the
+    # real content — frontmatter is built from this metadata, so without it a
+    # vision_only run would ship every file with no language at all.
+    if "language" not in parse_result.metadata and (parse_result.markdown or "").strip():
+        parse_result.metadata["language"] = _detect_language(parse_result.markdown)
 
     # --- Phase 1.6: Pre-write hooks (post-Vision, pre-frontmatter) ---
     # Hooks that enrich metadata without touching Vision (e.g. exiftool

@@ -175,15 +175,16 @@ _MODE_PRESETS: dict[str, dict[str, Any]] = {
     "balanced": {},
     "fast": {
         "parsing.engine": "vision_only",
-        # Vision pinned to flash-lite (GA): measured 2026-07-04 on WEO 75p,
-        # vision_only 64-way — 14s vs flash 44s (3x), table structure intact
-        # (91 vs 92 rows), [unreadable] marks accurate (ground-truth checked),
-        # content -5.7%. The GA endpoint fixed the preview-era regressions
-        # (-17% content / flattened tables) that once disqualified lite.
-        # Speed-first trade-off is exactly what "fast" means; balanced/best
-        # keep the quality-vetted default (models.defaults).
+        # Vision pinned to Flash-Lite: the speed-first trade-off is exactly what
+        # "fast" means, while balanced/best keep the quality default
+        # (models.defaults = gemini-3.7-flash). Measured on the previous Lite
+        # generation, 2026-07-04, WEO 75p, vision_only 64-way — 14s vs Flash 44s
+        # (3x), table structure intact (91 vs 92 rows), [unreadable] marks
+        # accurate (ground-truth checked), content -5.7%. The GA Lite endpoints
+        # fixed the preview-era regressions (-17% content / flattened tables)
+        # that once disqualified Lite entirely.
         "models.vision.primary.provider": "google",
-        "models.vision.primary.model": "gemini-3.1-flash-lite",
+        "models.vision.primary.model": "gemini-3.5-flash-lite",
         "models.vision.primary.api_key_env": "GEMINI_API_KEY",
         "performance.parallel_files": 64,
         "parsing.pptx.image_extraction.vision_enrich": False,
