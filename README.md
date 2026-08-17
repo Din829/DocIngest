@@ -2,390 +2,495 @@
 
 Universal document preprocessing for RAG and Agentic Search.
 
-Accepts any document (PDF/PPT/Excel/HTML/images/audio/video/ZIP/URLs/...) → parses with Docling + Vision AI + ASR → outputs clean Markdown + chunks + a knowledge map. One preprocessing pipeline, two consumers: **RAG** (vector search on `chunks.jsonl`) and **Agentic Search** (grep/glob on `sources/*.md`).
+Any input — PDF, Office, HTML, images, audio, video, ZIP, http(s) URLs — becomes clean
+Markdown + chunks + a searchable index. One pipeline, two consumers: **RAG** (vector
+search over `chunks.jsonl`) and **Agentic Search** (grep/read over `sources/*.md`).
 
-## Outputs
+**DocIngest does not retrieve.** No embeddings, no vector search, no answer generation —
+it prepares data; you search it with your own tools. That boundary is deliberate.
 
-| File | Purpose |
+## Quick start
+
+```bash
+docingest doctor                        # 1. is the environment ready?
+docingest inspect ./docs/               # 2. how big / how much will it cost?
+docingest run ./docs/ -o ./kb/          # 3. process
+```
+
+Then read `./kb/knowledge_search.SKILL.md` (an auto-generated search guide for this
+corpus) and grep `./kb/sources/*.md`, or feed `./kb/chunks.jsonl` to your vector store.
+
+Re-running `run` on the same output is cheap — unchanged files are skipped by content
+hash.
+
+## What a run produces
+
+Everything lands under the output directory:
+
+| Path | What it is |
 |---|---|
-| `sources/*.md` | Clean Markdown with frontmatter (Agentic Search, grep/glob) |
-| `chunks.jsonl` | Chunked text with metadata (RAG vector search) |
-| `index.json` | File directory (Agent file discovery) + per-file PDF bounding boxes |
-| `knowledge_map.yaml` + `knowledge_search.SKILL.md` | Auto-generated search guide |
-| `quality_report.json` | Vision accuracy health check (`[?]` + `[unreadable]` scan) |
-| `readable/*.md` | Human-readable version (optional, via `refine`) |
-| `graph/` | Knowledge graph artefacts (optional, via `docingest graph build` — see [GraphRAG](#graphrag-optional)) |
-| `chunks_enriched.jsonl` | Same chunks as `chunks.jsonl` but with graph entity descriptions injected, for traditional vector RAG (optional, via `docingest graph enrich` or `--enrich-chunks`) |
-| `extracted/<template>.jsonl` | One strongly-typed record per document, filled from a YAML template (optional, via `docingest extract` — see [Structured extraction](#structured-extraction-optional)) |
+| `sources/*.md` | Clean Markdown with YAML frontmatter — the product. Grep/read these. |
+| `chunks.jsonl` | Chunked text + metadata, one JSON object per line. Feed to your embedder. |
+| `index.json` | File directory for agent discovery, plus per-file PDF element bounding boxes. |
+| `knowledge_map.yaml` | Corpus summary + keyword reverse index (machine-readable). |
+| `knowledge_search.SKILL.md` | Search guide for this corpus: file table, keyword index, search protocol. **Read this first.** |
+| `quality_report.json` | Vision accuracy self-check — scans output for `[?]` / `[unreadable]` markers. |
+| `assets/` | Rendered page images and extracted embedded images. |
+| `log.md` | Append-only run history (`run_log` output; disable via `outputs`). |
+| `run.log` | Full INFO-level log of the last run. Always written. |
+| `errors.json` | Written only when files fail. Each entry has `file` / `error` / `error_type`. |
+| `.cache/` | Incremental cache. Never delete it unless you want a full rebuild. |
 
-### Open Knowledge Format (OKF) compatibility
+Optional, produced by follow-up commands: `readable/` (`refine`), `graph/` +
+`chunks_enriched.jsonl` (`graph build`), `extracted/<template>.jsonl` (`extract`),
+`viz/` (`visualize`).
+
+<details>
+<summary><b>Open Knowledge Format (OKF) compatibility</b></summary>
 
 `sources/*.md` frontmatter is field-level compatible with
 [Google Open Knowledge Format v0.1](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md),
-so OKF-aware consumers (OpenWiki, knowledge catalogs, …) can read DocIngest
-output directly:
+so OKF-aware consumers (OpenWiki, knowledge catalogs) can read the output directly:
+`type` (OKF's only required field, derived from format), `title`, `tags`, `resource`
+(canonical source URI for URL inputs), and `related` links in OKF §5.1 bundle-relative
+form. `description` — one retrieval-optimized sentence per file — is opt-in
+(`output.derived_metadata.description.enabled`, ~1 LLM call per 20 files) and
+**recommended for multi-file knowledge bases**: in a 10-file cross-domain benchmark, an
+agent picking which file to open from frontmatter alone went from 64% (title+tags) to
+89% (+description).
 
-- `type` — OKF's only REQUIRED field; a short semantic kind
-  (`Document` / `Spreadsheet` / `Transcript` / …) derived from the file format
-  (config: `output.derived_metadata.type`).
-- `title`, `tags`, `resource` — same semantics as OKF. `resource` carries the
-  canonical source URI for URL-resolved inputs (e.g. the original video URL);
-  it is absent for ordinary local files.
-- `description` — one retrieval-optimized sentence per file (opt-in:
-  `output.derived_metadata.description.enabled`, costs one LLM call per ~20
-  files). **Recommended for multi-file knowledge bases**: in our 10-file
-  cross-domain benchmark, an agent picking which file to open from
-  frontmatter alone went from 64% (title+tags) to 89% (+description).
-- `related` links use OKF §5.1 bundle-relative form (`/sources/<file>.md`).
+DocIngest deliberately does not emit a full OKF bundle — `index.json` is its own
+machine-readable contract. Compatibility is per-file frontmatter semantics, which is
+what retrieval-side consumers actually read.
+</details>
 
-DocIngest deliberately does NOT emit a full OKF bundle (no `index.md` tree —
-`index.json` is DocIngest's own machine-readable contract). Compatibility is
-per-file frontmatter semantics, which is what retrieval-side consumers read.
+## Commands
+
+Flags below are the ones you'll actually reach for. **`docingest <cmd> --help` is the
+source of truth** — run it when in doubt.
+
+| Command | Does | Key flags |
+|---|---|---|
+| `run <inputs...>` | Documents → Markdown + chunks + index | `--mode fast\|balanced\|best` · `-o/--output` · `--purpose` · `--outputs` · `--strategy` · `--max-pages N` · `--parallel-files N` · `--force` · `--sync` · `-y` · `--json` · `-v` |
+| `inspect <inputs...>` | Size / pages / cost estimate — **no parsing** | `--json` |
+| `extract <kb>` | Fill a YAML-declared schema per document → `extracted/<template>.jsonl` | `-t/--template` · `--input sources\|chunks` · `--parallel N` · `--json` |
+| `refine <files...>` | Rewrite Markdown into a human-readable copy (LLM) | `--skill refine_default\|refine_faithful\|refine_html` · `-o` · `-y` |
+| `doctor` | Check packages, external tools, API keys | — |
+| `visualize <kb>` | Draw parse bounding boxes onto page images (QA) | `--pages 1,3` · `--labels table` · `--numbers` |
+| `export <kb>` | Push chunks to a vector store (Azure AI Search) | `--endpoint` · `--index` · `--embed-model` · `--embed-dim` · `--vector-field` |
+| `skills list` | List the refine styles `refine --skill` accepts | `--json` |
+| `graph build\|query\|status\|enrich` | Optional knowledge-graph layer → [GraphRAG](#graphrag-optional) | see that section |
+
+`run` accepts files, directories, ZIP archives, and http(s) URLs — mixed freely in one
+call:
+
+```bash
+docingest run report.pdf slides.pptx -o ./kb/
+docingest run ./docs/ archive.zip "https://www.youtube.com/watch?v=..." -o ./kb/
+docingest run meeting.mp3 presentation.mp4 -o ./kb/
+```
+
+`-o` is optional for a **single** input (it derives `./knowledge/<input-name>/`) and
+**required** for multi-input runs, so separate knowledge bases never silently merge.
+
+**Advanced flags on `run`** — normally covered by `--mode`, set them only for the noted
+case: `--engine docling | vision_only | azure_di | docling_with_fallback` (set mainly for
+`azure_di`; `--mode fast` already picks `vision_only` for PDF, and non-PDF formats
+delegate back to docling under it), `--parallel N` (within-file Vision workers),
+`-c/--config <path>` (point at a specific `docingest.yaml`).
+
+**Conventions shared by every command:**
+
+- JSON goes to **stdout**, banner / progress / errors to **stderr** — safe to pipe.
+- Exit codes: `0` success · `1` some files failed · `2` safety abort · `130` graceful Ctrl+C.
+- Incremental by default. `--force` ignores the cache logic but does **not** delete
+  `<output>/.cache/` — for a genuinely clean run, use a new output directory.
+- **Vertically typeset CJK PDFs skip Docling.** Layout analysis reads vertical Japanese
+  as a table and shreds it one glyph per cell, so a ~0.02 s probe routes those files
+  straight to `vision_only`. Measured on a 17-page 法令 PDF: 358 s of unusable
+  pseudo-table → **10 s** and a correctly-read scoring table. Both signals must fire
+  (single-glyph spans ≥ 90% **and** average span ≤ 20 pt); across 75 real PDFs only the
+  genuinely vertical one matched. Tune or disable under `parsing.vertical_detect`.
+- **Parse failures fall back instead of losing the file.** When Docling fails on a PDF
+  or image (timeout, parser error), DocIngest retries once with the `vision_only`
+  engine, which renders pages and lets Vision read them. The downgrade is never
+  silent: it appears in the run warnings and in `metadata.lineage.transformations`
+  (`step: parse_fallback`), because the recovered file has no per-element bounding
+  boxes and every page was billed to Vision. Disable with
+  `error_handling.on_parse_failure: skip`.
+- Safety is `strict` by default: an over-budget run aborts with exit 2. Review the
+  estimate, then re-run with `-y`.
+
+## Processing modes
+
+One flag bundles the cost/quality knobs. The key design point: **the same mode resolves
+to a different path per file type**, so each format gets its best route automatically.
+
+| Mode | Use for | What it actually does |
+|---|---|---|
+| `fast` | bulk first pass, gist only | PDF → `vision_only` (skips Docling parse entirely — big speedup). Office → still Docling, but 64-way concurrency, aggressive triage, figure extraction off. **Also pins Vision to `gemini-3.5-flash-lite`** instead of the default `gemini-3.7-flash` (Lite measured at 14 s vs Flash 44 s on WEO 75p, table structure intact, content −5.7%). |
+| `balanced` *(default)* | almost everything | Nothing to pass — this is plain `docingest run`. |
+| `best` | contracts, spec sheets, never-miss-a-word | Every page to Vision (triage off) + batched calls off. ~2× cost, zero-miss recall. |
+
+Why `fast` differs per format: `vision_only`'s speed win only holds for PDF, which
+PyMuPDF renders quickly. Office formats are bottlenecked on LibreOffice→PDF rendering
+that no engine can skip, so their `fast` saves by sending *fewer* Vision calls, not by
+switching engines.
+
+An explicit flag (`--engine`, `--parallel`, …) overrides the mode. A misspelled mode
+fails loud with the valid names — it never silently runs at the wrong cost point. Full
+knob-by-knob matrix: [docs/PROCESSING_MODES.md](docs/PROCESSING_MODES.md); the exact
+override sets live in `_MODE_PRESETS` in [`src/docingest/api.py`](src/docingest/api.py).
+
+## Choosing what gets written
+
+Produce exactly the artefacts you want on disk — skipped stages aren't just deleted,
+they never run (so you save the LLM cost too).
+
+```bash
+docingest run ./docs/ -o ./kb/ --purpose rag        # Markdown + chunks + index
+docingest run ./docs/ -o ./kb/ --outputs markdown,chunks
+```
+
+| `--purpose` | Expands to |
+|---|---|
+| `markdown` | `markdown` |
+| `rag` | `markdown`, `chunks`, `index` (chunking auto-on) |
+| `agentic` | `markdown`, `index`, `knowledge_map` |
+| `full` *(default)* | everything |
+
+`--outputs` is the precise form and **overrides `--purpose`**. Valid values, exactly:
+`markdown` · `chunks` · `index` · `assets` · `knowledge_map` · `quality_report` ·
+`run_log`. (No abbreviations — `md` is not valid.) `index` and `assets` are runtime
+dependencies, so they're produced and then deleted when unwanted; `.cache/` always
+survives so incremental keeps working. Same names work as `outputs=[...]` in the Python
+and MCP paths. Legacy `--no-chunks` still works.
+
+## Recipes
+
+| Goal | Command |
+|---|---|
+| Ingest a folder, keep it mirrored | `docingest run ./docs/ -o ./kb/ --sync` |
+| Cheap first pass over a big pile | `docingest run ./docs/ -o ./kb/ --mode fast` |
+| A contract where nothing may be missed | `docingest run deal.pdf -o ./kb/ --mode best` |
+| Only the first 20 pages of a huge PDF | `docingest run big.pdf -o ./kb/ --max-pages 20` |
+| Markdown only, no RAG artefacts | `docingest run ./docs/ -o ./kb/ --purpose markdown` |
+| Faster wall-clock on many files | `docingest run ./docs/ -o ./kb/ --parallel-files 4` |
+| Cost estimate for an agent to read | `docingest inspect ./docs/ --json` |
+| Any of the above, machine-readable | add `--json` (summary to stdout, progress to stderr) |
+| A structured table out of similar docs | `docingest extract ./kb/ -t doc_summary` |
+| A human-readable copy of one file | `docingest refine ./kb/sources/spec.md` |
+| Check the parse actually got the tables | `docingest visualize ./kb/ --labels table --numbers` |
+
+`inspect --json` returns one object per file — enough for an agent to decide before
+spending anything:
+
+```json
+[{"name": "nutrition.pdf", "format": "pdf", "size_mb": 0.91, "pages": 10,
+  "chars_est": 15983, "est_cost_usd": 0.13, "recommendation": "Ready"}]
+```
+
+`--sync` mirrors exactly one directory: after a fully successful run it prunes outputs
+owned by source files that disappeared. The first successful sync binds that knowledge
+base to that directory; pointing it at another one later is rejected. Cleanup runs only
+when every discovered file succeeded — aborts, parse failures, and interrupts preserve
+the previous state. Ordinary runs never delete anything, because a normal call may be a
+partial import.
+
+`--max-pages N` caps **parsing** (layout + Vision + chunking), and the cost preview
+reflects N. It is not `parsing.vision.max_pages`, which parses everything but only
+Vision-enriches the first N.
+
+`--parallel-files N` overlaps *files*; `--parallel N` sets the within-file Vision worker
+pool. Parsing stays serialized by design — file B parses while file A waits on Vision
+I/O, which is where the time goes. Outputs stay input-ordered and byte-identical to a
+sequential run.
 
 ## Install
 
-**Prerequisites:** Python 3.10+ and git. (DocIngest installs everything else; it
-can't install Python or git for you.)
+**Prerequisites:** Python 3.10+ and git.
 
-Two helper scripts do the whole install — one for Python packages, one for the
-system binaries DocIngest shells out to (LibreOffice / ffmpeg / poppler). Run
-both, fill in your API keys, verify. Five steps:
-
-**Linux / macOS:**
+Two scripts do the whole install — one for Python packages, one for the system binaries
+DocIngest shells out to (LibreOffice / ffmpeg / poppler).
 
 ```bash
 git clone https://github.com/Din829/DocIngest.git && cd DocIngest
 python -m venv .venv && source .venv/bin/activate     # 1. isolated env
 ./scripts/install_python_deps.sh                       # 2. CPU torch + DocIngest
 ./scripts/install_system_deps.sh                       # 3. LibreOffice / ffmpeg / poppler
-cp .env.example .env                                   # 4. add GEMINI_API_KEY (see below)
-python scripts/verify_deps.py                          # 5. confirm everything is reachable
+cp .env.example .env                                   # 4. add your API key
+python scripts/verify_deps.py                          # 5. gate: non-zero if anything is missing
 ```
 
-**Windows (PowerShell):**
+**Windows (PowerShell)** — same five steps with `.ps1`, except step 5 needs a **new**
+shell (the system-deps step edits PATH):
 
 ```powershell
 git clone https://github.com/Din829/DocIngest.git ; cd DocIngest
-python -m venv .venv ; .\.venv\Scripts\Activate.ps1    # 1. isolated env
-.\scripts\install_python_deps.ps1                      # 2. CPU torch + DocIngest
-.\scripts\install_system_deps.ps1                      # 3. LibreOffice / ffmpeg / poppler
-Copy-Item .env.example .env                            # 4. add GEMINI_API_KEY (see below)
-# 5. The system-deps step adds poppler / Node.js to PATH — OPEN A NEW PowerShell,
-#    re-activate the venv, then verify (a fresh shell is required to see the new PATH):
+python -m venv .venv ; .\.venv\Scripts\Activate.ps1
+.\scripts\install_python_deps.ps1
+.\scripts\install_system_deps.ps1
+Copy-Item .env.example .env
+# open a NEW PowerShell, re-activate the venv, then:
 python scripts\verify_deps.py
 ```
 
-> If PowerShell blocks the `.ps1` with an execution-policy error, run it as
-> `powershell -ExecutionPolicy Bypass -File .\scripts\install_python_deps.ps1`.
+If PowerShell blocks the script, run
+`powershell -ExecutionPolicy Bypass -File .\scripts\install_python_deps.ps1`.
 
-That's it. Now fill in `.env` and you're ready — `docingest run ./docs/`.
-
-### API keys
-
-Only two, both optional (set only what you use):
+**API keys** — only two, both optional; set what you use:
 
 | Key | For | Needed when |
 |---|---|---|
 | `GEMINI_API_KEY` | Vision AI (reads charts / scans / images per page) | Almost always — it's the default Vision engine |
-| `DASHSCOPE_API_KEY` | Audio/video transcription (Qwen3-ASR) | Only if you ingest audio / video |
+| `DASHSCOPE_API_KEY` | Audio/video transcription (Qwen3-ASR) | Only if you ingest audio or video |
 
-Library users can inject keys at call time via Provider classes instead of `.env`
-— see [Python Library](#python-library).
+Library callers can inject credentials at call time instead — see
+[Python library](#python-library).
 
-### doctor vs verify_deps
+**`doctor` vs `verify_deps.py`** — `docingest doctor` is a friendly table for humans and
+always exits 0. `python scripts/verify_deps.py` is the real gate: non-zero exit when a
+required dep is missing or a CUDA torch slipped in. Use it in CI / Docker.
 
-Two health checks, different jobs:
+**Optional extras** — add one only when you need that feature; there is deliberately no
+"install everything" path:
 
-- **`docingest doctor`** — friendly table for humans, always exits 0. Run it
-  anytime to see what's installed.
-- **`python scripts/verify_deps.py`** — the real gate: exits non-zero when a
-  required dep is missing (and flags a CUDA torch). Use it after install and in
-  CI / Docker, where a non-zero exit must fail the build.
+```bash
+pip install -e ".[nlp]"          # Japanese keyword extraction (SudachiPy)
+pip install -e ".[mcp]"          # MCP server (FastMCP)
+pip install -e ".[audio]"        # Audio transcription (DashScope Qwen3-ASR)
+pip install -e ".[azure]"        # azure_di parse engine + export to Azure AI Search
+pip install -e ".[langchain]"    # LangChain loader
+pip install -e ".[postprocess]"  # Structured extraction marker (no extra deps)
+pip install -e ".[graph]"        # GraphRAG layer (LightRAG)
+pip install -e ".[graph-local]"  # Local embeddings for graph — adds ~2GB torch libs
+pip install -e ".[graph-gemini]" # Gemini embeddings for graph
+```
 
-### Why the scripts, and not a plain `pip install -e .`
+<details>
+<summary><b>Why the scripts instead of a plain <code>pip install -e .</code></b> — and why a CUDA torch is a correctness problem, not just a size one</summary>
 
-docling pulls `torch` transitively, and on Linux the default PyPI wheel is the
-~5.6GB **CUDA** build that DocIngest never uses (it's CPU inference only). The
-`install_python_deps` script forces the CPU wheel up front so the install stays
-small. Installing by hand works too — just run the CPU-torch line FIRST:
+docling pulls `torch` transitively, and on Linux the default PyPI wheel is the ~5.6GB
+**CUDA** build. `install_python_deps` forces the CPU wheel up front. By hand, run the
+CPU-torch line first:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -e .
 ```
 
-`verify_deps.py` will tell you if a CUDA torch slipped in either way.
+**A CUDA torch changes extraction results, silently.** DocIngest never sets docling's
+`accelerator_options`, so its default `device=auto` switches to the GPU as soon as a
+CUDA torch is importable — nobody opts in. On Ampere, `torch.backends.cudnn.allow_tf32`
+defaults to `True`, and the reduced precision shifts layout-model bounding boxes enough
+to drop whole text blocks. Measured (RTX 3080 Ti, torch 2.12, docling 2.113): on a
+21-page Japanese document a heading line disappeared on **every** GPU run and on **no**
+CPU run (5/5 vs 0/5 — deterministic, not jitter), with nothing in the output marking the
+gap. `verify_deps.py` fails the build when it finds a CUDA torch.
 
-### Optional extras
+Speed was never the objection — the same run measured GPU at 3–7× faster. The project
+simply doesn't chase it (see
+[COMPETITIVE_POSITIONING.md](docs/COMPETITIVE_POSITIONING.md)), and a default install
+shouldn't quietly trade correctness for speed. If you *deliberately* run on GPU, set
+`torch.backends.cudnn.allow_tf32 = False` before the first inference — that restored
+byte-identical output on all 7 test files at no measurable speed cost.
+</details>
 
-Add **one** only when you need that feature — there is deliberately no
-"install everything" path (it would pull GPU torch + backends you don't use):
+<details>
+<summary><b>Docker / CI, and embedding DocIngest in another project</b></summary>
 
-```bash
-pip install -e ".[nlp]"              # Japanese keyword extraction (SudachiPy)
-pip install -e ".[mcp]"              # MCP Server (FastMCP)
-pip install -e ".[audio]"            # Audio transcription (DashScope Qwen3-ASR)
-pip install -e ".[azure]"            # Azure plugin: azure_di parse engine + export to Azure AI Search
-pip install -e ".[langchain]"        # LangChain loader (chunks.jsonl → Document)
-pip install -e ".[postprocess]"      # Structured extraction (docingest extract) — no extra deps; marker only
-pip install -e ".[graph]"            # Optional GraphRAG layer (LightRAG)
-pip install -e ".[graph-local]"      # Local embedding model — adds ~2GB torch libs
-pip install -e ".[graph-gemini]"     # Gemini embeddings for GraphRAG (google-genai SDK)
-```
+`Dockerfile.example` is a single-stage production template wiring these same scripts
+together: system bins layer → CPU-torch + pip layer → optional OCR model pre-download →
+`verify_deps.py` build gate → non-root user. `install_system_deps.sh` covers apt / dnf /
+yum / pacman / zypper / brew; the `.ps1` uses winget plus a manual poppler download.
 
-The `install_python_deps` script flags select these too: `--minimal` (core only),
-`--no-graph`, `--full` (adds `graph-local`). System tools have an OCR opt-in
-(`--with-ocr` / `-WithOcr`) — off by default since per-page Vision reads images
-more accurately than docling's built-in OCR.
-
-### Docker / CI
-
-`Dockerfile.example` at the repo root is a single-stage production template that
-wires these same scripts together (system bins layer → CPU-torch + pip layer →
-optional OCR model pre-download as root → `verify_deps.py` build gate → non-root
-user). The scripts auto-detect the platform: `install_system_deps.sh` covers
-apt / dnf / yum / pacman / zypper / brew; `.ps1` uses winget plus a manual
-poppler download.
-
-### Use as a dependency of another project
-
-To embed DocIngest into another Python project (private / in-tree — no public package index needed), drop the source tree into the consumer project and install it in editable mode. The consumer gets a regular `import docingest` with all Python dependencies auto-resolved; edits to the DocIngest source are picked up on next run without reinstalling.
+To vendor DocIngest into another Python project (no package index needed):
 
 ```bash
-# From the consumer project root
 cp -r /path/to/DocIngest ./vendor/DocIngest
-pip install -e "./vendor/DocIngest[mcp,audio,nlp]"   # extras optional
-docingest doctor                                     # verify environment
+pip install -e "./vendor/DocIngest[mcp,audio,nlp]"
+docingest doctor
 ```
 
-System tools (LibreOffice / ffmpeg / yt-dlp) and API keys are **per-machine, not per-project** — each host that runs the consumer needs them installed and configured the same way as a standalone DocIngest install above. API keys can be injected at call-time via Provider classes (see [Python Library](#python-library)) so consumer projects don't need to touch `.env`.
+System tools and API keys are **per-machine, not per-project** — every host running the
+consumer needs them. Keys can be injected via Provider objects so consumers never touch
+`.env`. Re-sync the source tree to update; only re-run `pip install -e` if
+`pyproject.toml`'s dependency list changed.
+</details>
 
-When you update DocIngest, sync the source tree into `vendor/DocIngest/` again (no reinstall needed); only re-run `pip install -e ...` if `pyproject.toml`'s dependency list changed.
+## Configuration
 
-## Usage
+Four layers, highest wins:
 
-### Process documents → knowledge base
+```
+CLI flags  >  DOCINGEST__* env vars  >  project docingest.yaml  >  config/default.yaml
+```
+
+[`config/default.yaml`](config/default.yaml) is the single source of truth — every knob
+is there with inline comments explaining why the default is what it is. Drop a
+`docingest.yaml` in your project root to override only what you need.
+
+```yaml
+chunking:
+  strategy: "heading"       # auto | heading | recursive | slide | sheet | timestamp | whole
+  max_tokens: 1024
+
+models:
+  defaults:                 # ONE model for every text/vision task unless a task overrides
+    primary: { provider: "google", model: "gemini-3.7-flash" }
+    fallback: { provider: "openai", model: "gpt-5.4-mini" }
+
+parsing:
+  vision:
+    image_dpi: 200
+    triage: { enabled: true }   # skip pure-text pages → 30-60% Vision cost saved
+
+sanitize:
+  enabled: false            # PII masking (email / card / IP / phone), default OFF
+```
+
+Any value can be overridden by an env var, `__` separating levels:
 
 ```bash
-# Documents
-docingest run ./docs/ -o ./knowledge/
-docingest run report.pdf slides.pptx -o ./knowledge/
-
-# Audio / video (local files)
-docingest run meeting.mp3 interview.wav -o ./knowledge/
-docingest run presentation.mp4 -o ./knowledge/
-
-# Video platform URLs (YouTube, Bilibili, etc.)
-docingest run "https://www.bilibili.com/video/BVxxx" -o ./knowledge/
-docingest run "https://www.youtube.com/watch?v=xxx" -o ./knowledge/
-
-# Mixed input (files + directories + URLs + ZIPs)
-docingest run ./docs/ archive.zip "https://youtube.com/..." -o ./knowledge/
+export DOCINGEST__chunking__max_tokens=1024
+export DOCINGEST__parsing__audio__language=ja
 ```
 
-Options:
-```
--o, --output PATH    Output directory (default: ./knowledge/<input-name>/ for single input, ./knowledge/ for mixed)
--c, --config PATH    Project config YAML
---mode TEXT          Processing preset: fast | balanced (default) | best. Bundles
-                     the cost/quality knobs and adapts per file type (fast →
-                     vision_only on PDF, Docling+high-concurrency on Office; best
-                     → every page to Vision). The easy way to control cost/quality.
-                     See "Processing modes" below.
---strategy TEXT      Override chunking strategy: auto | heading | recursive | slide | sheet | timestamp | whole
-                     (auto picks heading/recursive/slide/sheet/timestamp/whole by file format)
---max-pages INTEGER  Parse only the first N pages of paged inputs (PDF/PPTX/DOCX).
-                     Caps the whole parse (layout + Vision + chunking), and the
-                     cost preview reflects N. Distinct from parsing.vision.max_pages,
-                     which parses every page but only Vision-enriches the first N.
---no-chunks          Only output Markdown, skip chunks.jsonl
---parallel-files N   Process up to N files in overlap (default 1 = sequential).
-                     Parsing stays serialized by design — file B parses while
-                     file A waits on Vision I/O, which is where the time goes.
-                     Outputs stay input-ordered, byte-identical to sequential.
---force              Ignore cache, full rebuild
---sync               Mirror exactly one input directory. After a fully
-                     successful run, remove Markdown/assets/cache owned by
-                     source files that disappeared from that directory.
+**Models.** One model serves every text and vision task (Vision, chunking assist,
+knowledge-map summary, refine, graph) — change `models.defaults` once and it changes
+everywhere; add a `primary:` under a specific task to override just that one. Two roles
+are intentionally separate: `models.audio_transcription` (ASR: `qwen3-asr-flash`,
+falling back to `whisper-1`) and `graph.embedding`. There is **no hard-coded model name
+in code** — a task with no model fails loud rather than silently substituting one.
 
-Advanced (usually covered by --mode; set only for the noted cases):
---engine TEXT        Parsing engine: docling (default, local) | vision_only
-                     (skip docling on PDF/image — render + full-page Vision,
-                     OOM-immune; other formats auto-delegate to docling) |
-                     azure_di (cloud parse via Azure Document Intelligence, needs
-                     [azure] extra + credentials). Set mainly for azure_di;
-                     --mode fast already picks vision_only for PDF. Overrides --mode.
---parallel INTEGER   Worker count for Vision API calls and ASR segmentation
-                     (the within-file pools). Usually left to --mode (fast = 64).
-```
+**Credentials gotcha:** the CLI calls `load_dotenv()` without `override=True`, so an
+API key already present in the **environment wins over `.env`**. A stale env var
+therefore doesn't fail loudly — the primary provider errors, the fallback answers, and
+the run looks successful. If you suspect this, check `token_usage.by_model` in
+`--json` output: it reports the model actually billed.
 
-**Incremental mode is on by default.** Second run skips unchanged files. All outputs (index.json, chunks.jsonl, knowledge_map, SKILL.md) are fully regenerated each run to include both cached and new files:
+**Naming trap:** `performance.parallel_files` in YAML is the *within-file* Vision worker
+pool (CLI `--parallel`), while CLI `--parallel-files` maps to
+`performance.file_concurrency`. Similar names, opposite meanings.
 
-```bash
-docingest run ./docs/                 # run 1: full pipeline
-docingest run ./docs/                 # run 2: 100% cache hit, seconds
-docingest run ./docs/ --force         # ignore cache, full rebuild
-```
+## Python library
 
-Incremental mode skips unchanged files, but ordinary runs deliberately do not
-delete old `sources/*.md`: a normal call may be a partial import. Use explicit
-directory sync when the knowledge base should mirror one folder exactly:
-
-```bash
-docingest run ./docs/ -o ./knowledge/project --sync
-```
-
-The first successful sync binds that knowledge base to the resolved directory
-in `.cache/sync-manifest.json`. A later `--sync` with another directory is
-rejected. Cleanup runs only after every discovered file succeeds; safety aborts,
-parse failures, and graceful interrupts preserve the previous files and
-manifest. Only paths recorded as DocIngest-owned under `sources/` and `assets/`
-plus their cache metadata can be removed. An empty bound directory intentionally
-syncs the knowledge base to empty.
-
-### Chunk source locators
-
-Eligible `chunks.jsonl` records carry one additive `metadata.locator` so a
-retrieval result can point back to its original unit:
-
-```json
-{"kind": "page", "start": 3, "end": 4}
-{"kind": "slide", "index": 6}
-{"kind": "sheet", "name": "売上集計"}
-{"kind": "time", "start_seconds": 120, "end_seconds": 165}
-```
-
-PDF ranges are 1-based and are emitted only when every expected pagebreak
-survived chunking; otherwise DocIngest warns and omits the locator instead of
-guessing. PPT locator indices are also 1-based for display, while the legacy
-zero-based `slide_index` stays unchanged. Existing sheet/time fields remain.
-Cache hits gain locators during replay, so this metadata upgrade does not force
-document parsing or Vision to run again.
-
-### Processing modes — fast / balanced / best
-
-Rather than tuning the cost/quality knobs (engine, page triage, parallelism,
-figure-Vision) by hand, pick one of three scenario presets. The key idea: **the
-same mode resolves to a different path per file type**, so each format gets its
-fastest/most-accurate route automatically.
-
-| Mode | Use for | What it does |
-|---|---|---|
-| `fast` | bulk first-pass, gist only | PDF goes `vision_only` (skips Docling parse, big speedup). Office (PPTX/DOCX/XLSX) stays Docling + high concurrency + aggressive triage — their page images must go through LibreOffice regardless, so the win is smaller |
-| `balanced` *(default)* | almost everything | Today's default behaviour — accurate parse, triage on, figure extraction on |
-| `best` | contracts, spec sheets, never-miss-a-word | Every page to Vision (triage off), no batching shortcuts; ~2× cost for zero-miss recall |
-
-Why per-format: `vision_only`'s speed win only holds for PDF (PyMuPDF renders an
-already-laid-out format fast). Office formats are bottlenecked on LibreOffice→PDF
-rendering, which no engine can skip — so their `fast` mode saves by sending *fewer*
-Vision calls, not by switching engines. Full knob-by-knob matrix:
-[docs/PROCESSING_MODES.md](docs/PROCESSING_MODES.md).
-
-> The one-flag `--mode` entry point is planned; until it lands, apply a mode via a
-> small project `docingest.yaml` (or `config_overrides` from the library/MCP) using
-> the knob sets in PROCESSING_MODES.md. A plain `docingest run` already equals `balanced`.
-
-### Inspect documents before processing
-
-Pre-flight check — reports file size, page count, and recommendations without parsing:
-
-```bash
-docingest inspect ./docs/             # Rich table output (for humans)
-docingest inspect report.pdf --json   # JSON output (for Agents / MCP)
-```
-
-### Refine for human readability (optional)
-
-```bash
-docingest refine ./knowledge/sources/spec.md                        # Default: readability-first
-docingest refine ./knowledge/sources/*.md --skill refine_faithful   # Faithful: word-for-word, only dedup + format
-docingest refine ./knowledge/sources/spec.md --skill refine_html    # HTML: fidelity-preserving HTML5 fragment (.html)
-```
-
-Available skills: `refine_default` (allows rewriting) | `refine_faithful` (preserves original text exactly) | `refine_html` (same fidelity as faithful, outputs HTML fragment with `.html` extension)
-
-### Visualize parse layout (QA / debugging)
-
-Draw Docling's element bounding boxes onto the rendered page images — a quick way to check parse quality (tables / titles / figures detected correctly?). Reads `index.json` + `assets/`, writes annotated PNGs to a `viz/` subdir. Needs a knowledge base built with `output.include_bounding_boxes` (default on).
-
-```bash
-docingest visualize ./knowledge/                        # all pages, every label
-docingest visualize ./knowledge/ --pages 1,3 --numbers  # only pages 1 & 3, tag reading order
-docingest visualize ./knowledge/ --labels table         # only table boxes
-```
-
-### LangChain integration (optional)
-
-Load a knowledge base's chunks **straight into LangChain** as `Document` objects — reusing DocIngest's semantic chunks instead of re-splitting with a naive character splitter. Because LangChain itself integrates dozens of vector stores / retrievers (Azure AI Search, Bedrock Knowledge Bases, Pinecone, ...), this one adapter bridges DocIngest to all of them. The extra pulls only `langchain-core`:
-
-```bash
-pip install -e ".[langchain]"
-```
+The public surface is exactly what `docingest/__init__.py` exports: `ingest`, `inspect`,
+`refine`, `list_knowledge`, `get_summary`, `IngestResult`, `build_config`,
+`__version__`, and the Provider classes. Everything else under `docingest.*` is
+internal and may change between minor versions.
 
 ```python
-from docingest.integrations.langchain import DocIngestLoader
+import docingest
 
-docs = DocIngestLoader("./knowledge/").load()   # -> list[langchain_core.documents.Document]
-vectorstore.add_documents(docs)                  # any LangChain backend — you own embeddings / index / config
+result = docingest.ingest("./docs/", output="./kb/")
+print(result.stats["successful"], "files processed")
+for chunk in result.chunks:
+    embed(chunk["text"])
 ```
 
-### Azure plugin (optional)
+`ingest()` keyword arguments: `output`, `outputs`, `purpose`, `vision` / `audio` /
+`text` (Provider injection), `config_overrides`, `config_file`, `force`, `mode`,
+`acknowledge_large` (the `-y` equivalent), `on_progress`, `install_signal_handler`,
+`raise_on_failure`, `sync`.
 
-An opt-in `[azure]` plugin (`docingest.azure`) adds two **independent** Azure
-capabilities — use either, both, or neither. The core `docingest run` pipeline
-never imports it, and the SDKs load only when a capability actually runs:
+```python
+# Pick outputs, pick a mode, override any YAML value — all per call
+docingest.ingest(
+    "./docs/", output="./kb/",
+    mode="fast",
+    outputs=["markdown", "chunks"],
+    config_overrides={"parsing.vision.max_pages": 200, "chunking.max_tokens": 1024},
+)
 
-```bash
-pip install -e ".[azure]"
+# Inject credentials instead of using .env
+docingest.ingest(
+    "./docs/", output="./kb/",
+    vision=docingest.GeminiProvider(api_key="..."),
+    audio=docingest.DashScopeProvider(api_key="..."),
+)
 ```
 
-- **Azure Document Intelligence as a parse backend** — `parsing.engine: azure_di`
-  parses in Azure's cloud instead of local docling, with zero local parsing
-  memory pressure. Default stays `docling`; you opt in per run.
-- **Export chunks → Azure AI Search** — `docingest export` embeds a knowledge
-  base's chunks with your own model and pushes them into an Azure AI Search
-  vector index ("manual vectorization", preserving DocIngest's chunks instead of
-  letting Azure re-chunk). Generic: field names and embedding are injectable,
-  the vector dimension is verified before upload, and the metadata channel is
-  open-ended (`field_map` maps any `chunks.jsonl` metadata key to your index).
+Providers: `GeminiProvider`, `OpenAIProvider`, `AnthropicProvider`, `AzureOpenAIProvider`,
+`BedrockProvider`, `VertexAIProvider`, `DashScopeProvider`, `WhisperProvider` (plus the
+`VisionProvider` / `AudioProvider` / `TextProvider` base classes for custom subclasses).
+Cloud providers follow the same shape; unset optional fields fall back to ambient
+credentials (container IAM role, workload identity, gcloud ADC).
+
+```python
+docingest.ingest("./docs/", output="./kb/", vision=docingest.AzureOpenAIProvider(
+    model="my-gpt4-deployment",          # Azure deployment name, NOT a model id
+    api_base="https://my-resource.openai.azure.com/",
+    api_version="2024-08-01-preview",
+))
+```
+
+**`IngestResult`** carries the artefacts so you don't re-read the output directory:
+`markdown_files`, `chunks`, `index`, `knowledge_map`, `quality_report` (each populated
+when that name is in `outputs`), plus `stats` and `output_dir` which are always present.
+`stats` holds `total_files` / `successful` / `failed` / `token_usage` / `errors` /
+`warnings` / `quality` / `safety` / `interrupted`. (`run_log` is a valid `outputs` value
+— it toggles `log.md` on disk — but it is not a field on the result object.)
+
+**Failure handling** — `ingest()` returns rather than raises; the caller owns errors via
+`stats["errors"]` (each entry has `file` / `error` / `error_type`). Failures are always
+logged at warning level so the "succeeded, 0 files" trap can't hide. Pass
+`raise_on_failure=True` for a `RuntimeError` on any failure.
+
+**Progress** — `on_progress=fn` receives `kind="file_done"` per file and
+`kind="file_progress"` for within-file Vision page progress, so a UI bar isn't frozen
+during a big file. The callback runs on the pipeline thread and its exceptions are
+swallowed (logged) so a buggy callback can't break a run.
+
+**Signals** — as a library, DocIngest installs **no** SIGINT handler, leaving your host's
+Ctrl+C handling intact. The CLI opts in (`install_signal_handler=True`).
+
+**Parse timeout scales with size** — `clamp(base + per_page * pages, base, max)`
+(defaults 120 / 3 / 1800 s, so a 519-page PDF gets ~1677 s and a 10-page memo ~150 s).
+Non-PDFs fall back to the flat `parsing.timeout_sec`. Tune under
+`parsing.dynamic_timeout`.
+
+Desktop GUI: `python -m docingest.gui` (needs `pywebview`; `start_gui.bat` on Windows).
+
+## MCP server
 
 ```bash
-# Free local parse → Azure AI Search, two steps:
+pip install -e ".[mcp]"
+python -m docingest.mcp_server                    # stdio (Claude Desktop / Code, Copilot)
+python -m docingest.mcp_server --transport http   # streamable HTTP
+```
+
+Seven tools, each a thin wrapper over the same Python API: `inspect` · `run` · `refine` ·
+`build_graph` · `query_graph` · `graph_status` · `enrich_chunks` (the four graph tools
+register only when `[graph]` is installed). All accept `config_overrides`.
+
+Browsing or searching the knowledge base is **deliberately not a tool** — agents use
+their own Grep / Read / Glob on the artefacts, starting from the generated
+`knowledge_search.SKILL.md`. Client configuration and troubleshooting:
+[INTEGRATION.md §4](docs/INTEGRATION.md).
+
+**How agents discover the command set:** one catalog, four channels —
+`.claude/skills/docingest/SKILL.md` (Agent Skill, description auto-loads in ~100
+tokens), [AGENTS.md](AGENTS.md), the MCP `instructions` block, and `docingest --help`.
+`tests/unit/test_command_catalog.py` pins that catalog to the source, so a command can't
+change without the table going red.
+
+## Structured extraction (optional)
+
+Where `run` produces *text* and `graph build` produces a *graph*, `extract` produces a
+*table*: one strongly-typed record per document, fields exactly as you declared them.
+It reads the generated `sources/*.md` (or `chunks.jsonl`) — never the original files.
+
+```bash
 docingest run ./docs/ -o ./kb/
-docingest export ./kb/ --to azure-search \
-    --endpoint https://<svc>.search.windows.net --index my-index \
-    --search-key <key> --embed-provider azure-openai \
-    --embed-model my-embed-deployment --embed-dim 1536 \
-    --embed-endpoint https://<res>.openai.azure.com/ --vector-field content_vector
-```
-
-Full usage, credential resolution, library API, and how to create an index live
-in [`src/docingest/azure/README.md`](src/docingest/azure/README.md).
-
-### Structured extraction (optional)
-
-Turn a knowledge base's clean Markdown into **strongly-typed records** — you declare the
-fields you want in a small YAML template, and an LLM fills that schema from each document
-(structured output). Where `docingest run` produces *text* and `graph build` produces a
-*graph*, `extract` produces a *table*: one record per document, fields exactly as you
-defined, ready for a database / spreadsheet / downstream system. It reads the produced
-`sources/*.md` (or `chunks.jsonl`) — never the original documents — and writes
-`extracted/<template>.jsonl`. Opt-in (`docingest.postprocess`); the core `run` pipeline
-never touches it.
-
-```bash
-docingest run ./docs/ -o ./kb/                          # 1. produce the knowledge base
-docingest extract ./kb/ --template doc_summary          # 2. fill the template per document
+docingest extract ./kb/ --template doc_summary
 docingest extract ./kb/ -t ./my_template.yaml --input chunks --parallel 8
 ```
 
-A template is just a field table + extraction rules — change what gets extracted by editing
-YAML, no code. Built-in templates live in `postprocess_templates/`; drop your own there (or
-pass a path) to define a new extraction. Long documents are split, processed in parallel,
-then merged; a per-piece failure is isolated, not fatal.
+A template is a field table plus rules — change what gets extracted by editing YAML, no
+code:
 
 ```yaml
-# postprocess_templates/contract.yaml — extract a contract card
 name: contract
 fields:
   - name: party_a
@@ -402,531 +507,237 @@ rules:
   - Only extract what the text states; never invent.
 ```
 
-Python library:
-
-```python
-import docingest.postprocess               # explicit import — never triggered by `import docingest`
-
-result = docingest.postprocess.run(
-    "./kb/",
-    processor="extract",
-    template="doc_summary",                 # built-in name, project-local name, or a .yaml path
-)
-print(result.units_ok, "/", result.units_total, "documents extracted")
-for r in result.records:
-    print(r["unit_id"], r["record"])        # record matches your template's schema
-```
-
-The LLM is the same one-model-to-rule default as every other task (override with a
-`models.extraction` block, or inject `llm=docingest.GeminiProvider(...)`). All knobs are
-under `postprocess.*` in `config/default.yaml`. Per-flag detail: `docingest extract --help`.
-
-### Python Library
-
-DocIngest exposes a small, stable Python API for use as a dependency of other projects. The public surface is exactly: `ingest`, `inspect`, `refine`, `list_knowledge`, `get_summary`, `IngestResult`, `build_config`, and the Provider classes — everything else under `docingest.*` is internal.
-
-```python
-import docingest
-
-# Minimal — one line
-result = docingest.ingest("./docs/", output="./kb/")
-print(result.stats["successful"], "files processed")
-for md in result.markdown_files:
-    print(md["path"], "→", len(md["content"]), "chars")
-
-# Explicit folder mirror; ordinary ingest remains non-destructive.
-result = docingest.ingest("./docs/", output="./kb/", sync=True)
-print(result.stats["sync"])
-
-# Select only the outputs you need (skips disabled stages entirely)
-result = docingest.ingest(
-    "./docs/",
-    output="./kb/",
-    outputs=["markdown", "chunks"],     # no knowledge_map / quality_report / run_log
-)
-for chunk in result.chunks:
-    embed(chunk["text"])                # feed straight into your RAG pipeline
-
-# Inject LLM credentials without touching env vars / .env
-result = docingest.ingest(
-    "./docs/",
-    output="./kb/",
-    vision=docingest.GeminiProvider(api_key="..."),
-    audio=docingest.DashScopeProvider(api_key="..."),
-)
-
-# Cloud LLM providers — same shape, only the Provider class changes.
-# (Required fields vary by cloud; unset optional fields fall back to
-# ambient credentials — container IAM role / workload identity / etc.)
-
-# Azure OpenAI: deployment-based routing
-result = docingest.ingest(
-    "./docs/", output="./kb/",
-    vision=docingest.AzureOpenAIProvider(
-        model="my-gpt4-deployment",                # Azure deployment name, NOT a model id
-        api_base="https://my-resource.openai.azure.com/",
-        api_version="2024-08-01-preview",
-        api_key="...",                              # or set AZURE_API_KEY
-    ),
-)
-
-# AWS Bedrock: minimal form relies on ambient creds (IAM role on
-# EC2/ECS/EKS, or AWS_* env vars set externally)
-result = docingest.ingest(
-    "./docs/", output="./kb/",
-    vision=docingest.BedrockProvider(
-        model="anthropic.claude-sonnet-4-20250514-v1:0",
-        # aws_access_key_id / aws_secret_access_key / aws_region_name
-        # are all optional — pass them only when not using ambient auth.
-    ),
-)
-
-# Google Vertex AI: project + location mandatory, credentials optional
-# (falls back to GOOGLE_APPLICATION_CREDENTIALS env / gcloud ADC /
-# GKE workload identity if omitted)
-result = docingest.ingest(
-    "./docs/", output="./kb/",
-    vision=docingest.VertexAIProvider(
-        model="gemini-2.5-pro",
-        vertex_project="my-gcp-project",
-        vertex_location="us-central1",
-        # vertex_credentials="/path/to/sa.json"   # optional
-    ),
-)
-
-# Any config/default.yaml value can be overridden per call (flat dot-path
-# form OR nested dict, both work — mix freely)
-result = docingest.ingest(
-    "./docs/",
-    output="./kb/",
-    config_overrides={
-        "parsing.vision.max_pages": 200,
-        "chunking.max_tokens": 1024,
-    },
-)
-```
-
-**Progress callback (optional)** — pass `on_progress=...` to receive progress events. Two kinds: `kind="file_done"` once per file completion (cached / added / updated / failed / skipped), and `kind="file_progress"` for *within-file* progress (Vision page `sub_current/sub_total` while a long file is being enriched, plus a "parsing" busy signal) — so a UI bar isn't frozen during a big file. Old consumers that only handle `file_done` ignore the new kind automatically. Useful when piping progress to a UI or SSE stream. The callback runs synchronously on the pipeline thread; exceptions are swallowed (logged at warning level) so a buggy callback can't break the run:
-
-```python
-def on_event(e):
-    if e["kind"] == "file_progress":          # within-file (Vision pages / parsing)
-        print(f"  └ {e['file']} {e['phase']} {e.get('sub_current')}/{e.get('sub_total')}")
-    else:                                      # file_done
-        print(f"[{e['current']}/{e['total']}] {e['file']} — {e['status']}")
-
-docingest.ingest("./docs/", output="./kb/", on_progress=on_event)
-```
-
-**Signal handling** — by default DocIngest does NOT install a SIGINT handler when used as a library, so embedding it in a long-running host (web server, daemon) leaves your own Ctrl+C handling intact. The CLI opts in to graceful Ctrl+C (`install_signal_handler=True`); library callers can do the same explicitly when running stand-alone.
-
-**Failure handling** — `ingest()` returns rather than raises, so the caller owns error handling via `result.stats["errors"]` (each entry has `file` / `error` / `error_type`). To avoid the "succeeded, 0 files" trap, failures are **always logged at warning level** even on the library path. Pass `raise_on_failure=True` to instead get a `RuntimeError` whenever any file fails (parse error, timeout, …):
-
-```python
-# Hard-fail on any error instead of inspecting stats yourself
-docingest.ingest("./docs/", output="./kb/", raise_on_failure=True)
-```
-
-**Parse timeout scales with size** — a single flat per-file timeout is wrong at both ends, so the parse budget is sized by page count: `clamp(base_sec + per_page_sec * pages, base_sec, max_sec)` (defaults 120 / 3 / 1800 → a 519-page PDF gets ~1677 s, a 10-page memo ~150 s). Page count is probed cheaply for PDFs; non-PDFs or probe failures fall back to the fixed `parsing.timeout_sec`. Tune or disable under `parsing.dynamic_timeout` in `config/default.yaml`.
-
-**Return value** — `IngestResult` carries the produced artefacts so callers don't have to re-read the output directory:
-
-| Field | Populated when | Shape |
-|---|---|---|
-| `markdown_files` | `"markdown"` in outputs | `[{"path", "content", "metadata"}, ...]` |
-| `chunks` | `"chunks"` in outputs | `[{"id", "text", "metadata"}, ...]` |
-| `index` | `"index"` in outputs | content of `index.json` |
-| `knowledge_map` | `"knowledge_map"` in outputs | parsed `knowledge_map.yaml` |
-| `quality_report` | `"quality_report"` in outputs | parsed `quality_report.json` |
-| `stats` | always | `total_files`, `successful`, `failed`, `token_usage`, `errors`, `warnings`, `quality`, `safety`, `interrupted` |
-| `output_dir` | always | absolute path the run wrote to (handy for later CLI ops) |
-
-(`run_log` is a valid `outputs=` value — it toggles writing `log.md` on disk — but it is not a field on `IngestResult`; the run history lives in the file, not the return object.)
-
-**API stability** — only names re-exported from `docingest/__init__.py` are public. Internal modules (`docingest.pipeline`, `docingest.parsers`, `docingest.chunkers`, hooks, output writers) may change between minor versions.
-
-**Advanced — lower-level API** (use only when you need direct control over parser/chunker instantiation; the facade above covers 95% of use cases):
-
-```python
-from pathlib import Path
-from docingest.config import load_config
-from docingest.parsers import create_parser
-from docingest.chunkers import create_chunker
-from docingest.pipeline import run_pipeline
-
-config = load_config(cli_overrides={"output": {"dir": "./knowledge"}})
-parser = create_parser(config)
-chunker = create_chunker(config)
-result = run_pipeline([Path("./docs")], config, parser, chunker)
-print(f"{result.successful}/{result.total_files} files, {result.total_chunks} chunks")
-```
-
-### How agents discover commands
-
-One command catalog (CLI / graph / MCP, three sections) is the single source of
-truth, surfaced on every channel an agent enters through — so it sees the full
-command set no matter how it calls DocIngest:
-
-- **Agent Skill** `.claude/skills/docingest/SKILL.md` — its frontmatter
-  `description` lists the whole command set and is auto-loaded into context
-  (~100 tokens, zero action), so the agent knows the commands exist before
-  reading anything; the body holds the full table. Agent Skills are an
-  [open standard](https://docs.claude.com/en/docs/agents-and-tools/agent-skills/overview)
-  (Claude.ai / Claude Code / API), so this isn't Claude-Code-specific.
-- **AGENTS.md** — same table at the top, for agents reading the repo directly
-  or environments without skill support.
-- **MCP `instructions`** — the at-a-glance tool list, for MCP callers.
-- **`docingest --help`** — the command set at the top, for shell/agent callers.
-
-Disclosure is progressive: the skill `description` (≈100 tokens, always) → the
-full table in `SKILL.md` / AGENTS.md (on demand) → `docingest <cmd> --help` for
-per-flag detail. The catalog is hand-written but pinned to the code by
-`tests/unit/test_command_catalog.py`, which asserts the documented command set,
-`--strategy` values, and `refine` default match the source — change a command
-without updating the table and the test goes red.
-
-> Not to be confused with `skills/refine_*.SKILL.md` (LLM prompts for the
-> `refine` command) or the generated `<output>/knowledge_search.SKILL.md`
-> (a per-knowledge-base search guide for downstream agents) — both reuse the
-> `SKILL.md` filename but are unrelated to the Agent Skill above.
-
-### MCP Server (for AI Agents)
-
-Thin MCP wrapper exposing DocIngest as tools for AI agents. `mcp_server.py` is a transport layer only — every tool is a ~10-line wrapper around the corresponding Python API, so MCP and library callers share identical behaviour.
-
-```bash
-pip install -e ".[mcp]"
-python -m docingest.mcp_server                    # stdio (Claude Desktop / Code, VS Code Copilot)
-python -m docingest.mcp_server --transport http   # Streamable HTTP (web clients)
-```
-
-**Tools** (each accepts optional `config_overrides`):
-
-| Tool | Purpose |
-|---|---|
-| `inspect` | Pre-flight check (size, pages, cost estimate) |
-| `run` | Process documents → knowledge base |
-| `refine` | AI-powered Markdown cleanup |
-| `build_graph` / `query_graph` / `graph_status` / `enrich_chunks` | Graph layer — registered only when `[graph]` extras are installed |
-
-Browsing / searching the knowledge base is **deliberately NOT an MCP tool** — DocIngest is a preprocessing engine, not a retrieval engine. Agents use their own native Grep / Read / Glob on the artefacts (`sources/*.md`, `index.json`, `chunks.jsonl`); each knowledge base ships an auto-generated `knowledge_search.SKILL.md` with the corpus summary, file index, and a language-routed search protocol to read first.
-
-**Client configuration** (Claude Desktop / Claude Code / VS Code Copilot), the agent workflow, per-call `config_overrides`, and troubleshooting are in [INTEGRATION.md §4 (Agent via MCP)](docs/INTEGRATION.md). To add a tool, see ARCHITECTURE.md §3.3.
+Built-ins live in `postprocess_templates/`; drop your own there or pass a path. Long
+documents are split, processed in parallel, and merged; a per-piece failure is isolated,
+not fatal. From Python, `import docingest.postprocess` explicitly (`import docingest`
+never triggers it) and call `docingest.postprocess.run(kb, processor="extract",
+template=...)`.
 
 ## GraphRAG (optional)
 
-Build an entity / relation knowledge graph on top of an existing knowledge base, then run global / local / hybrid queries via [LightRAG](https://github.com/HKUDS/LightRAG). **Strictly opt-in** — `docingest run` never touches it, and the import path `docingest.graph` only loads when explicitly imported.
+An entity/relation knowledge graph over an existing knowledge base, with global / local
+/ hybrid queries via [LightRAG](https://github.com/HKUDS/LightRAG). Strictly opt-in —
+`run` never touches it, and `docingest.graph` only loads when explicitly imported.
 
-This section covers **how to use** the graph layer. For the architecture (module
-boundaries, three-tier caching, why LightRAG, the `Communities = 0` behaviour on
-LightRAG ≥ 1.4, swapping backends), see [ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-graphrag-子模块docingestgraph可选).
+**More expensive than Vision.** Use it for "themes / relationships / multi-hop across
+the corpus" questions; for single-fact lookup, plain grep over `sources/*.md` is cheaper
+and better.
 
 ```bash
-# 1. Install the optional extras (LightRAG + OpenAI embedding client)
 pip install -e ".[graph]"
-
-# 2. Process documents as usual
 docingest run ./docs/ -o ./kb/
-
-# 3. Build the graph on top of the knowledge base
-docingest graph build ./kb/                          # full mode (default)
-docingest graph build ./kb/ --mode vector_only       # cheap: skip community detection
-
-# 4. Query
-docingest graph query "整个语料的主要主题是什么？" --kb ./kb/ --mode global
-docingest graph query "X 和 Y 什么关系？"            --kb ./kb/ --mode local
-docingest graph query "comprehensive answer please" --kb ./kb/ --mode hybrid
-docingest graph status ./kb/                         # entity / relation / community counts
+docingest graph build ./kb/                        # full mode (default)
+docingest graph build ./kb/ --mode vector_only     # cheap: skip community detection
+docingest graph query "What are the main themes?" --kb ./kb/ --mode global
+docingest graph status ./kb/
 ```
 
-Two retrieval modes:
-
-| Build mode | Cost | Query modes available | Best for |
+| Build mode | Cost | Query modes it allows | Best for |
 |---|---|---|---|
-| `vector_only` | Cheap (skips community summary LLM calls) | `naive`, `local` | Single-fact / two-hop questions |
-| `full` (default) | Higher (per-community LLM summary) | `naive`, `local`, `global`, `hybrid`, `mix` | Multi-hop reasoning, "main themes / trends" |
+| `vector_only` | cheap (no community-summary LLM calls) | `naive`, `local` | single-fact / two-hop |
+| `full` *(default)* | higher (per-community LLM summary) | `naive`, `local`, `global`, `hybrid`, `mix` | multi-hop, "main themes" |
 
-Python library:
+Artefacts land in `./kb/graph/`; deleting that folder leaves the rest intact. Extraction
+is incremental — chunks whose content + LLM-config hash is unchanged are skipped.
+Embedding providers (`OpenAIEmbedding` / `GeminiEmbedding` /
+`SentenceTransformerEmbedding`) are independent of the main pipeline's providers, so the
+graph can use a small cheap model without affecting `run`.
 
-```python
-import docingest
-import docingest.graph                 # explicit import — never triggered by `import docingest`
+**Boost ordinary vector RAG with graph entities.** `graph build --enrich-chunks` (or
+`graph enrich <kb>` later) writes a sibling `chunks_enriched.jsonl` with each chunk's
+top entities injected into both the text (helps embedding recall on synonyms) and
+`metadata.entities` (for hybrid / filtered retrieval). **The original `chunks.jsonl` is
+never modified** (hash-checked by tests), and no LLM or embedding calls are made — it's
+a pure replay over on-disk graph data (~35 ms for 44 chunks). Delete the enriched file
+any time to drop back.
 
-# Build (incremental — second run reuses cache for unchanged chunks)
-result = docingest.graph.build(
-    "./kb/",
-    mode="full",
-    llm=docingest.OpenAIProvider(api_key="...", model="gpt-5.4-mini"),
-    embedding=docingest.graph.OpenAIEmbedding(
-        api_key="...",
-        model="text-embedding-3-small",
-        dimension=1536,
-    ),
-    config_overrides={"graph.lightrag.entity_extract_max_gleaning": 2},
-)
-print(result.entities_count, "entities,", result.relations_count, "relations")
+**Speed vs. recall — two knobs.** `graph.lightrag.entity_extract_max_gleaning` defaults
+to `0` (LightRAG's own default is 1): for structured input — DB sheets, API specs,
+contracts — one pass already captures 95%+ of entities, halving the LLM bill. Raise it
+to 1 for prose / academic / legal corpora where the first pass misses 10–15% of edge
+entities. `graph.lightrag.max_parallel_insert` (default 4) trades RPM for wall-clock.
 
-# Query
-answer = docingest.graph.query(
-    "What are the main themes across the corpus?",
-    knowledge_dir="./kb/",
-    mode="hybrid",
-)
-print(answer.answer)
-```
+<details>
+<summary><b>Known issue — repeated <code>query()</code> in one Python process</b></summary>
 
-Outputs land under `./kb/graph/` (LightRAG's working_dir layout); deleting the folder leaves the rest of the knowledge base intact. Extraction is incremental — chunks whose content + LLM config hash hasn't changed since last build are skipped.
+LightRAG 1.4's internal `asyncio.Lock` binds to the first event loop, so a fresh
+`asyncio.run()` per call fails on the 2nd+ invocation with "Lock bound to a different
+event loop".
 
-Embedding providers (`docingest.graph.OpenAIEmbedding` / `GeminiEmbedding` / `SentenceTransformerEmbedding`) are independent from the main pipeline's Vision / ASR providers — pick a small / cheap model just for graph extraction without affecting `docingest run`. Sentence-transformers (`pip install -e ".[graph-local]"`) gives zero-API-cost local embeddings.
+| Entry point | Status |
+|---|---|
+| CLI | ✅ Each invocation is a fresh subprocess — nothing to do |
+| MCP server | ✅ Auto-fixed: the MCP entry point applies `nest_asyncio` |
+| Python library | 🟡 Not auto-fixed (we won't monkey-patch a host's asyncio). Either call `nest_asyncio.apply()` yourself, or use one subprocess / one call per process |
 
-**Credential resolution order** (highest wins):
+When it bites, the empty answer surfaces as `result.stats["error"]` with a descriptive
+message — detectable programmatically, just not recoverable without the workaround.
+</details>
 
-1. Explicit `Provider(api_key="...")` argument
-2. Environment variable (e.g. `OPENAI_API_KEY`, `GEMINI_API_KEY`)
-3. `.env` file in the working directory (auto-loaded **on the CLI path only**)
+<details>
+<summary><b>Credential resolution order (graph layer)</b></summary>
+
+1. Explicit `Provider(api_key="...")`
+2. Environment variable (`OPENAI_API_KEY`, `GEMINI_API_KEY`, …)
+3. `.env` in the working directory — **CLI path only**
 4. YAML config
 
-**Library callers** (`docingest.graph.build(...)`) do NOT auto-load `.env` — by design, so embedding DocIngest into a long-running host doesn't pollute the process environment. If you want `.env` behaviour from the library, call `load_dotenv()` yourself before invoking the facade, or pass keys via Provider objects.
+Library callers do **not** auto-load `.env`, by design: embedding DocIngest in a
+long-running host shouldn't pollute the process environment. Call `load_dotenv()`
+yourself or pass Provider objects.
+</details>
 
-**Known issue — repeated `query()` in the same Python process.** LightRAG 1.4's internal `asyncio.Lock` is bound to the first event loop, so a fresh `asyncio.run()` per call (which is what `docingest.graph.query()` does) fails on the 2nd+ invocation with "Lock bound to a different event loop". We handle this differently per entry point:
+## Other integrations
 
-| Entry point | Multiple calls per process? | Status |
-|---|---|---|
-| **CLI** (`docingest graph query`) | No — each invocation is a fresh subprocess | ✅ Just works, nothing to do |
-| **MCP server** (`build_graph` / `query_graph` tools) | Yes — long-running server, agents call repeatedly | ✅ Auto-fixed: the MCP entry point applies `nest_asyncio` so subsequent `asyncio.run()` calls reuse the existing loop. Agents see no difference |
-| **Python library** (`docingest.graph.query(...)`) | Depends on caller | 🟡 Not auto-fixed (we don't want to monkey-patch host's asyncio). Three workarounds: (1) call `nest_asyncio.apply()` yourself before looping over queries; (2) spawn one subprocess per query; (3) issue a single call per process |
+**LangChain** (`pip install -e ".[langchain]"`) — load a knowledge base's chunks straight
+into LangChain instead of re-splitting with a naive character splitter. Since LangChain
+already bridges dozens of vector stores, this one adapter connects DocIngest to all of
+them. Pulls only `langchain-core`:
 
-When the bug DOES bite (library path without workaround), the empty answer is surfaced as `result.stats["error"]` with a descriptive message — you can detect failure programmatically, you just can't recover from it without the workaround.
+```python
+from docingest.integrations.langchain import DocIngestLoader
+docs = DocIngestLoader("./knowledge/").load()   # -> list[Document]
+vectorstore.add_documents(docs)
+```
 
-### Boost traditional RAG with graph entities (`chunks_enriched.jsonl`)
-
-GraphRAG queries are great, but most teams already have a vector RAG pipeline they want to keep. The optional **chunk enrichment** stage feeds the graph's extracted entity names + descriptions back into a NEW jsonl file — giving your existing vector RAG a precision boost without rewriting it.
+**Azure** (`pip install -e ".[azure]"`) — two independent capabilities; the core pipeline
+never imports either. (1) `parsing.engine: azure_di` parses in Azure Document
+Intelligence instead of local docling, with zero local parse memory pressure. (2)
+`docingest export` embeds chunks with your own model and pushes them into an Azure AI
+Search vector index, preserving DocIngest's chunks instead of letting Azure re-chunk:
 
 ```bash
-# Either as a follow-up of build:
-docingest graph build ./kb/ --enrich-chunks
-
-# Or standalone (graph already built earlier):
-docingest graph enrich ./kb/
+docingest export ./kb/ --to azure-search \
+    --endpoint https://<svc>.search.windows.net --index my-index \
+    --embed-provider azure-openai --embed-model my-embed-deployment --embed-dim 1536 \
+    --embed-endpoint https://<res>.openai.azure.com/ --vector-field content_vector
 ```
 
-What it does:
-- Reads `graph/vdb_entities.json` and the chunk-id map (no LLM calls).
-- For each chunk, picks the top-N most relevant entities (entities that occur **only** in this chunk are prioritised, then shorter names — longer names tend to be doc-level boilerplate).
-- Writes a sibling `chunks_enriched.jsonl` with two channels of enrichment:
-  - **Text channel** — injects `[关键实体: 敷金 — 預かり金として扱われる費用; ...]` right after the `[来源: ...]` header. Pure vector RAG benefits because the embedding model now sees explicit anchors for the entities, easing synonym recall ("修繕費" finds the chunk where the entity description mentions "修繕" even though the surface form differs).
-  - **Metadata channel** — adds `metadata.entities = [{"name", "description", "exclusive"}, ...]`. Hybrid / metadata-filtered RAG (Qdrant `WHERE entities CONTAINS '敷金'`, BM25+vector) can use this directly.
+Field names and embedding are injectable, and the dimension is verified before upload.
+Full detail: [`src/docingest/azure/README.md`](src/docingest/azure/README.md).
 
-Invariants:
-- **The original `chunks.jsonl` is NEVER modified.** Hash-checked by tests.
-- **No LLM / embedding calls** during enrichment — pure replay over on-disk graph data. 44 chunks ≈ 35 ms.
-- Re-running replaces (not stacks) the previous injection. Deterministic output for the same input.
-
-Tune via config:
-```yaml
-graph:
-  enrich_chunks:
-    enabled: false                # default OFF
-    max_entities_per_chunk: 5
-    max_description_length: 100
-    inject_into_text: true
-    inject_into_metadata: true
-```
-
-### Speed vs. precision — two knobs
-
-Graph build is dominated by LLM calls during entity extraction. Two YAML knobs trade speed against recall:
-
-```yaml
-graph:
-  lightrag:
-    entity_extract_max_gleaning: 0  # 0 (DocIngest default): skip the 2nd extraction pass.
-                                    # Raise to 1 for prose / academic / legal corpora where
-                                    # the first pass misses ~10-15% of edge entities (doubles cost).
-    max_parallel_insert: 4          # chunks processed in parallel (LightRAG's own default is 2).
-                                    # 6-8 if your LLM tier has high RPM; 1-2 on a shared tier-1 key.
-```
-
-DocIngest defaults gleaning to **0** (vs LightRAG's 1) because the typical input is structured (DB sheets, API specs, contracts) where one pass already captures 95%+ of entities — halving the LLM bill with no precision loss. Raise it for free-flowing prose. (~50-chunk corpus: 2-3 min at these defaults vs 6-8 min at LightRAG's.)
-
-## Configuration
-
-Four layers, highest wins:
-
-```
-CLI args  >  environment variables  >  project docingest.yaml  >  config/default.yaml
-```
-
-### YAML
-
-[`config/default.yaml`](config/default.yaml) is the single source of truth — every
-knob is there with inline comments. Drop a `docingest.yaml` in your project root to
-override only what you need (everything else inherits the default). A taste:
-
-```yaml
-chunking:
-  strategy: "heading"             # auto | heading | recursive | slide | sheet | timestamp | whole
-  max_tokens: 1024
-
-models:
-  defaults:
-    primary: { provider: "google", model: "gemini-3-flash-preview" }
-    # One model for every text/vision task; override a single task under its own key.
-
-parsing:
-  vision:
-    image_dpi: 200
-    triage: { enabled: true }     # skip pure-text pages → saves Vision API cost
-
-sanitize:
-  enabled: false                  # PII masking (email / card / IP / phone), default OFF
-```
-
-The most-tuned sections — `chunking.heading.*` / `chunking.protection.*` (merge & overflow
-policy), per-format `parsing.<pdf|xlsx|pptx>.vision.*` overrides, `models.*` retry/token
-budgets — are all documented inline in `config/default.yaml`. Read it there rather than
-duplicating the full reference here.
-
-### Environment variables
-
-Any config value can be overridden by `DOCINGEST__<path>` env variables (double
-underscore separates levels):
-
-```bash
-export DOCINGEST__chunking__max_tokens=1024
-export DOCINGEST__models__vision__primary__model=gemini-3-pro-preview
-export DOCINGEST__parsing__audio__language=ja
-```
-
-## Pipeline at a Glance
+## How it works
 
 ```
 input files / dirs / URLs / ZIPs
       │
-      ▼
-discover_files  (ZIP expansion, yt-dlp for URLs)
+      ▼  discover_files (ZIP expansion, yt-dlp for URLs)
+      ▼  Phase 0.5: legacy .xls/.doc/.ppt → OOXML via LibreOffice
+      ▼  partition by incremental cache (skip unchanged)
       │
-      ▼
-Phase 0.5: legacy .xls/.doc/.ppt → .xlsx/.docx/.pptx via LibreOffice
-            (opt-out: parsing.<xls|doc|ppt>.auto_convert_to_*)
+      ├─ per new file ─────────────────────────────────────────────┐
+      │   pre_parse hook       DOCX OMML → LaTeX                   │
+      │   parse                Docling / Media / Text              │
+      │     ↳ xlsx pre-route   openpyxl renderer (per-sheet        │
+      │                        headings, merged cells anchor-only) │
+      │   garbled fallback     glyph< → pymupdf                    │
+      │   page render          xlsx/docx/pptx → PDF → screenshots  │
+      │   post_parse hook      PPTX chart direct-read              │
+      │   Vision enrichment    per-page, 10-layer triage, parallel │
+      │   pre_write hook       exiftool / sanitize                 │
+      │   write                sources/*.md + assets/              │
+      │   chunk + path-inject  auto/heading/slide/sheet/timestamp  │
+      └────────────────────────────────────────────────────────────┘
       │
-      ▼
-partition by incremental cache  (skip unchanged files)
-      │
-      ▼
-for each new file:
-      ├─ pre_parse hook        DOCX OMML → LaTeX
-      ├─ Docling / Media / Text
-      │     ↳ xlsx pre-route: openpyxl renderer (default ON) —
-      │       per-sheet headings, merged-cell anchor-only, empty
-      │       columns pruned. Bypasses Docling's Excel backend to
-      │       guarantee correct title_path on chunks.
-      ├─ garbled fallback      glyph< → pymupdf
-      ├─ Excel denoise         merged cells, sparse rows
-      ├─ LibreOffice pages     xlsx/docx/pptx → PDF → screenshots
-      ├─ post_parse hook       PPTX chart direct-read
-      ├─ Vision enrichment     per-page, 10-layer triage, parallel; format-split
-                                supplement/full — xlsx supplements visuals only
-                                (no table re-transcribe), PDF/PPT full whole-page
-      ├─ pre_write hook        exiftool / sanitize
-      ├─ Vision dedup          OFF by default — duplication is already removed at
-                                the source by the format-split supplement above;
-                                this old length-ratio post-pass stays opt-in
-                                (output.dedup.enabled)
-      ├─ write sources/*.md    + assets/
-      └─ chunk + path-inject   auto / heading / slide / sheet / timestamp
-      │
-      ▼
-index.json + chunks.jsonl + knowledge_map.yaml + quality_report.json
-      │
-      ▼  (OPTIONAL, opt-in via `docingest graph build` — see GraphRAG section)
-LightRAG entity / relation extraction → graph/  (graphml + entity vdb + chunk vdb)
+      ▼  index.json + chunks.jsonl + knowledge_map.yaml + quality_report.json
+      ▼  (opt-in) graph build → graph/
 ```
 
-See [ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full Phase breakdown, design rationale, and how to add new formats / hooks / chunkers. The optional graph layer is documented in [ARCHITECTURE.md §10](docs/ARCHITECTURE.md#10-graphrag-子模块docingestgraph可选).
+Full phase breakdown, design rationale, and how to add formats / hooks / chunkers:
+[ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Key Features
+## Capabilities
 
-- **20+ formats** via Docling (PDF, DOCX, PPTX, XLSX, HTML, images, Markdown, ...)
-- **Audio/video transcription** — subtitle-first (SRT/VTT, zero API cost), Qwen3-ASR-Flash default, OpenAI Whisper fallback. Long audio auto-segmented.
-- **Native video understanding** (default for video) — send the WHOLE video to a video-capable model in ONE call instead of sampling frames: the model watches the frames AND listens to the audio in a single pass, returning a timeline-aligned transcript + on-screen description (URLs, typed prompts, button labels, captions). Measured on a 100 s screencast vs the frame-sampling path: **1 API call vs 10, ~11K tokens vs ~50K, far fewer `[unreadable]` markers** (the model sees the real video stream, not shrunk-down single frames). Auto-selects transport by size (base64 inline < 20 MB, Files API above). **Default ON** (the default Vision provider is Gemini, so it works out of the box); Gemini-only today, other providers / a missing SDK **degrade to frame sampling** automatically. Subtitles still win when present. Turn off with `parsing.audio.native_video.enabled: false`.
-- **Video frame understanding** (fallback path) — used when native video is off, the provider can't do it, or the call fails: the audio track is transcribed via ASR and frames are sampled with ffmpeg, then fed through the same per-page Vision step (slides / charts / on-screen UI become searchable text), spliced into the transcript by timestamp. Frame count capped like a text doc of equal length; near-uniform solid-colour frames (black / blank slates) are skipped before Vision to save cost. Config under `parsing.audio.video_frames`.
-- **Video URL support** — YouTube, Bilibili, and 1000+ platforms via yt-dlp. Auto subtitle + metadata extraction.
-- **ZIP archive expansion** — recursive unpacking with Japanese filename recovery, bomb protection.
-- **Per-page Vision AI** — AI decides per page: clean up text / describe charts / OCR scan. Parallel execution, cached by content hash.
-- **Format-aware Vision supplement** — xlsx (rendered cleanly by openpyxl) lets Vision SUPPLEMENT only the visual content (charts / pictures / stamps) and never re-transcribe the table, removing the Docling↔Vision duplication **at the source** (measured: per-section re-transcription 65–92% → 0–5%, and body text is never dropped because it lives in the openpyxl render the supplement can't touch). PDF/PPT stay on full whole-page transcription — Docling fragments their 方眼紙 tables, so they need it to recover the body. Per-format via `parsing.<format>.vision.supplement_only` (global default off, xlsx on).
-- **PPTX chart direct-read** — python-pptx extracts chart data (categories, series, values) as 100% accurate Markdown tables. Vision supplements with visual context.
-- **DOCX math equations** — OMML → LaTeX preprocessing before Docling parses. `$E=mc^{2}$` instead of garbled text.
-- **Smart chunking** — auto strategy by format (heading/recursive/slide/sheet/timestamp). CJK-aware token estimation. Protected blocks with per-type overflow control (tables, code, lists) and per-type `on_overflow` strategy — oversized Markdown tables are split at data-row boundaries with the header repeated in every sub-chunk, and oversized lists split at item boundaries before falling back to recursive splitting for a single huge item. Single-pass heading merge (prelude + orphan-heading + small-section policies) produces zero-fragment chunks with the deepest-available title_path. Adjacent byte-identical chunks auto-deduplicated. All behaviour is config-driven — every knob in `chunking.heading.*` and `chunking.protection.*`.
-- **Excel via openpyxl (default)** — xlsx is rendered by `openpyxl` instead of Docling: every sheet's body lives under its own `## SheetName` heading (so chunk `title_path` always points at the right sheet), merged cells stay anchor-only (no N×N value duplication), entirely-empty columns are pruned out of wide layouts. Embedded pictures pasted into cells (PNG/JPEG/GIF/BMP/TIFF/WebP **and** EMF/WMF — read directly from the xlsx OOXML structure, bypassing openpyxl's silent EMF drop) are anchored to their actual row with a `<!-- image: <filename> -->` marker so Vision triage can pick them up and downstream RAG / Agentic Search can locate them. Falls back to Docling automatically if openpyxl is unavailable or the workbook can't open. Disable via `parsing.xlsx.use_openpyxl_renderer: false`.
-- **Excel denoising** — merged-cell dedup, sparse row cleanup, embedded image extraction.
-- **Legacy Office support (`.xls` / `.doc` / `.ppt`)** — pre-2007 binary Office files are auto-converted to their modern OOXML form (`.xlsx` / `.docx` / `.pptx`) via LibreOffice as Phase 0.5, then routed through the full modern-format path (Docling / openpyxl renderer + Vision + chunking). Docling rejects the binary forms outright, so this conversion is what makes them work at all. The original filename / mimetype / mtime are preserved in `metadata.lineage.original_input`, and a `format_convert` entry is recorded in `metadata.lineage.transformations`. Conversion result is cached at `.cache/_legacy_convert/<sha256>.<ext>` so the same file converts exactly once per output dir. LibreOffice missing → warning + degrades to TextParser fallback (the pipeline never raises). Disable per format via `parsing.<xls|doc|ppt>.auto_convert_to_*: false`.
-- **Content-based format detection** — magika ML model identifies files with weak/missing extensions.
-- **Anti-hallucination Vision** — `[?]` for partial reads, `[unreadable]` for gaps. Post-run quality report.
-- **Vision triage** — per-page analysis skips pure-text pages, saving 30-60% Vision API cost with zero info loss. Ten-layer defence for damaged pages: `glyph<` / `&lt;` CID markers, U+FFFD ratio, complex-table density, CJK mixed-script anomaly, **language-script consistency** — catches CMap failures that produce CLEAN but WRONG Unicode (e.g. Bengali/Thai/Tibetan chars on a Japanese-declared document; the other checks miss this because the output is legal Unicode) — and **Latin-script cipher garble** (a broken CMap mapping each glyph to a *different* legal Latin letter, caught by an abnormally low vowel ratio). Whitelist per language (ja/zh/en/ko by default), add a language = edit `parsing.vision.triage.language_script_check.expected_scripts` — no code change. Default ON (`parsing.vision.triage.enabled`).
-- **Bounding boxes** — per-element PDF coordinates extracted from Docling for RAG source citation and highlighting. Exposed per file in `index.json` (`files[].element_boxes[<page_no>] = [{label, bbox, text_preview}, ...]`); RAG apps look them up by matching `chunk.metadata.source` → index entry. Toggle via `output.include_bounding_boxes`.
-- **Per-page image paths (vision_only)** — when `--engine vision_only` renders every page to a screenshot, `index.json` records `files[].page_image_paths` (`{page_no: "assets/<stem>-page-NNN.png"}`) alongside `page_sizes`. A downstream visual / image-RAG consumer (e.g. a pixel-native retriever) can locate each page's image without re-deriving the filename pattern — DocIngest keeps producing text as the primary output, but the rendered pages are now first-class, discoverable artefacts too. The Docling engine doesn't emit this (its page images are an internal Vision input, not a promised artefact). The generated `knowledge_search.SKILL.md` adds a one-line pointer when such images exist.
-- **Parse visualization** — `docingest visualize <kb>` draws those element boxes onto the rendered page images (colored by label, optional reading-order numbers) for QA / debugging. PIL on PNG; scales bboxes via the per-page `page_sizes` now stored in `index.json` (falls back to render-DPI for KBs built earlier).
-- **Repeating-furniture dedup** — opt-in `pre_write` hook collapses per-page furniture Vision transcribed (e.g. a `DocuSign Envelope ID` repeated on every page) down to its first copy — never deletes every copy, so no unique content is lost. Default OFF (`hooks.strip_repeating.enabled`).
-- **LangChain integration** — `DocIngestLoader` (opt-in `[langchain]` extra) maps `chunks.jsonl` → LangChain `Document`, bridging DocIngest to any LangChain vector store / retriever (Azure AI Search, Bedrock, Pinecone, ...) while reusing its semantic chunks. Pulls only `langchain-core`.
-- **Azure plugin** — opt-in `[azure]` plugin (`docingest.azure`) with two independent capabilities: a cloud parse backend (`parsing.engine: azure_di`, zero local parse memory pressure) and a generic chunks → Azure AI Search exporter (`docingest export`, bring-your-own embedding, injectable field map, dimension-checked). Core `run` never imports it; SDKs load only on use. Default OFF.
-- **Chunk lineage** — every chunk in `chunks.jsonl` carries a `metadata.lineage` sub-dict recording `source_markdown`, `original_input` (filename / mimetype / binary_hash / last_modified), and an ordered `transformations` array of what actually shaped it (parser → hooks → vision → chunker). Disabled features (e.g. sanitize.enabled=false) and triaged-out Vision pages are NOT recorded — lineage is a positive provenance trail for RAG citation / quality attribution / reproducibility, not a debug log. Existing flat metadata fields (`source`, `original_file`, `format`, `language`, `title_path`, …) are preserved unchanged for backwards compatibility.
-- **Hidden text detection** — flags invisible/background content via Docling ContentLayer analysis.
-- **Sensitive data sanitization** — opt-in PII masking (email, URL, credit card with Luhn validation, IPv4, JP phone). High-precision rules only, no name detection. Default OFF (`sanitize.enabled`).
-- **Incremental cache** — content-addressed, per-file, crash-safe. 100 docs + 1 new → only 1 re-runs.
-- **AI Refine** — standalone `refine` command for human-readable output with Mermaid flowcharts.
-- **Template-driven structured extraction** — opt-in `docingest extract` (`docingest.postprocess`) fills a YAML-declared Pydantic schema from each document via LLM structured output → one strongly-typed record per doc in `extracted/<template>.jsonl`. Change the fields by editing YAML, no code. Long docs are split + processed in parallel + merged; per-piece errors isolated. No extra deps (litellm + pydantic only). The core `run` pipeline never imports it.
-- **Knowledge Map** — auto-generated search guide + keyword reverse index. Optional SudachiPy integration for high-precision Japanese keyword extraction (language-routed: Japanese → SudachiPy, Chinese/Korean/English → regex).
-- **Multi-provider** — Gemini / OpenAI / Anthropic / DashScope with automatic fallback.
-- **Network-level retry** — every LLM call (Vision / text completion / ASR) passes `num_retries` to litellm, which applies exponential backoff on transient errors (rate limits, 5xx, TCP resets). Default 2 retries via `models.defaults.max_retries`; per-task override (e.g. `models.vision.max_retries: 5` for a flaky endpoint). Orthogonal to truncation retry (`retry_on_truncation`) which sits at the application layer.
-- **Wall-clock timeouts** — bounded parse and Vision calls so a single hung file can't stall the run. `parsing.timeout_sec` (default 600s) caps Docling per file; `models.vision.timeout_sec` (default 180s) caps each Vision page call. On timeout the file is recorded as failed with `error_type: "timeout"` in `errors.json` and the pipeline continues. Set either to `null` to disable.
-- **Graceful interrupt** — Ctrl+C between files lets the current file finish, then writes `chunks.jsonl` / `index.json` / `knowledge_map.yaml` for everything completed so far and exits with code 130. Rerun resumes from the incremental cache. Press Ctrl+C twice for a hard exit.
-- **Classified errors** — `errors.json` entries carry an `error_type` field (`timeout` / `parse_error` / `chunk_error` / `io_error` / `interrupted` / `unknown`) so downstream consumers can branch without grepping the message.
-- **Per-format Vision overrides** — `parsing.<pdf|pptx|docx|xlsx>.vision` shallow-merges over the global Vision config to tune `model` / `max_response_tokens` / `image_dpi` per format. Raise DPI for dense PDFs, cap output for content-light PPTs, swap models for scans — without affecting other formats. Unset fields fall through to global.
-- **Cross-platform binary finder** — auto-discovers LibreOffice, ffmpeg, yt-dlp, exiftool on Windows/macOS/Linux standard paths.
-- **Config-driven** — all thresholds, strategies, models in YAML. No hardcoding.
+Everything below is config-driven — the knob for each is in `config/default.yaml`.
 
-## Project Layout
+**Formats.** 20+ via Docling (PDF, DOCX, PPTX, XLSX, HTML, images, Markdown, …).
+Legacy `.xls` / `.doc` / `.ppt` are auto-converted to OOXML via LibreOffice first
+(Docling rejects the binary forms outright), with the original filename / mimetype
+preserved in `metadata.lineage`. ZIP archives unpack recursively with Japanese filename
+recovery and bomb protection. magika identifies files with weak or missing extensions.
 
-See [ARCHITECTURE.md §3.1](docs/ARCHITECTURE.md) for the full annotated directory tree and §3.2 for a "I want to look at X → find it at Y" quick-navigation table.
+**Excel is rendered by openpyxl, not Docling** (default) — every sheet's body sits under
+its own `## SheetName` heading so chunk `title_path` always points at the right sheet;
+merged cells stay anchor-only instead of duplicating N×N; empty columns are pruned.
+Embedded pictures (including EMF/WMF, read straight from OOXML to bypass openpyxl's
+silent drop) are anchored to their real row with an `<!-- image: -->` marker so Vision
+can pick them up. This is the project's core competence: Japanese 方眼紙 spec sheets.
 
-## Testing
+**Audio & video.** Subtitle-first (SRT/VTT, zero API cost), then Qwen3-ASR-Flash with
+Whisper fallback; long audio auto-segmented. For video the default is **native video
+understanding** — the whole file goes to a video-capable model in one call, so it watches
+frames *and* hears audio together (measured on a 100 s screencast: 1 API call vs 10,
+~11K tokens vs ~50K, far fewer `[unreadable]` markers). Gemini-only today; other
+providers degrade automatically to frame sampling + ASR. YouTube / Bilibili / 1000+
+platforms via yt-dlp.
 
-All suites below pass cleanly on every supported platform. Run them after any
-change to verify no regression.
+**Per-page Vision AI.** The model decides per page: clean up text, describe charts, OCR
+a scan. Parallel, cached by content hash. **Triage** skips pure-text pages for 30–60%
+savings with no information loss, and has ten layers of defence for damaged pages —
+including language-script consistency (catches CMap failures that produce *clean but
+wrong* Unicode, e.g. Bengali glyphs on a Japanese document) and Latin cipher garble
+(detected by an abnormally low vowel ratio). **Anti-hallucination is explicit**: the
+model marks `[?]` for partial reads and `[unreadable]` for gaps, and
+`quality_report.json` scans the output for them afterwards.
+
+**Format-aware Vision supplement.** For xlsx — already rendered cleanly by openpyxl —
+Vision only *supplements* the visual content (charts, stamps, pictures) and never
+re-transcribes the table, killing Docling↔Vision duplication at the source (measured:
+per-section re-transcription 65–92% → 0–5%). PDF and PPT stay on full whole-page
+transcription because Docling fragments their grid tables.
+
+**Chunking.** Strategy auto-selected per format (heading / recursive / slide / sheet /
+timestamp / whole), CJK-aware token estimation. Protected blocks with per-type overflow
+policy: oversized tables split at data-row boundaries with the header repeated in every
+sub-chunk, oversized lists split at item boundaries. Single-pass heading merge produces
+zero-fragment chunks carrying the deepest available `title_path`. Eligible chunks also
+carry a `metadata.locator` pointing back to the original unit —
+`{"kind":"page","start":3,"end":4}`, `{"kind":"slide","index":6}`,
+`{"kind":"sheet","name":"売上集計"}`, `{"kind":"time","start_seconds":120,...}`. PDF
+ranges are emitted only when every expected pagebreak survived chunking; otherwise
+DocIngest warns and omits rather than guessing.
+
+**Provenance.** Every chunk carries `metadata.lineage`: `source_markdown`,
+`original_input` (filename / mimetype / binary hash / mtime), and an ordered
+`transformations` array of what actually shaped it. Disabled features aren't recorded —
+it's a positive provenance trail for citation and reproducibility, not a debug log.
+`index.json` additionally exposes per-element PDF bounding boxes
+(`files[].element_boxes`) for source highlighting, and under `vision_only` also
+`files[].page_image_paths` so an image-RAG consumer can find each rendered page.
+
+**Reliability.** Wall-clock timeouts on both parse and each Vision call, so one hung file
+can't stall a run (the file is recorded with `error_type: "timeout"` and the pipeline
+continues). Network-level retry with exponential backoff on every LLM call
+(`models.defaults.max_retries`, default 2). Errors are classified (`timeout` /
+`parse_error` / `chunk_error` / `io_error` / `interrupted` / `unknown`) so consumers can
+branch without grepping messages. Ctrl+C between files finishes the current file, writes
+everything completed so far, and exits 130 — a rerun resumes from cache. Multi-provider
+fallback across Gemini / OpenAI / Anthropic / DashScope.
+
+**Opt-in extras** (default OFF): PII sanitization (email / URL / credit card with Luhn /
+IPv4 / JP phone — high-precision rules only, no name detection), repeating-furniture
+dedup (collapses a per-page `DocuSign Envelope ID` to its first copy, never removing
+every copy), exiftool metadata, contextual chunk summaries.
+
+## Docs & tests
+
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — phases, design rationale, extension guide
+  (hooks / parsers / chunkers), known debt. §10 covers the graph layer.
+- **[INTEGRATION.md](docs/INTEGRATION.md)** — embedding DocIngest into your own system
+  (CLI subprocess / library / MCP), per-scenario recipes.
+- **[PROCESSING_MODES.md](docs/PROCESSING_MODES.md)** — the mode × format knob matrix.
+- **[COMPETITIVE_POSITIONING.md](docs/COMPETITIVE_POSITIONING.md)** — where this sits
+  versus cloud suites and local tools, and which fights it deliberately skips.
+- **[AGENTS.md](AGENTS.md)** — the command catalog for agents reading the repo directly.
 
 ```bash
-# Public Python API (facade + outputs whitelist + Provider injection)
-python tests/unit/test_api.py
-
-# Chunk lineage (metadata.lineage + transformations trail)
-python tests/unit/test_lineage.py
-
-# Network-level retry plumbing (num_retries → litellm)
-python tests/unit/test_retry.py
-
-# Config-overrides layering
-python tests/unit/test_config_override.py
-
-# Incremental cache behaviour (modify / delete / config-change scenarios)
-python tests/incremental/run_tests.py
-
-# GraphRAG layer — optionality regression (passes with or without [graph] extras)
-python tests/unit/test_graph_optional.py
-
-# GraphRAG layer — internals (chunks_loader filters, cache hashing, mode validation)
-python tests/unit/test_graph_internals.py
-
-# GraphRAG chunk enrichment (chunks.jsonl preservation, top-N selection, idempotency)
-python tests/unit/test_graph_enrich.py
+python tests/unit/test_api.py               # public API: facade, outputs whitelist, providers
+python tests/unit/test_lineage.py           # chunk lineage + transformations trail
+python tests/unit/test_config_override.py   # config layering
+python tests/incremental/run_tests.py       # incremental cache: modify / delete / config change
+python tests/unit/test_graph_optional.py    # graph layer stays optional (with or without extras)
+python tests/unit/test_graph_enrich.py      # chunks.jsonl preservation, idempotency
 ```
 
-`tests/unit/test_mixed.py` (mixed-input integration; its `title_path`
-assertion previously had a known failure, now resolved — the suite passes
-cleanly) runs the full parse path and is slower than the units above.
-
-## Documentation
-
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — Architecture, Phase breakdown, design rationale, extension guide (hooks / parsers / chunkers), known technical debt. **§10** covers the optional `docingest.graph` layer (boundaries, module layout, three-tier caching, swapping backends).
-- **[INTEGRATION.md](docs/INTEGRATION.md)** — How to integrate DocIngest into your own system (CLI subprocess / Python library / MCP), per-scenario recipes, cross-cutting concerns
-- **[COMPETITIVE_POSITIONING.md](docs/COMPETITIVE_POSITIONING.md)** — Where DocIngest sits vs. cloud suites (Azure/AWS/GCP) and local tools (Docling/MinerU/markitdown); who its users are, which fights to pick and which to skip, and what that means for development priorities. The moat: Japanese Excel spec-sheet (方眼紙) handling backed by real-sample access.
+`tests/unit/test_mixed.py` runs the full parse path end to end and is slower than the
+units above.
